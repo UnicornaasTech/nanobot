@@ -27,6 +27,10 @@ def _resolve_version() -> str:
 __version__ = _resolve_version()
 __logo__ = "🐈"
 
+from nanobot.security.bootstrap_web_fetch import apply as _apply_web_fetch_defense
+
+_apply_web_fetch_defense()
+
 from nanobot.nanobot import Nanobot, RunResult
 
 __all__ = ["Nanobot", "RunResult"]

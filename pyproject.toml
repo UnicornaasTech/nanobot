@@ -110,6 +110,8 @@ allow-direct-references = true
 [tool.hatch.build]
 include = [
     "nanobot/**/*.py",
+    "nanobot/data/*.json",
+    "nanobot/data/*.txt",
     "nanobot/templates/**/*.md",
     "nanobot/skills/**/*.md",
     "nanobot/skills/**/*.sh",
@@ -127,6 +129,8 @@ packages = ["nanobot"]
 [tool.hatch.build.targets.sdist]
 include = [
     "nanobot/",
+    "nanobot/data/*.json",
+    "nanobot/data/*.txt",
     "bridge/",
     "README.md",
     "LICENSE",

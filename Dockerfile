@@ -40,6 +40,14 @@ RUN useradd -m -u 1000 -s /bin/bash nanobot && \
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh
 
+# Copy and set up firewall script (container egress policy; requires NET_ADMIN at runtime)
+COPY init-firewall.sh /usr/local/bin/init-firewall.sh
+RUN sed -i 's/\r$//' /usr/local/bin/init-firewall.sh && chmod +x /usr/local/bin/init-firewall.sh && \
+    apt-get update && apt-get install -y --no-install-recommends sudo iptables ipset && \
+    rm -rf /var/lib/apt/lists/* && \
+    echo "nanobot ALL=(root) NOPASSWD: /usr/local/bin/init-firewall.sh" > /etc/sudoers.d/nanobot-firewall && \
+    chmod 0440 /etc/sudoers.d/nanobot-firewall
+
 USER nanobot
 ENV HOME=/home/nanobot
 

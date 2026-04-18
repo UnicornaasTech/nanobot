@@ -1,0 +1,9 @@
+web_fetch_patterns.json
+  Derived from FireClaw (fireclaw-example/patterns.json).
+  FireClaw is licensed under the GNU Affero General Public License v3.0.
+  See https://www.gnu.org/licenses/agpl-3.0.html
+  Nanobot deltas: removed sql_injection, sql_comment, encoding_declaration; tightened
+  command_prefix with a leading word boundary (fewer false positives on normal web/SQL docs).
+
+web_fetch_domain_tiers.json
+  Copied from fireclaw-example/data/domain-tiers.json (same license as FireClaw example tree).

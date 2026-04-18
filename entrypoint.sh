@@ -1,4 +1,6 @@
 #!/bin/sh
+sudo /usr/local/bin/init-firewall.sh
+
 dir="$HOME/.nanobot"
 if [ -d "$dir" ] && [ ! -w "$dir" ]; then
     owner_uid=$(stat -c %u "$dir" 2>/dev/null || stat -f %u "$dir" 2>/dev/null)

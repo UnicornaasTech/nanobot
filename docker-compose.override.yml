@@ -1,0 +1,22 @@
+# Merged automatically with docker-compose.yml by Docker Compose.
+# In-container firewall (init-firewall.sh): NET_ADMIN for iptables;
+# extra_hosts if need to have host.docker.internal resolves on Linux (see init-firewall.sh).
+services:
+  nanobot-gateway:
+#    extra_hosts:
+#      - "host.docker.internal:host-gateway"
+    cap_add:
+      - NET_ADMIN
+  nanobot-api:
+#    extra_hosts:
+#      - "host.docker.internal:host-gateway"
+    # Use the same workspace in api as with cli:
+    command:
+      ["serve", "--host", "0.0.0.0", "-w", "/home/nanobot/.nanobot/workspace"]
+    cap_add:
+      - NET_ADMIN
+  nanobot-cli:
+#    extra_hosts:
+#      - "host.docker.internal:host-gateway"
+    cap_add:
+      - NET_ADMIN
