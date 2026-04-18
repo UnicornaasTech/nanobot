@@ -6,7 +6,11 @@ services:
 #    extra_hosts:
 #      - "host.docker.internal:host-gateway"
     cap_add:
+        # init-firewall.sh is invoked via sudo in entrypoint.sh; sudo needs these
+        # capabilities when capabilities are otherwise dropped (cap_drop: ALL).
       - NET_ADMIN
+      - SETUID
+      - SETGID
   nanobot-api:
 #    extra_hosts:
 #      - "host.docker.internal:host-gateway"
