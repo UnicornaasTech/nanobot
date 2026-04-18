@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 from loguru import logger
@@ -105,7 +106,7 @@ async def postprocess_fetch_result(
                 and isinstance(block.get("text"), str)
                 and tier != "trusted"
             ):
-                sr = sanitize_web_fetch_text(block["text"], tier, max_chars)
+                sr = sanitize_web_fetch_text(block["text"], tier, max_chars, url=url)
                 st = structural_outcome(sr, policy)
                 if st.blocked:
                     _log_blocked(
@@ -131,6 +132,7 @@ async def postprocess_fetch_result(
             )
         if invoked and combined_for_llm:
             sample = "\n\n".join(combined_for_llm)[:CLASSIFIER_MAX_INPUT_CHARS]
+            llm_t0 = time.perf_counter()
             scan = await run_safety_classification(
                 url=url,
                 text_sample=sample,
@@ -138,6 +140,12 @@ async def postprocess_fetch_result(
                 model=scan_cfg.model,
                 api_key=scan_cfg.api_key,
                 proxy=tool.proxy,
+            )
+            logger.debug(
+                "web_fetch_defense llm_validation url={} seconds={:.3f} verdict={}",
+                url,
+                time.perf_counter() - llm_t0,
+                scan.get("verdict"),
             )
             lt = llm_classifier_outcome(scan, policy)
             if lt.blocked:
@@ -172,7 +180,7 @@ async def postprocess_fetch_result(
     structural_skipped: bool | None = None
 
     if defense.sanitize_enabled:
-        sr = sanitize_web_fetch_text(body, tier, max_chars)
+        sr = sanitize_web_fetch_text(body, tier, max_chars, url=url)
         body = sr.sanitized
         structural_severity = sr.severity
         structural_detection_count = sr.detection_count
@@ -202,6 +210,7 @@ async def postprocess_fetch_result(
             url,
         )
     if invoked:
+        llm_t0 = time.perf_counter()
         scan = await run_safety_classification(
             url=url,
             text_sample=body[:CLASSIFIER_MAX_INPUT_CHARS],
@@ -209,6 +218,12 @@ async def postprocess_fetch_result(
             model=scan_cfg.model,
             api_key=scan_cfg.api_key,
             proxy=tool.proxy,
+        )
+        logger.debug(
+            "web_fetch_defense llm_validation url={} seconds={:.3f} verdict={}",
+            url,
+            time.perf_counter() - llm_t0,
+            scan.get("verdict"),
         )
         llm_verdict = str(scan.get("verdict", ""))
         sev = scan.get("severity")
@@ -269,7 +284,13 @@ def make_defended_web_fetch_class(vanilla: type[WebFetchTool]) -> type[WebFetchT
                     ensure_ascii=False,
                 )
 
+            fetch_t0 = time.perf_counter()
             result = await super().execute(url, extractMode, maxChars, **kwargs)
+            logger.debug(
+                "web_fetch_defense fetch url={} seconds={:.3f}",
+                url,
+                time.perf_counter() - fetch_t0,
+            )
             return await postprocess_fetch_result(self, url, result, max_chars, defense)
 
     _DefendedWebFetchTool.__name__ = vanilla.__name__

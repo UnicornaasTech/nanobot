@@ -10,6 +10,8 @@ from functools import lru_cache
 from importlib import resources
 from typing import Any, Literal
 
+from loguru import logger
+
 TrustTier = Literal["trusted", "neutral", "suspicious", "blocked"]
 
 _RE_GIM = re.IGNORECASE | re.MULTILINE
@@ -217,10 +219,41 @@ def _pattern_matcher() -> PatternMatcher:
     return PatternMatcher(data)
 
 
+def _preview_for_log(raw: str, max_len: int = 120) -> str:
+    one_line = raw.replace("\n", "\\n").replace("\r", "\\r")
+    if len(one_line) > max_len:
+        return f"{one_line[:max_len]}…"
+    return one_line
+
+
+def _debug_log_pattern_hits(
+    url: str | None,
+    phase: str,
+    hits: list[dict[str, Any]],
+) -> None:
+    u = url if url else "-"
+    for h in hits:
+        match = h.get("match", "")
+        preview = _preview_for_log(match) if isinstance(match, str) else repr(match)
+        logger.debug(
+            "web_fetch_defense pattern_hit url={} phase={} category={} name={} "
+            "severity={} position={} match_preview={}",
+            u,
+            phase,
+            h.get("category"),
+            h.get("name"),
+            h.get("severity"),
+            h.get("position"),
+            preview,
+        )
+
+
 def sanitize_web_fetch_text(
     text: str,
     trust_tier: TrustTier,
     max_chars: int,
+    *,
+    url: str | None = None,
 ) -> WebFetchSanitizeResult:
     """Run Fireclaw-style InputSanitizer pipeline.
 
@@ -243,7 +276,9 @@ def sanitize_web_fetch_text(
     detections: list[dict[str, Any]] = []
 
     # Structural patterns (HTML layout, hidden markup, etc.) score on the raw input.
-    detections.extend(matcher.scan(text, ["structural"]))
+    raw_structural_hits = matcher.scan(text, ["structural"])
+    _debug_log_pattern_hits(url, "raw_input", raw_structural_hits)
+    detections.extend(raw_structural_hits)
 
     sanitized = text
     if "<" in sanitized:
@@ -282,18 +317,20 @@ def sanitize_web_fetch_text(
     injection_categories = ["injection_signatures"]
     if intensity > 1.0:
         injection_categories.append("exfiltration")
-    detections.extend(matcher.scan(sanitized, injection_categories))
+    post_sanitize_hits = matcher.scan(sanitized, injection_categories)
+    _debug_log_pattern_hits(url, "sanitized_input", post_sanitize_hits)
+    detections.extend(post_sanitize_hits)
 
     if truncated:
-        detections.append(
-            {
-                "category": "structural",
-                "name": "truncation",
-                "match": f"Content truncated to {max_chars} chars",
-                "position": 0,
-                "severity": 0,
-            }
-        )
+        trunc_hit = {
+            "category": "structural",
+            "name": "truncation",
+            "match": f"Content truncated to {max_chars} chars",
+            "position": 0,
+            "severity": 0,
+        }
+        _debug_log_pattern_hits(url, "sanitized_input", [trunc_hit])
+        detections.append(trunc_hit)
 
     severity = PatternMatcher.calculate_severity(detections)
     return WebFetchSanitizeResult(
