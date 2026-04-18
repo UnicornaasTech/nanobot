@@ -1,6 +1,7 @@
 """MCP client: connects to MCP servers and wraps their tools as native nanobot tools."""
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack
 from typing import Any
 
@@ -9,6 +10,57 @@ from loguru import logger
 
 from nanobot.agent.tools.base import Tool
 from nanobot.agent.tools.registry import ToolRegistry
+
+try:
+    import anyio
+
+    _ANYIO_BROKEN_RESOURCE: tuple[type[BaseException], ...] = (anyio.BrokenResourceError,)
+except ImportError:
+    _ANYIO_BROKEN_RESOURCE = ()
+
+
+def _is_mcp_transport_failure(exc: BaseException) -> bool:
+    """True when the MCP HTTP/SSE transport is likely dead (session must reconnect)."""
+    if isinstance(exc, _ANYIO_BROKEN_RESOURCE):
+        return True
+    if isinstance(
+        exc,
+        (
+            BrokenPipeError,
+            ConnectionAbortedError,
+            ConnectionResetError,
+            EOFError,
+        ),
+    ):
+        return True
+    if isinstance(exc, OSError):
+        import errno
+
+        err = getattr(exc, "errno", None)
+        if err in (errno.ECONNRESET, errno.EPIPE, errno.ETIMEDOUT, errno.ECONNABORTED):
+            return True
+    return isinstance(
+        exc,
+        (
+            httpx.ReadTimeout,
+            httpx.ConnectTimeout,
+            httpx.ConnectError,
+            httpx.RemoteProtocolError,
+            httpx.WriteError,
+        ),
+    )
+
+
+def _sse_httpx_timeout(timeout: httpx.Timeout | None) -> httpx.Timeout | None:
+    """SSE is a long-lived stream; never apply a finite read timeout to the shared client."""
+    if timeout is None:
+        return None
+    return httpx.Timeout(
+        connect=timeout.connect,
+        read=None,
+        write=timeout.write,
+        pool=timeout.pool,
+    )
 
 
 def _extract_nullable_branch(options: Any) -> tuple[dict[str, Any], bool] | None:
@@ -75,7 +127,14 @@ def _normalize_schema_for_openai(schema: Any) -> dict[str, Any]:
 class MCPToolWrapper(Tool):
     """Wraps a single MCP server tool as a nanobot Tool."""
 
-    def __init__(self, session, server_name: str, tool_def, tool_timeout: int = 30):
+    def __init__(
+        self,
+        session,
+        server_name: str,
+        tool_def,
+        tool_timeout: int = 30,
+        on_transport_failure: Callable[[], Awaitable[None]] | None = None,
+    ):
         self._session = session
         self._original_name = tool_def.name
         self._name = f"mcp_{server_name}_{tool_def.name}"
@@ -83,6 +142,7 @@ class MCPToolWrapper(Tool):
         raw_schema = tool_def.inputSchema or {"type": "object", "properties": {}}
         self._parameters = _normalize_schema_for_openai(raw_schema)
         self._tool_timeout = tool_timeout
+        self._on_transport_failure = on_transport_failure
 
     @property
     def name(self) -> str:
@@ -116,12 +176,24 @@ class MCPToolWrapper(Tool):
             logger.warning("MCP tool '{}' was cancelled by server/SDK", self._name)
             return "(MCP tool call was cancelled)"
         except Exception as exc:
-            logger.exception(
-                "MCP tool '{}' failed: {}: {}",
-                self._name,
-                type(exc).__name__,
-                exc,
-            )
+            if self._on_transport_failure and _is_mcp_transport_failure(exc):
+                try:
+                    await self._on_transport_failure()
+                except Exception:
+                    logger.exception("MCP on_transport_failure hook failed for '{}'", self._name)
+                logger.warning(
+                    "MCP tool '{}' transport error (session reset): {}: {}",
+                    self._name,
+                    type(exc).__name__,
+                    exc,
+                )
+            else:
+                logger.exception(
+                    "MCP tool '{}' failed: {}: {}",
+                    self._name,
+                    type(exc).__name__,
+                    exc,
+                )
             return f"(MCP tool call failed: {type(exc).__name__})"
 
         parts = []
@@ -136,7 +208,14 @@ class MCPToolWrapper(Tool):
 class MCPResourceWrapper(Tool):
     """Wraps an MCP resource URI as a read-only nanobot Tool."""
 
-    def __init__(self, session, server_name: str, resource_def, resource_timeout: int = 30):
+    def __init__(
+        self,
+        session,
+        server_name: str,
+        resource_def,
+        resource_timeout: int = 30,
+        on_transport_failure: Callable[[], Awaitable[None]] | None = None,
+    ):
         self._session = session
         self._uri = resource_def.uri
         self._name = f"mcp_{server_name}_resource_{resource_def.name}"
@@ -148,6 +227,7 @@ class MCPResourceWrapper(Tool):
             "required": [],
         }
         self._resource_timeout = resource_timeout
+        self._on_transport_failure = on_transport_failure
 
     @property
     def name(self) -> str:
@@ -185,12 +265,24 @@ class MCPResourceWrapper(Tool):
             logger.warning("MCP resource '{}' was cancelled by server/SDK", self._name)
             return "(MCP resource read was cancelled)"
         except Exception as exc:
-            logger.exception(
-                "MCP resource '{}' failed: {}: {}",
-                self._name,
-                type(exc).__name__,
-                exc,
-            )
+            if self._on_transport_failure and _is_mcp_transport_failure(exc):
+                try:
+                    await self._on_transport_failure()
+                except Exception:
+                    logger.exception("MCP on_transport_failure hook failed for '{}'", self._name)
+                logger.warning(
+                    "MCP resource '{}' transport error (session reset): {}: {}",
+                    self._name,
+                    type(exc).__name__,
+                    exc,
+                )
+            else:
+                logger.exception(
+                    "MCP resource '{}' failed: {}: {}",
+                    self._name,
+                    type(exc).__name__,
+                    exc,
+                )
             return f"(MCP resource read failed: {type(exc).__name__})"
 
         parts: list[str] = []
@@ -207,7 +299,14 @@ class MCPResourceWrapper(Tool):
 class MCPPromptWrapper(Tool):
     """Wraps an MCP prompt as a read-only nanobot Tool."""
 
-    def __init__(self, session, server_name: str, prompt_def, prompt_timeout: int = 30):
+    def __init__(
+        self,
+        session,
+        server_name: str,
+        prompt_def,
+        prompt_timeout: int = 30,
+        on_transport_failure: Callable[[], Awaitable[None]] | None = None,
+    ):
         self._session = session
         self._prompt_name = prompt_def.name
         self._name = f"mcp_{server_name}_prompt_{prompt_def.name}"
@@ -233,6 +332,7 @@ class MCPPromptWrapper(Tool):
             "properties": properties,
             "required": required,
         }
+        self._on_transport_failure = on_transport_failure
 
     @property
     def name(self) -> str:
@@ -277,12 +377,24 @@ class MCPPromptWrapper(Tool):
             )
             return f"(MCP prompt call failed: {exc.error.message} [code {exc.error.code}])"
         except Exception as exc:
-            logger.exception(
-                "MCP prompt '{}' failed: {}: {}",
-                self._name,
-                type(exc).__name__,
-                exc,
-            )
+            if self._on_transport_failure and _is_mcp_transport_failure(exc):
+                try:
+                    await self._on_transport_failure()
+                except Exception:
+                    logger.exception("MCP on_transport_failure hook failed for '{}'", self._name)
+                logger.warning(
+                    "MCP prompt '{}' transport error (session reset): {}: {}",
+                    self._name,
+                    type(exc).__name__,
+                    exc,
+                )
+            else:
+                logger.exception(
+                    "MCP prompt '{}' failed: {}: {}",
+                    self._name,
+                    type(exc).__name__,
+                    exc,
+                )
             return f"(MCP prompt call failed: {type(exc).__name__})"
 
         parts: list[str] = []
@@ -303,7 +415,10 @@ class MCPPromptWrapper(Tool):
 
 
 async def connect_mcp_servers(
-    mcp_servers: dict, registry: ToolRegistry
+    mcp_servers: dict,
+    registry: ToolRegistry,
+    *,
+    on_transport_failure: Callable[[str], Awaitable[None]] | None = None,
 ) -> dict[str, AsyncExitStack]:
     """Connect to configured MCP servers and register their tools, resources, prompts.
 
@@ -319,6 +434,10 @@ async def connect_mcp_servers(
     async def connect_single_server(name: str, cfg) -> tuple[str, AsyncExitStack | None]:
         server_stack = AsyncExitStack()
         await server_stack.__aenter__()
+
+        async def _notify_transport_failure() -> None:
+            if on_transport_failure:
+                await on_transport_failure(name)
 
         try:
             transport_type = cfg.type
@@ -354,7 +473,7 @@ async def connect_mcp_servers(
                     return httpx.AsyncClient(
                         headers=merged_headers or None,
                         follow_redirects=True,
-                        timeout=timeout,
+                        timeout=_sse_httpx_timeout(timeout),
                         auth=auth,
                     )
 
@@ -400,7 +519,15 @@ async def connect_mcp_servers(
                         name,
                     )
                     continue
-                wrapper = MCPToolWrapper(session, name, tool_def, tool_timeout=cfg.tool_timeout)
+                wrapper = MCPToolWrapper(
+                    session,
+                    name,
+                    tool_def,
+                    tool_timeout=cfg.tool_timeout,
+                    on_transport_failure=_notify_transport_failure
+                    if on_transport_failure
+                    else None,
+                )
                 registry.register(wrapper)
                 logger.debug("MCP: registered tool '{}' from server '{}'", wrapper.name, name)
                 registered_count += 1
@@ -426,7 +553,13 @@ async def connect_mcp_servers(
                 resources_result = await session.list_resources()
                 for resource in resources_result.resources:
                     wrapper = MCPResourceWrapper(
-                        session, name, resource, resource_timeout=cfg.tool_timeout
+                        session,
+                        name,
+                        resource,
+                        resource_timeout=cfg.tool_timeout,
+                        on_transport_failure=_notify_transport_failure
+                        if on_transport_failure
+                        else None,
                     )
                     registry.register(wrapper)
                     registered_count += 1
@@ -440,7 +573,13 @@ async def connect_mcp_servers(
                 prompts_result = await session.list_prompts()
                 for prompt in prompts_result.prompts:
                     wrapper = MCPPromptWrapper(
-                        session, name, prompt, prompt_timeout=cfg.tool_timeout
+                        session,
+                        name,
+                        prompt,
+                        prompt_timeout=cfg.tool_timeout,
+                        on_transport_failure=_notify_transport_failure
+                        if on_transport_failure
+                        else None,
                     )
                     registry.register(wrapper)
                     registered_count += 1

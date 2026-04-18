@@ -215,6 +215,7 @@ class AgentLoop:
         self._mcp_stacks: dict[str, AsyncExitStack] = {}
         self._mcp_connected = False
         self._mcp_connecting = False
+        self._mcp_lifecycle_lock = asyncio.Lock()
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._background_tasks: list[asyncio.Task] = []
         self._session_locks: dict[str, asyncio.Lock] = {}
@@ -294,27 +295,61 @@ class AgentLoop:
                 CronTool(self.cron_service, default_timezone=self.context.timezone or "UTC")
             )
 
+    def _unregister_mcp_tools(self) -> None:
+        for tool_name in list(self.tools.tool_names):
+            if tool_name.startswith("mcp_"):
+                self.tools.unregister(tool_name)
+
+    async def _reset_mcp_transport_after_failure(self, server_name: str) -> None:
+        """Close MCP transports and drop tool registrations so the next message can reconnect."""
+        async with self._mcp_lifecycle_lock:
+            if not self._mcp_stacks and not self._mcp_connected:
+                return
+            logger.warning(
+                "MCP transport failure (server='{}'); closing sessions and unregistering MCP tools",
+                server_name,
+            )
+            for name, stack in list(self._mcp_stacks.items()):
+                try:
+                    await stack.aclose()
+                except (RuntimeError, BaseExceptionGroup):
+                    logger.debug("MCP server '{}' cleanup error (can be ignored)", name)
+            self._mcp_stacks.clear()
+            self._mcp_connected = False
+            self._unregister_mcp_tools()
+
     async def _connect_mcp(self) -> None:
-        """Connect to configured MCP servers (one-time, lazy)."""
-        if self._mcp_connected or self._mcp_connecting or not self._mcp_servers:
+        """Connect to configured MCP servers (lazy; reconnects after transport reset)."""
+        if not self._mcp_servers:
             return
-        self._mcp_connecting = True
+        if self._mcp_connected:
+            return
         from nanobot.agent.tools.mcp import connect_mcp_servers
 
-        try:
-            self._mcp_stacks = await connect_mcp_servers(self._mcp_servers, self.tools)
-            if self._mcp_stacks:
-                self._mcp_connected = True
-            else:
-                logger.warning("No MCP servers connected successfully (will retry next message)")
-        except asyncio.CancelledError:
-            logger.warning("MCP connection cancelled (will retry next message)")
-            self._mcp_stacks.clear()
-        except BaseException as e:
-            logger.error("Failed to connect MCP servers (will retry next message): {}", e)
-            self._mcp_stacks.clear()
-        finally:
-            self._mcp_connecting = False
+        async with self._mcp_lifecycle_lock:
+            if self._mcp_connected or self._mcp_connecting or not self._mcp_servers:
+                return
+            self._mcp_connecting = True
+            try:
+                self._mcp_stacks = await connect_mcp_servers(
+                    self._mcp_servers,
+                    self.tools,
+                    on_transport_failure=self._reset_mcp_transport_after_failure,
+                )
+                if self._mcp_stacks:
+                    self._mcp_connected = True
+                else:
+                    logger.warning("No MCP servers connected successfully (will retry next message)")
+            except asyncio.CancelledError:
+                logger.warning("MCP connection cancelled (will retry next message)")
+                self._mcp_stacks.clear()
+                self._unregister_mcp_tools()
+            except BaseException as e:
+                logger.error("Failed to connect MCP servers (will retry next message): {}", e)
+                self._mcp_stacks.clear()
+                self._unregister_mcp_tools()
+            finally:
+                self._mcp_connecting = False
 
     def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
         """Update context for all tools that need routing info."""
@@ -605,12 +640,15 @@ class AgentLoop:
         if self._background_tasks:
             await asyncio.gather(*self._background_tasks, return_exceptions=True)
             self._background_tasks.clear()
-        for name, stack in self._mcp_stacks.items():
-            try:
-                await stack.aclose()
-            except (RuntimeError, BaseExceptionGroup):
-                logger.debug("MCP server '{}' cleanup error (can be ignored)", name)
-        self._mcp_stacks.clear()
+        async with self._mcp_lifecycle_lock:
+            for name, stack in self._mcp_stacks.items():
+                try:
+                    await stack.aclose()
+                except (RuntimeError, BaseExceptionGroup):
+                    logger.debug("MCP server '{}' cleanup error (can be ignored)", name)
+            self._mcp_stacks.clear()
+            self._mcp_connected = False
+            self._unregister_mcp_tools()
 
     def _schedule_background(self, coro) -> None:
         """Schedule a coroutine as a tracked background task (drained on shutdown)."""
@@ -647,6 +685,8 @@ class AgentLoop:
                 self.sessions.save(session)
 
             session, pending = self.auto_compact.prepare_session(session, key)
+
+            await self._connect_mcp()
 
             await self.consolidator.maybe_consolidate_by_tokens(session)
             # Persist subagent follow-ups into durable history BEFORE prompt
@@ -702,6 +742,8 @@ class AgentLoop:
             self.sessions.save(session)
 
         session, pending = self.auto_compact.prepare_session(session, key)
+
+        await self._connect_mcp()
 
         # Slash commands
         raw = msg.content.strip()

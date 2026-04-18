@@ -5,12 +5,14 @@ from contextlib import AsyncExitStack, asynccontextmanager
 import sys
 from types import ModuleType, SimpleNamespace
 
+import httpx
 import pytest
 
 from nanobot.agent.tools.mcp import (
     MCPResourceWrapper,
     MCPPromptWrapper,
     MCPToolWrapper,
+    _sse_httpx_timeout,
     connect_mcp_servers,
 )
 from nanobot.agent.tools.registry import ToolRegistry
@@ -154,6 +156,14 @@ def test_wrapper_normalizes_nullable_property_type_union() -> None:
     assert wrapper.parameters["properties"]["name"] == {"type": "string", "nullable": True}
 
 
+def test_sse_httpx_timeout_clears_read_timeout() -> None:
+    base = httpx.Timeout(5.0, read=300.0)
+    merged = _sse_httpx_timeout(base)
+    assert merged is not None
+    assert merged.read is None
+    assert merged.connect == base.connect
+
+
 def test_wrapper_normalizes_nullable_property_anyof() -> None:
     tool_def = SimpleNamespace(
         name="demo",
@@ -245,6 +255,32 @@ async def test_execute_handles_generic_exception() -> None:
     result = await wrapper.execute()
 
     assert result == "(MCP tool call failed: RuntimeError)"
+
+
+@pytest.mark.asyncio
+async def test_execute_read_timeout_triggers_transport_hook() -> None:
+    events: list[int] = []
+
+    async def call_tool(_name: str, arguments: dict) -> object:
+        raise httpx.ReadTimeout("timed out")
+
+    async def on_fail() -> None:
+        events.append(1)
+
+    tool_def = SimpleNamespace(
+        name="x",
+        description="",
+        inputSchema={"type": "object", "properties": {}},
+    )
+    wrapper = MCPToolWrapper(
+        SimpleNamespace(call_tool=call_tool),
+        "s",
+        tool_def,
+        on_transport_failure=on_fail,
+    )
+    result = await wrapper.execute()
+    assert events == [1]
+    assert "ReadTimeout" in result
 
 
 def _make_tool_def(name: str) -> SimpleNamespace:
