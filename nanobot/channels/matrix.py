@@ -214,8 +214,10 @@ class MatrixConfig(Base):
     allow_from: list[str] = Field(default_factory=list)
     group_policy: Literal["open", "mention", "allowlist"] = "open"
     group_allow_from: list[str] = Field(default_factory=list)
-    allow_room_mentions: bool = False,
+    allow_room_mentions: bool = False
     streaming: bool = False
+    recovery_key: str = Field(default="", alias="recoveryKey")
+    recovery_passphrase: str = Field(default="", alias="recoveryPassphrase")
 
 
 class MatrixChannel(BaseChannel):
@@ -317,6 +319,16 @@ class MatrixChannel(BaseChannel):
         else:
             logger.warning("Unable to load a Matrix session due to missing password, access_token, or device_id; encryption may not work")
             return
+
+        if self.client and self.config.e2ee_enabled and (
+            (self.config.recovery_key or "").strip()
+            or (self.config.recovery_passphrase or "").strip()
+        ):
+            from nanobot.channels.matrix_cross_signing_recovery import (
+                bootstrap_cross_signing_from_recovery,
+            )
+
+            await bootstrap_cross_signing_from_recovery(self.client, self.config)
 
         self._sync_task = asyncio.create_task(self._sync_loop())
 

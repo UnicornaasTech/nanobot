@@ -487,6 +487,8 @@ for reliable encryption, password login is recommended instead. If the
 
 > Keep a persistent `matrix-store` — encrypted session state is lost if these change across restarts.
 
+**Headless cross-signing (optional)** — If your homeserver requires [verified devices](https://docs.element.io/latest/element-support/device-verification/how-to-verify-devices/#verify-with-a-recovery-key), set **`recoveryKey`** (Element **Security key**) or **`recoveryPassphrase`** (when your backup uses a passphrase instead of a raw key). On each gateway start, nanobot will upload a self-signing signature for the current session if it is missing, then you can **remove** the secret from config. Prefer injecting the key via environment (for example `NANOBOT_CHANNELS__MATRIX__RECOVERY_KEY`) rather than committing it. Never share or log the recovery secret. The account must already have **cross-signing** enabled in Element once; nanobot only recovers the existing self-signing key from Secret Storage.
+
 | Option | Description |
 |--------|-------------|
 | `allowFrom` | User IDs allowed to interact. Empty denies all; use `["*"]` to allow everyone. |
@@ -495,6 +497,8 @@ for reliable encryption, password login is recommended instead. If the
 | `allowRoomMentions` | Accept `@room` mentions in mention mode. |
 | `e2eeEnabled` | E2EE support (default `true`). Set `false` for plaintext-only. |
 | `maxMediaBytes` | Max attachment size (default `20MB`). Set `0` to block all media. |
+| `recoveryKey` | Optional Element **Security key** (base58) to sign this device with cross-signing at startup. |
+| `recoveryPassphrase` | Optional Secret Storage passphrase (`m.pbkdf2` on the default key) if you do not use a raw `recoveryKey`. |
 
 
 
