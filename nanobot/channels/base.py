@@ -199,6 +199,7 @@ class BaseChannel(ABC):
         media: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
         session_key: str | None = None,
+        no_reply: bool = False,
     ) -> None:
         """
         Handle an incoming message from the chat platform.
@@ -212,6 +213,7 @@ class BaseChannel(ABC):
             media: Optional list of media URLs.
             metadata: Optional channel-specific metadata.
             session_key: Optional session key override (e.g. thread-scoped sessions).
+            no_reply: When True, agent loop may persist without generating a reply.
         """
         if not self.is_allowed(sender_id):
             self.logger.warning(
@@ -222,7 +224,7 @@ class BaseChannel(ABC):
             return
 
         meta = metadata or {}
-        if self.supports_streaming:
+        if self.supports_streaming and not no_reply:
             meta = {**meta, "_wants_stream": True}
 
         msg = InboundMessage(
@@ -233,6 +235,7 @@ class BaseChannel(ABC):
             media=media or [],
             metadata=meta,
             session_key_override=session_key,
+            no_reply=no_reply,
         )
 
         await self.bus.publish_inbound(msg)

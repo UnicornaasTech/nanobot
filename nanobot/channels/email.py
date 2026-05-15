@@ -1,16 +1,15 @@
-"""Email channel implementation using IMAP polling + SMTP replies."""
+"""Email channel implementation using IMAP polling (outbound SMTP disabled)."""
 
 import asyncio
 import html
 import imaplib
 import re
-import smtplib
-import ssl
+import select
+import time
 from contextlib import suppress
 from datetime import date
 from email import policy
 from email.header import decode_header, make_header
-from email.message import EmailMessage
 from email.parser import BytesParser
 from email.utils import parseaddr
 from fnmatch import fnmatch
@@ -29,7 +28,7 @@ from nanobot.utils.helpers import safe_filename
 
 
 class EmailConfig(Base):
-    """Email channel configuration (IMAP inbound + SMTP outbound)."""
+    """Email channel configuration (IMAP inbound; outbound via Gmail draft tool only)."""
 
     enabled: bool = False
     consent_granted: bool = False
@@ -50,7 +49,8 @@ class EmailConfig(Base):
     from_address: str = ""
 
     auto_reply_enabled: bool = True
-    poll_interval_seconds: int = 30
+    imap_idle_enabled: bool = True  # Gmail/IMAP IDLE for near-real-time inbound (falls back to poll)
+    poll_interval_seconds: int = 60  # Max 60s between checks when IDLE is off or as IDLE cycle cap
     mark_seen: bool = True
     max_body_chars: int = 12000
     subject_prefix: str = "Re: "
@@ -71,15 +71,20 @@ class EmailChannel(BaseChannel):
     Email channel.
 
     Inbound:
-    - Poll IMAP mailbox for unread messages.
-    - Convert each message into an inbound event.
+    - IMAP to the mailbox (Gmail-friendly). Prefer IMAP IDLE for near-real-time
+      notifications when ``imap_idle_enabled`` is true; otherwise poll at
+      ``poll_interval_seconds`` (clamped to at most 60s).
 
     Outbound:
-    - Send responses via SMTP back to the sender address.
+    - SMTP sending is disabled by policy. Use the ``create_gmail_draft`` tool
+      for human-reviewed Gmail drafts instead.
     """
 
     name = "email"
     display_name = "Email"
+    _MAX_PROCESSED_UIDS = 100_000
+    _POLL_INTERVAL_MIN = 5
+    _POLL_INTERVAL_MAX = 60  # inbound policy: poll at most once per minute
     _IMAP_MONTHS = (
         "Jan",
         "Feb",
@@ -123,10 +128,32 @@ class EmailChannel(BaseChannel):
         self._last_subject_by_chat: dict[str, str] = {}
         self._last_message_id_by_chat: dict[str, str] = {}
         self._processed_uids: set[str] = set()  # Capped to prevent unbounded growth
-        self._MAX_PROCESSED_UIDS = 100000
+
+    @classmethod
+    def _clamp_poll_interval(cls, seconds: int) -> int:
+        return max(cls._POLL_INTERVAL_MIN, min(cls._POLL_INTERVAL_MAX, int(seconds)))
+
+    async def _deliver_inbound_batch(self, inbound_items: list[dict[str, Any]]) -> None:
+        for item in inbound_items:
+            sender = item["sender"]
+            subject = item.get("subject", "")
+            message_id = item.get("message_id", "")
+
+            if subject:
+                self._last_subject_by_chat[sender] = subject
+            if message_id:
+                self._last_message_id_by_chat[sender] = message_id
+
+            await self._handle_message(
+                sender_id=sender,
+                chat_id=sender,
+                content=item["content"],
+                media=item.get("media") or None,
+                metadata=item.get("metadata", {}),
+            )
 
     async def start(self) -> None:
-        """Start polling IMAP for inbound emails."""
+        """Start IMAP IDLE (immediate) or polling (≤60s) for inbound emails."""
         if not self.config.consent_granted:
             self.logger.warning(
                 "Email channel disabled: consent_granted is false. "
@@ -144,85 +171,55 @@ class EmailChannel(BaseChannel):
                 "Emails with spoofed From headers will be accepted. "
                 "Set verify_dkim=true and verify_spf=true for anti-spoofing protection."
             )
-        self.logger.info("Starting Email channel (IMAP polling mode)...")
 
-        poll_seconds = max(5, int(self.config.poll_interval_seconds))
+        poll_seconds = self._clamp_poll_interval(self.config.poll_interval_seconds)
+        use_idle = self.config.imap_idle_enabled
+        idle_failed = False
+        if use_idle:
+            self.logger.info(
+                "Starting Email channel (IMAP IDLE, {}s max wait between checks)...",
+                poll_seconds,
+            )
+        else:
+            self.logger.info("Starting Email channel (IMAP poll every {}s)...", poll_seconds)
+
         while self._running:
             try:
+                if use_idle and not idle_failed:
+                    try:
+                        await asyncio.to_thread(self._imap_idle_wait, poll_seconds)
+                    except Exception as exc:
+                        self.logger.warning(
+                            "IMAP IDLE unavailable ({}), falling back to {}s polling",
+                            exc,
+                            poll_seconds,
+                        )
+                        idle_failed = True
+
                 inbound_items = await asyncio.to_thread(self._fetch_new_messages)
-                for item in inbound_items:
-                    sender = item["sender"]
-                    subject = item.get("subject", "")
-                    message_id = item.get("message_id", "")
+                await self._deliver_inbound_batch(inbound_items)
 
-                    if subject:
-                        self._last_subject_by_chat[sender] = subject
-                    if message_id:
-                        self._last_message_id_by_chat[sender] = message_id
-
-                    await self._handle_message(
-                        sender_id=sender,
-                        chat_id=sender,
-                        content=item["content"],
-                        media=item.get("media") or None,
-                        metadata=item.get("metadata", {}),
-                    )
+                if not use_idle or idle_failed:
+                    await asyncio.sleep(poll_seconds)
             except Exception:
                 self.logger.exception("Polling error")
-
-            await asyncio.sleep(poll_seconds)
+                await asyncio.sleep(poll_seconds)
 
     async def stop(self) -> None:
         """Stop polling loop."""
         self._running = False
 
+    def send_message(self, *args: Any, **kwargs: Any) -> None:
+        """Legacy hook; email delivery is disabled (see :meth:`send`)."""
+        raise NotImplementedError(
+            "Email sending is disabled by policy. Use the create_gmail_draft tool instead.",
+        )
+
     async def send(self, msg: OutboundMessage) -> None:
-        """Send email via SMTP."""
-        if not self.config.consent_granted:
-            self.logger.warning("Skip email send: consent_granted is false")
-            return
-
-        if not self.config.smtp_host:
-            self.logger.warning("SMTP host not configured")
-            return
-
-        to_addr = msg.chat_id.strip()
-        if not to_addr:
-            self.logger.warning("Missing recipient address")
-            return
-
-        # Determine if this is a reply (recipient has sent us an email before)
-        is_reply = to_addr in self._last_subject_by_chat
-        force_send = bool((msg.metadata or {}).get("force_send"))
-
-        # autoReplyEnabled only controls automatic replies, not proactive sends
-        if is_reply and not self.config.auto_reply_enabled and not force_send:
-            self.logger.info("Skip automatic reply to {}: auto_reply_enabled is false", to_addr)
-            return
-
-        base_subject = self._last_subject_by_chat.get(to_addr, "nanobot reply")
-        subject = self._reply_subject(base_subject)
-        if msg.metadata and isinstance(msg.metadata.get("subject"), str):
-            override = msg.metadata["subject"].strip()
-            if override:
-                subject = override
-
-        email_msg = EmailMessage()
-        email_msg["From"] = self.config.from_address or self.config.smtp_username or self.config.imap_username
-        email_msg["To"] = to_addr
-        email_msg["Subject"] = subject
-        email_msg.set_content(msg.content or "")
-
-        in_reply_to = self._last_message_id_by_chat.get(to_addr)
-        if in_reply_to:
-            email_msg["In-Reply-To"] = in_reply_to
-            email_msg["References"] = in_reply_to
-
-        try:
-            await asyncio.to_thread(self._smtp_send, email_msg)
-        except Exception:
-            self.logger.exception("Error sending to {}", to_addr)
-            raise
+        """Email outbound delivery is disabled — use ``create_gmail_draft`` for drafts."""
+        raise NotImplementedError(
+            "Email sending is disabled by policy. Use the create_gmail_draft tool instead.",
+        )
 
     def _validate_config(self) -> bool:
         missing = []
@@ -232,35 +229,66 @@ class EmailChannel(BaseChannel):
             missing.append("imap_username")
         if not self.config.imap_password:
             missing.append("imap_password")
-        if not self.config.smtp_host:
-            missing.append("smtp_host")
-        if not self.config.smtp_username:
-            missing.append("smtp_username")
-        if not self.config.smtp_password:
-            missing.append("smtp_password")
 
         if missing:
             self.logger.error("Channel not configured, missing: {}", ', '.join(missing))
             return False
         return True
 
-    def _smtp_send(self, msg: EmailMessage) -> None:
-        timeout = 30
-        if self.config.smtp_use_ssl:
-            with smtplib.SMTP_SSL(
-                self.config.smtp_host,
-                self.config.smtp_port,
-                timeout=timeout,
-            ) as smtp:
-                smtp.login(self.config.smtp_username, self.config.smtp_password)
-                smtp.send_message(msg)
-            return
+    def _imap_idle_wait(self, timeout_seconds: float) -> None:
+        """Block on IMAP IDLE until mail may have arrived or *timeout_seconds* elapses."""
+        mailbox = self.config.imap_mailbox or "INBOX"
+        if self.config.imap_use_ssl:
+            client = imaplib.IMAP4_SSL(self.config.imap_host, self.config.imap_port)
+        else:
+            client = imaplib.IMAP4(self.config.imap_host, self.config.imap_port)
 
-        with smtplib.SMTP(self.config.smtp_host, self.config.smtp_port, timeout=timeout) as smtp:
-            if self.config.smtp_use_tls:
-                smtp.starttls(context=ssl.create_default_context())
-            smtp.login(self.config.smtp_username, self.config.smtp_password)
-            smtp.send_message(msg)
+        try:
+            client.login(self.config.imap_username, self.config.imap_password)
+            status, _ = client.select(mailbox)
+            if status != "OK":
+                raise RuntimeError(f"IMAP select failed: {status}")
+
+            tag = client._new_tag()
+            client.send(tag + b" IDLE\r\n")
+
+            while True:
+                line = client.readline()
+                if not line:
+                    raise ConnectionError("IMAP IDLE: connection closed during handshake")
+                if line.startswith(b"+"):
+                    break
+                if line.startswith(tag):
+                    raise RuntimeError(f"IMAP IDLE rejected: {line!r}")
+
+            sock = client.socket()
+            if sock is None:
+                raise RuntimeError("IMAP IDLE: socket unavailable")
+
+            deadline = time.monotonic() + float(timeout_seconds)
+            while time.monotonic() < deadline:
+                wait = min(30.0, deadline - time.monotonic())
+                if wait <= 0:
+                    break
+                readable, _, _ = select.select([sock], [], [], wait)
+                if not readable:
+                    continue
+                line = client.readline()
+                if line.startswith(b"*") and (
+                    b"EXISTS" in line or b"RECENT" in line or b"EXPUNGE" in line
+                ):
+                    break
+
+            client.send(b"DONE\r\n")
+            while True:
+                line = client.readline()
+                if not line:
+                    break
+                if line.startswith(tag):
+                    break
+        finally:
+            with suppress(Exception):
+                client.logout()
 
     def _fetch_new_messages(self) -> list[dict[str, Any]]:
         """Poll IMAP and return parsed unread messages."""

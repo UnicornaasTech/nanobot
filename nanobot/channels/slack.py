@@ -344,8 +344,9 @@ class SlackChannel(BaseChannel):
         if not self._is_allowed(sender_id, chat_id, channel_type):
             return
 
-        if channel_type != "im" and not self._should_respond_in_channel(event_type, text, chat_id):
-            return
+        no_reply = channel_type != "im" and not self._should_respond_in_channel(
+            event_type, text, chat_id
+        )
 
         text = self._strip_bot_mention(text)
 
@@ -362,15 +363,16 @@ class SlackChannel(BaseChannel):
         ):
             thread_ts = event_ts
         # Add :eyes: reaction to the triggering message (best-effort)
-        try:
-            if self._web_client and event.get("ts"):
-                await self._web_client.reactions_add(
-                    channel=chat_id,
-                    name=self.config.react_emoji,
-                    timestamp=event.get("ts"),
-                )
-        except Exception as e:
-            self.logger.debug("reactions_add failed: {}", e)
+        if not no_reply:
+            try:
+                if self._web_client and event.get("ts"):
+                    await self._web_client.reactions_add(
+                        channel=chat_id,
+                        name=self.config.react_emoji,
+                        timestamp=event.get("ts"),
+                    )
+            except Exception as e:
+                self.logger.debug("reactions_add failed: {}", e)
 
         # Thread-scoped session key whenever the user is in a real thread
         # (raw_thread_ts is set). DM threads get their own session, separate
@@ -417,6 +419,7 @@ class SlackChannel(BaseChannel):
                     },
                 },
                 session_key=session_key,
+                no_reply=no_reply,
             )
         except Exception:
             self.logger.exception("Error handling message from {}", sender_id)

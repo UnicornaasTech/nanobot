@@ -14,6 +14,7 @@ from nanobot.agent.tools.registry import ToolRegistry
 _SKIP_MODULES = frozenset({
     "base", "schema", "registry", "context", "loader", "config",
     "file_state", "sandbox", "mcp", "__init__", "runtime_state",
+    "gmail_auth",  # helper module imported by gmail_draft (no Tool class)
 })
 
 

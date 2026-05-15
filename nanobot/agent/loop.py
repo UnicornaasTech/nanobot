@@ -582,6 +582,44 @@ class AgentLoop:
             return True
         return False
 
+    def _persist_no_reply_user_turn(self, session_key: str, msg: InboundMessage) -> None:
+        """Append user text/media for ``no_reply`` without ``pending_user_turn`` metadata.
+
+        Caller must hold the session lock for *session_key*.
+        """
+        session = self.sessions.get_or_create(session_key)
+        work_msg = msg
+        if msg.media:
+            new_content, image_only = extract_documents(msg.content, msg.media)
+            work_msg = dataclasses.replace(msg, content=new_content, media=image_only)
+        media_paths = [
+            p for p in (work_msg.media or []) if isinstance(p, str) and p
+        ]
+        has_text = (
+            isinstance(work_msg.content, str) and work_msg.content.strip()
+        )
+        if has_text or media_paths:
+            extra: dict[str, Any] = (
+                {"media": list(media_paths)} if media_paths else {}
+            )
+            text = (
+                work_msg.content if isinstance(work_msg.content, str) else ""
+            )
+            session.add_message("user", text, **extra)
+            self.sessions.save(session)
+
+    async def _append_no_reply_when_session_unlocked(self, msg: InboundMessage) -> None:
+        """Persist a ``no_reply`` turn without injecting it into an active LLM run."""
+        try:
+            session_key = self._effective_session_key(msg)
+            if session_key != msg.session_key:
+                msg = dataclasses.replace(msg, session_key_override=session_key)
+            lock = self._session_locks.setdefault(session_key, asyncio.Lock())
+            async with lock:
+                self._persist_no_reply_user_turn(session_key, msg)
+        except Exception:
+            logger.exception("Failed to persist no_reply message")
+
     def _build_initial_messages(
         self,
         msg: InboundMessage,
@@ -837,6 +875,17 @@ class AgentLoop:
                         self.commands.dispatch,
                     )
                     continue
+                elif msg.no_reply:
+                    bg_msg = msg
+                    if effective_key != msg.session_key:
+                        bg_msg = dataclasses.replace(
+                            msg,
+                            session_key_override=effective_key,
+                        )
+                    self._schedule_background(
+                        self._append_no_reply_when_session_unlocked(bg_msg)
+                    )
+                    continue
                 pending_msg = msg
                 if effective_key != msg.session_key:
                     pending_msg = dataclasses.replace(
@@ -883,6 +932,12 @@ class AgentLoop:
         try:
             async with lock, gate:
                 try:
+                    if msg.no_reply and not self.commands.is_dispatchable_command(
+                        msg.content.strip()
+                    ):
+                        self._persist_no_reply_user_turn(session_key, msg)
+                        return
+
                     on_stream = on_stream_end = None
                     if msg.metadata.get("_wants_stream"):
                         # Split one answer into distinct stream segments.

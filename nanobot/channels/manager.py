@@ -427,6 +427,13 @@ class ChannelManager:
                 return  # Send succeeded
             except asyncio.CancelledError:
                 raise  # Propagate cancellation for graceful shutdown
+            except NotImplementedError as e:
+                logger.info(
+                    "Outbound send not implemented for {} ({}); skipping retries",
+                    msg.channel,
+                    e,
+                )
+                return
             except Exception as e:
                 if attempt == max_attempts - 1:
                     logger.exception(
