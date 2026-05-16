@@ -592,6 +592,14 @@ class AgentLoop:
         if msg.media:
             new_content, image_only = extract_documents(msg.content, msg.media)
             work_msg = dataclasses.replace(msg, content=new_content, media=image_only)
+        content = work_msg.content if isinstance(work_msg.content, str) else ""
+        preview = content[:80] + "..." if len(content) > 80 else content
+        logger.info(
+            "Reading-only message from {}:{}: {}",
+            work_msg.channel,
+            work_msg.sender_id,
+            preview,
+        )
         media_paths = [
             p for p in (work_msg.media or []) if isinstance(p, str) and p
         ]
