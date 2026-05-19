@@ -1,4 +1,5 @@
 # Nanobot Implementation Instructions
+
 ## Features: Gmail Draft Tool + Instagram DM Channel
 
 These instructions are for a coding agent working on a **source-installed nanobot** (`git clone https://github.com/HKUDS/nanobot`). Read the existing codebase before writing any code — specifically study `nanobot/channels/email.py`, `nanobot/channels/slack.py`, and `nanobot/tools/` to understand the patterns before implementing anything.
@@ -8,9 +9,11 @@ These instructions are for a coding agent working on a **source-installed nanobo
 ## Part 1 — Gmail "Draft Only" Tool
 
 ### Goal
+
 Replace nanobot's email send capability with a tool that **creates a Gmail Draft** instead of sending. The send path must be **removed at the code level**, not just suppressed by an instruction.
 
 ### Prerequisites
+
 - A Google Cloud project with the Gmail API enabled
 - OAuth 2.0 credentials (`credentials.json`) with scope `https://www.googleapis.com/auth/gmail.compose`
 - `pip install --upgrade google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client`
@@ -144,9 +147,10 @@ def create_gmail_draft(
 
 Open nanobot's tool registry (likely `nanobot/tools/__init__.py` or `nanobot/tools/registry.py`). Register `create_gmail_draft` following the same pattern used for existing tools (web search, file tools, etc.).
 
-In the tool's description string that is shown to the LLM, include: *"Creates a Gmail draft for human review. NEVER sends the email. Always use this instead of any send operation."*
+In the tool's description string that is shown to the LLM, include: _"Creates a Gmail draft for human review. NEVER sends the email. Always use this instead of any send operation."_
 
 Also ensure the tool is listed in the agent's available tools in `AGENTS.md` in the workspace, e.g.:
+
 ```
 ## Email
 - Use `create_gmail_draft` to draft replies to support emails.
@@ -179,6 +183,7 @@ Note: No `smtpHost`, `smtpPort`, or `smtpPassword` — omitting SMTP config enti
 ### Verification
 
 Write a test `tests/test_email_draft.py`:
+
 ```python
 from nanobot.channels.email import EmailChannel
 import pytest
@@ -201,7 +206,9 @@ def test_draft_creates_not_sends(monkeypatch):
 ## Part 2 — Instagram DM Channel
 
 ### Goal
+
 Build a new nanobot channel that:
+
 1. Receives incoming Instagram DMs via a Meta webhook
 2. Passes them into nanobot's agent loop for reply drafting
 3. Posts the drafted reply to a Slack `#instagram-drafts` channel with **Send**, **Edit & Send**, and **Discard** buttons
@@ -236,6 +243,7 @@ _handle_slack_action():
 The agent's `send_message()` method still raises unconditionally. Only `_send_instagram_message()` — which is only reachable from a human Slack action — calls the Meta API.
 
 ### Prerequisites
+
 - Instagram Business or Creator account linked to a Facebook Page
 - Meta Developer App with `instagram_manage_messages` and `pages_messaging` permissions approved
 - App must pass Meta's Business Verification and App Review for messaging
@@ -775,13 +783,17 @@ In your nanobot workspace `~/.nanobot/workspace/AGENTS.md`, add:
 
 ```markdown
 ## Instagram DMs
+
 When you receive a message from the instagram channel:
+
 1. Read the customer's message carefully.
 2. Consult the knowledge base files in this workspace for product/policy info.
-3. Draft a helpful, on-brand reply.
-4. Your reply will be posted to Slack where a human will review it and choose to send,
-   edit and send, or discard it.
+3. If a reply is warranted, call `create_instagram_draft` with the proposed reply text. This queues a Slack draft for human review.
+4. If no reply is needed, do NOT call `create_instagram_draft`. A Slack review card is
+   still posted indicating "no reply suggested"; humans can use Edit & Send if needed.
 5. Do NOT attempt to send the reply yourself — there is no Instagram send tool.
+6. Slack review cards include the customer's message and are grouped in one Slack thread
+   per Instagram conversation/customer.
 ```
 
 ### Verification

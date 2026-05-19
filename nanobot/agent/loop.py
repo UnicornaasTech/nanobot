@@ -26,6 +26,11 @@ from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, res
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.self import MyTool
+from nanobot.agent.unified_delivery import (
+    DeliveryTarget,
+    allows_unified_mid_turn_injection,
+    delivery_target_from_message,
+)
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
@@ -257,6 +262,8 @@ class AgentLoop:
         # When a session has an active task, new messages for that session
         # are routed here instead of creating a new task.
         self._pending_queues: dict[str, asyncio.Queue] = {}
+        # Active turn delivery surface per session (unified-session injection guard).
+        self._pending_delivery_origins: dict[str, DeliveryTarget] = {}
         # NANOBOT_MAX_CONCURRENT_REQUESTS: <=0 means unlimited; default 3.
         _max = int(os.environ.get("NANOBOT_MAX_CONCURRENT_REQUESTS", "3"))
         self._concurrency_gate: asyncio.Semaphore | None = (
@@ -875,44 +882,55 @@ class AgentLoop:
             # is processing this session), route the message there for mid-turn
             # injection instead of creating a competing task.
             if effective_key in self._pending_queues:
-                # Non-priority commands must not be queued for injection;
-                # dispatch them directly (same pattern as priority commands).
-                if self.commands.is_dispatchable_command(raw):
+                if not allows_unified_mid_turn_injection(
+                    unified_session=self._unified_session,
+                    session_key=effective_key,
+                    inbound=msg,
+                    active_origin=self._pending_delivery_origins.get(effective_key),
+                ):
+                    logger.info(
+                        "Deferring cross-surface follow-up ({}:{}) until session {} turn ends",
+                        msg.channel,
+                        msg.chat_id,
+                        effective_key,
+                    )
+                elif self.commands.is_dispatchable_command(raw):
                     await self._dispatch_command_inline(
                         msg, effective_key, raw,
                         self.commands.dispatch,
                     )
                     continue
-                elif msg.no_reply:
-                    bg_msg = msg
+                else:
+                    if msg.no_reply:
+                        bg_msg = msg
+                        if effective_key != msg.session_key:
+                            bg_msg = dataclasses.replace(
+                                msg,
+                                session_key_override=effective_key,
+                            )
+                        self._schedule_background(
+                            self._append_no_reply_when_session_unlocked(bg_msg)
+                        )
+                        continue
+                    pending_msg = msg
                     if effective_key != msg.session_key:
-                        bg_msg = dataclasses.replace(
+                        pending_msg = dataclasses.replace(
                             msg,
                             session_key_override=effective_key,
                         )
-                    self._schedule_background(
-                        self._append_no_reply_when_session_unlocked(bg_msg)
-                    )
-                    continue
-                pending_msg = msg
-                if effective_key != msg.session_key:
-                    pending_msg = dataclasses.replace(
-                        msg,
-                        session_key_override=effective_key,
-                    )
-                try:
-                    self._pending_queues[effective_key].put_nowait(pending_msg)
-                except asyncio.QueueFull:
-                    logger.warning(
-                        "Pending queue full for session {}, falling back to queued task",
-                        effective_key,
-                    )
-                else:
-                    logger.info(
-                        "Routed follow-up message to pending queue for session {}",
-                        effective_key,
-                    )
-                    continue
+                    try:
+                        self._pending_queues[effective_key].put_nowait(pending_msg)
+                    except asyncio.QueueFull:
+                        logger.warning(
+                            "Pending queue full for session {}, falling back to queued task",
+                            effective_key,
+                        )
+                    else:
+                        logger.info(
+                            "Routed follow-up message to pending queue for session {}",
+                            effective_key,
+                        )
+                        continue
             # Compute the effective session key before dispatching
             # This ensures /stop command can find tasks correctly when unified session is enabled
             task = asyncio.create_task(self._dispatch(msg))
@@ -936,6 +954,8 @@ class AgentLoop:
         # routed here (mid-turn injection) instead of spawning a new task.
         pending = asyncio.Queue(maxsize=20)
         self._pending_queues[session_key] = pending
+        if self._unified_session and session_key == UNIFIED_SESSION_KEY:
+            self._pending_delivery_origins[session_key] = delivery_target_from_message(msg)
 
         try:
             async with lock, gate:
@@ -1053,6 +1073,7 @@ class AgentLoop:
             # them to the bus so they are processed as fresh inbound messages
             # rather than silently lost.
             queue = self._pending_queues.pop(session_key, None)
+            self._pending_delivery_origins.pop(session_key, None)
             if queue is not None:
                 leftover = 0
                 while True:

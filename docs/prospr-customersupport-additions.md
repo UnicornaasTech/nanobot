@@ -242,6 +242,56 @@ Default bind: **`webhookHost`** `0.0.0.0`, **`webhookPort`** `5005`. When **`use
 - **`pollFallbackEnabled`:** when `true` with webhooks, still polls the Conversations API on an interval (≤60s) to catch missed deliveries.
 - **`igUserId`:** optional; when set with **poll** mode, messages “from” that ID can be skipped to avoid treating your bot as the customer (if Meta returns your IGSID there).
 
+### 7. Multiple Instagram accounts (internal app per account)
+
+Use one **`accounts`** array entry per Instagram account. Each account should have its **own internal-use Meta app** (`appSecret`, `verifyToken`, `pageAccessToken`, `pageId`). Nanobot routes inbound DMs and approved sends by `accountKey`.
+
+**Poll-first (recommended to start):** set `useWebhook: false`. Only `pageId` + `pageAccessToken` are required per account.
+
+**Webhooks later:** register each Meta app to  
+`https://YOUR_PUBLIC_HOST/webhook/instagram/{accountKey}`  
+(with matching per-account `verifyToken` / `appSecret`). Legacy single-account setups may still use `/webhook/instagram`.
+
+Full Meta setup steps: [`docs/instagram_multi_account_meta_setup.md`](instagram_multi_account_meta_setup.md).
+
+```json
+{
+  "channels": {
+    "instagram": {
+      "enabled": true,
+      "consentGranted": true,
+      "useWebhook": false,
+      "pollIntervalSeconds": 60,
+      "slackBotToken": "xoxb-...",
+      "slackDraftChannel": "C0XXXXXXXXX",
+      "slackAppToken": "xapp-...",
+      "allowFrom": ["*"],
+      "accounts": [
+        {
+          "accountKey": "brand_main",
+          "label": "Brand Main",
+          "pageId": "111111111111111",
+          "pageAccessToken": "EAAB...",
+          "igUserId": "",
+          "appSecret": "secret-for-brand-main-app",
+          "verifyToken": "verify-token-brand-main"
+        },
+        {
+          "accountKey": "brand_outlet",
+          "label": "Brand Outlet",
+          "pageId": "222222222222222",
+          "pageAccessToken": "EAAB...",
+          "appSecret": "secret-for-brand-outlet-app",
+          "verifyToken": "verify-token-brand-outlet"
+        }
+      ]
+    }
+  }
+}
+```
+
+Legacy top-level `pageAccessToken` / `pageId` / `appSecret` / `verifyToken` still work for a single account (normalized into one `accounts` entry).
+
 **References:** [Instagram Messaging get started](https://developers.facebook.com/docs/messenger-platform/instagram/get-started/), [Webhook verification](https://developers.facebook.com/docs/messenger-platform/webhooks/), [Send API](https://developers.facebook.com/docs/messenger-platform/instagram/features/send-message/), [Page conversations](https://developers.facebook.com/docs/graph-api/reference/page/conversations/), [Slack Socket Mode](https://api.slack.com/apis/connections/socket).
 
 ---
@@ -303,6 +353,7 @@ When you receive a message from the instagram channel:
 
 1. Read the customer's message carefully.
 2. Consult the knowledge base files in this workspace for product and policy information.
-3. Draft a helpful, on-brand reply.
-4. Your reply is posted to Slack where a human will review it and choose to send, edit and send, or discard it.
+3. If a reply is warranted, call `create_instagram_draft` with the proposed reply text (and optional reviewer notes). This queues the draft for Slack human review — it does **not** send to Instagram.
+4. If no reply is needed, do **not** call `create_instagram_draft`. A Slack review card will still be posted indicating no reply was suggested; humans can use **Edit & Send** if they disagree.
 5. Do NOT attempt to send the reply yourself — there is no Instagram send tool for the agent.
+6. Each Instagram customer conversation appears as one Slack thread; review cards include the customer message for context.
