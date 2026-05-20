@@ -164,6 +164,30 @@ class AgentDefaults(Base):
         validation_alias=AliasChoices("consolidationRatio"),
         serialization_alias="consolidationRatio",
     )  # Consolidation target ratio (0.5 = 50% of budget retained after compression)
+    archive_media_max_bytes: int = Field(
+        default=10_485_760,
+        ge=1,
+        validation_alias=AliasChoices("archiveMediaMaxBytes"),
+        serialization_alias="archiveMediaMaxBytes",
+    )
+    archive_extract_max_chars: int = Field(
+        default=8_000,
+        ge=256,
+        validation_alias=AliasChoices("archiveExtractMaxChars"),
+        serialization_alias="archiveExtractMaxChars",
+    )
+    archive_bootstrap_max_chars: int = Field(
+        default=12_000,
+        ge=0,
+        validation_alias=AliasChoices("archiveBootstrapMaxChars"),
+        serialization_alias="archiveBootstrapMaxChars",
+    )
+    archive_max_images: int = Field(
+        default=5,
+        ge=0,
+        validation_alias=AliasChoices("archiveMaxImages"),
+        serialization_alias="archiveMaxImages",
+    )
     dream: DreamConfig = Field(default_factory=DreamConfig)
     eager_knowledge: EagerKnowledgeConfig = Field(default_factory=EagerKnowledgeConfig)
 

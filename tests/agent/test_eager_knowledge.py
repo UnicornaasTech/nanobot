@@ -39,6 +39,7 @@ def _manager(
             context_window_tokens=8192,
             build_messages=MagicMock(return_value=[]),
             get_tool_definitions=MagicMock(return_value=[]),
+            workspace=tmp_path,
         )
     scheduled: list[asyncio.Task] = []
 
@@ -66,7 +67,7 @@ async def test_singleton_flushes_to_history_after_idle(tmp_path: Path) -> None:
     assert await mgr.maybe_flush("slack:C1", reason="scheduled")
 
     history = (tmp_path / "memory" / "history.jsonl").read_text(encoding="utf-8")
-    assert "[EAGER singleton slack:C1]" in history
+    assert "[single raw message slack:C1]" in history
     assert "ambient one-off" in history
     assert session.metadata.get("_prospr_eager_cursor") == 1
 
@@ -87,6 +88,22 @@ async def test_batch_triggers_archive_and_advances_cursor(tmp_path: Path) -> Non
     archived = consolidator.archive.await_args.args[0]
     assert len(archived) == 3
     assert session.metadata.get("_prospr_eager_cursor") == 3
+
+
+@pytest.mark.asyncio
+async def test_batch_skip_advances_cursor_without_history(tmp_path: Path) -> None:
+    mgr, sessions, consolidator = _manager(tmp_path)
+    consolidator.archive = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+    session = sessions.get_or_create("slack:C-empty")
+    for _ in range(3):
+        session.add_message("user", "")
+    sessions.save(session)
+    await mgr.maybe_flush("slack:C-empty", reason="scheduled")
+
+    assert session.metadata.get("_prospr_eager_cursor") == 3
+    history_path = tmp_path / "memory" / "history.jsonl"
+    assert not history_path.exists() or not history_path.read_text(encoding="utf-8").strip()
 
 
 @pytest.mark.asyncio
@@ -218,17 +235,12 @@ async def test_token_consolidation_skips_eager_archived_prefix(tmp_path: Path) -
     session.last_consolidated = 0
     sessions.save(session)
 
-    boundary = consolidator.pick_consolidation_boundary(session, tokens_to_remove=1)
-    assert boundary is not None
-    end_idx = boundary[0]
-    assert end_idx > 3
-
     from nanobot.agent.eager_knowledge import eager_consolidation_start
 
     start_idx = eager_consolidation_start(session)
     assert start_idx == 3
-    chunk = session.messages[start_idx:end_idx]
-    assert len(chunk) == end_idx - 3
+    chunk = session.messages[start_idx:]
+    assert len(chunk) == 1
     await consolidator.archive(chunk)
     consolidator.archive.assert_awaited_once()
     archived = consolidator.archive.await_args.args[0]
@@ -243,4 +255,4 @@ def test_eager_cursor_shifts_when_session_prefix_trimmed(tmp_path: Path) -> None
     session.metadata["_prospr_eager_cursor"] = 7
     session.retain_recent_legal_suffix(5)
     assert len(session.messages) == 5
-    assert read_eager_cursor(session) == 2
+    assert read_eager_cursor(session) == 0

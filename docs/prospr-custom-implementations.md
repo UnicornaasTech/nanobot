@@ -58,6 +58,7 @@ When `agents.defaults.eagerKnowledge.enabled` is **true**, session traffic is pr
 | Piece                                                            | Behavior                                                                                                                                                                                                                                                                                                             |
 | ---------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **`EagerKnowledgeManager`** (`nanobot/agent/eager_knowledge.py`) | Cursored flush (`_prospr_eager_cursor`). Batch ≥ `minBatch` → `Consolidator.archive()`. Smaller batches flush after `singletonIdleS` via raw `[EAGER singleton …]` append (no LLM). Token overflow / file-cap consolidation skip indices already covered by the eager cursor (no duplicate `history.jsonl` entries). |
+| **`Consolidator.archive()`** (shared)                            | Skips empty payloads and no-op LLM outputs (`(nothing)`, `[no summary]`). Inlines session `media` (images to vision blocks, documents via text extraction) with per-file and prompt budget caps. System prompt includes labeled **REFERENCE ONLY** bootstrap (`AGENTS.md`, `SOUL.md`, `USER.md`, `TOOLS.md`) so summaries do not repeat standing instructions. |
 | **Triggers**                                                     | After `no_reply` persist and after normal turn `_state_save`; idle tick in `AgentLoop.run()` for cold singletons.                                                                                                                                                                                                    |
 | **Slack provenance**                                             | `slack_ts`, `slack_thread_ts`, `slack_root_ts`, `slack_reply_kind` on stored user rows; archived lines prefixed e.g. `[slack C123 reply root=…]`.                                                                                                                                                                    |
 
@@ -258,6 +259,10 @@ Fragments below merge into `~/.nanobot/config.json`. Longer setup runbooks: [`do
 | `eagerKnowledge.minBatch` | int | `3` | LLM archive when pending chunk reaches this size. |
 | `eagerKnowledge.singletonIdleS` | int | `120` | Raw flush for smaller chunks after this idle time (seconds). |
 | `eagerKnowledge.maxBatch` | int | `20` | Max messages per eager flush. |
+| `archiveMediaMaxBytes` | int | `10485760` | Max bytes read per attachment during `Consolidator.archive()` (eager + token consolidation). |
+| `archiveExtractMaxChars` | int | `8000` | Max inlined text per extracted document in archive prompts. |
+| `archiveBootstrapMaxChars` | int | `12000` | Max combined bootstrap reference block in archive system prompt. |
+| `archiveMaxImages` | int | `5` | Max vision image blocks per archive LLM call. |
 
 #### Example — `unifiedSession`
 

@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import mimetypes
 import os
 import re
 import weakref
 from contextlib import suppress
 from datetime import datetime
+from importlib.resources import files as pkg_files
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator
 
@@ -19,8 +21,11 @@ from nanobot.agent.eager_knowledge import eager_consolidation_start
 from nanobot.agent.runner import AgentRunner, AgentRunSpec
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.session.manager import Session
+from nanobot.utils.document import extract_documents
 from nanobot.utils.gitstore import GitStore
 from nanobot.utils.helpers import (
+    build_image_content_blocks,
+    detect_image_mime,
     ensure_dir,
     estimate_message_tokens,
     estimate_prompt_tokens_chain,
@@ -428,6 +433,184 @@ class MemoryStore:
         )
 
 
+# ---------------------------------------------------------------------------
+# Archive formatting and summary normalization
+# ---------------------------------------------------------------------------
+
+_ARCHIVE_BOOTSTRAP_FILES = ("AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md")
+_ARCHIVE_TRANSCRIPT_HEADER = "## INPUT — Conversation transcript (summarize THIS only)\n\n"
+_NOOP_SUMMARIES = frozenset({"(nothing)", "[no summary]"})
+ARCHIVE_IMAGE_TOKEN_RESERVE = 1200
+ARCHIVE_SYSTEM_OVERHEAD = 512
+
+
+def _normalize_archive_summary(text: str | None) -> str | None:
+    """Return None for empty or no-op consolidation outputs."""
+    if not text or not isinstance(text, str):
+        return None
+    stripped = text.strip()
+    if not stripped:
+        return None
+    if stripped.lower() in _NOOP_SUMMARIES:
+        return None
+    return stripped
+
+
+def _is_workspace_template_content(content: str, template_path: str) -> bool:
+    """True when workspace file is still the bundled default template."""
+    with suppress(Exception):
+        tpl = pkg_files("nanobot") / "templates" / template_path
+        if tpl.is_file():
+            return content.strip() == tpl.read_text(encoding="utf-8").strip()
+    return False
+
+
+def _estimate_text_tokens(text: str) -> int:
+    try:
+        enc = tiktoken.get_encoding("cl100k_base")
+        return len(enc.encode(text))
+    except Exception:
+        return max(1, len(text) // 4)
+
+
+def _content_to_archive_text(content: Any) -> str:
+    """Normalize session message content to plain text for archive formatting."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text = block.get("text")
+                if isinstance(text, str) and text.strip():
+                    parts.append(text)
+        return "\n".join(parts)
+    if content is None:
+        return ""
+    return str(content)
+
+
+def _format_tools_suffix(message: dict[str, Any]) -> str:
+    tools_used = message.get("tools_used")
+    if not tools_used or not isinstance(tools_used, (list, tuple)):
+        return ""
+    names = [str(t) for t in tools_used if t]
+    return f" [tools: {', '.join(names)}]" if names else ""
+
+
+def _count_archive_vision_images(image_blocks: list[dict[str, Any]]) -> int:
+    return sum(
+        1 for block in image_blocks if isinstance(block, dict) and block.get("type") == "image_url"
+    )
+
+
+def _format_message_line(message: dict[str, Any]) -> str | None:
+    """Single transcript line from message content (no media expansion)."""
+    content = _content_to_archive_text(message.get("content"))
+    if not content.strip():
+        return None
+    tools = _format_tools_suffix(message)
+    return (
+        f"[{message.get('timestamp', '?')[:16]}] "
+        f"{message.get('role', 'user').upper()}{tools}: {content}"
+    )
+
+
+def format_messages_for_archive(
+    messages: list[dict[str, Any]],
+    *,
+    max_media_bytes: int,
+    extract_max_chars: int,
+    max_images: int,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Build transcript text and optional vision blocks for consolidation."""
+    lines: list[str] = []
+    image_blocks: list[dict[str, Any]] = []
+    images_embedded = 0
+
+    for message in messages:
+        text = _content_to_archive_text(message.get("content"))
+        media_paths = message.get("media")
+        paths: list[str] = []
+        if isinstance(media_paths, list):
+            paths = [p for p in media_paths if isinstance(p, str) and p]
+
+        doc_parts: list[str] = []
+        for path_str in paths:
+            p = Path(path_str)
+            if not p.is_file():
+                lines.append(f"[media missing: {p.name}]")
+                continue
+            try:
+                size = p.stat().st_size
+            except OSError:
+                lines.append(f"[media unreadable: {p.name}]")
+                continue
+            if size > max_media_bytes:
+                lines.append(
+                    f"[media skipped: {p.name} ({size} bytes > {max_media_bytes} limit)]"
+                )
+                continue
+
+            with open(p, "rb") as f:
+                header = f.read(16)
+            mime = detect_image_mime(header) or mimetypes.guess_type(path_str)[0]
+            if mime and mime.startswith("image/"):
+                if images_embedded >= max_images:
+                    lines.append(f"[image skipped: batch image limit ({max_images})]")
+                    continue
+                try:
+                    raw = p.read_bytes()
+                except OSError:
+                    lines.append(f"[image unreadable: {p.name}]")
+                    continue
+                if len(raw) > max_media_bytes:
+                    lines.append(f"[media skipped: {p.name} ({len(raw)} bytes > limit)]")
+                    continue
+                img_mime = detect_image_mime(raw) or mime
+                image_blocks.extend(
+                    build_image_content_blocks(
+                        raw,
+                        img_mime,
+                        str(p.resolve()),
+                        f"(archive image: {p.name})",
+                    )
+                )
+                images_embedded += 1
+                continue
+
+            extracted, _images = extract_documents(
+                "",
+                [path_str],
+                max_file_size=max_media_bytes,
+            )
+            if extracted and extracted.strip():
+                body = extracted.strip()
+                if len(body) > extract_max_chars:
+                    body = truncate_text(body, extract_max_chars) + " … (truncated for archive)"
+                doc_parts.append(body)
+
+        line = _format_message_line(message)
+        combined = text.strip()
+        if doc_parts:
+            combined = "\n\n".join(part for part in [combined, *doc_parts] if part)
+        if line is None and combined:
+            tools = _format_tools_suffix(message)
+            line = (
+                f"[{message.get('timestamp', '?')[:16]}] "
+                f"{message.get('role', 'user').upper()}{tools}: {combined}"
+            )
+        elif line and doc_parts:
+            line = f"{line}\n" + "\n".join(doc_parts)
+        if line:
+            lines.append(line)
+
+    return "\n".join(lines), image_blocks
+
+
+def has_archivable_content(formatted_text: str, image_blocks: list[dict[str, Any]]) -> bool:
+    return bool(formatted_text.strip() or image_blocks)
+
 
 # ---------------------------------------------------------------------------
 # Consolidator — lightweight token-budget triggered consolidation
@@ -460,6 +643,11 @@ class Consolidator:
         get_tool_definitions: Callable[[], list[dict[str, Any]]],
         max_completion_tokens: int = 4096,
         consolidation_ratio: float = 0.5,
+        workspace: Path | None = None,
+        archive_media_max_bytes: int = 10_485_760,
+        archive_extract_max_chars: int = 8_000,
+        archive_bootstrap_max_chars: int = 12_000,
+        archive_max_images: int = 5,
     ):
         self.store = store
         self.provider = provider
@@ -468,6 +656,11 @@ class Consolidator:
         self.context_window_tokens = context_window_tokens
         self.max_completion_tokens = max_completion_tokens
         self.consolidation_ratio = consolidation_ratio
+        self.workspace = (workspace or store.workspace).expanduser().resolve()
+        self.archive_media_max_bytes = archive_media_max_bytes
+        self.archive_extract_max_chars = archive_extract_max_chars
+        self.archive_bootstrap_max_chars = archive_bootstrap_max_chars
+        self.archive_max_images = archive_max_images
         self._build_messages = build_messages
         self._get_tool_definitions = get_tool_definitions
         self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
@@ -588,9 +781,10 @@ class Consolidator:
         return summary
 
     def _persist_last_summary(self, session: Session, summary: str | None) -> None:
-        if summary and summary != "(nothing)":
+        normalized = _normalize_archive_summary(summary)
+        if normalized:
             session.metadata["_last_summary"] = {
-                "text": summary,
+                "text": normalized,
                 "last_active": session.updated_at.isoformat(),
             }
             self.sessions.save(session)
@@ -625,9 +819,9 @@ class Consolidator:
         """Available input token budget for consolidation LLM."""
         return self.context_window_tokens - self.max_completion_tokens - self._SAFETY_BUFFER
 
-    def _truncate_to_token_budget(self, text: str) -> str:
+    def _truncate_to_token_budget(self, text: str, *, max_tokens: int | None = None) -> str:
         """Truncate text so it fits within the consolidation LLM's token budget."""
-        budget = self._input_token_budget
+        budget = self._input_token_budget if max_tokens is None else max_tokens
         if budget <= 0:
             return truncate_text(text, _RAW_ARCHIVE_MAX_CHARS)
         try:
@@ -639,6 +833,105 @@ class Consolidator:
         except Exception:
             return truncate_text(text, budget * 4)
 
+    def _load_bootstrap_context(self) -> str:
+        """Load workspace bootstrap files for archive dedup reference."""
+        parts: list[str] = []
+        for filename in _ARCHIVE_BOOTSTRAP_FILES:
+            file_path = self.workspace / filename
+            if not file_path.exists():
+                continue
+            try:
+                content = file_path.read_text(encoding="utf-8")
+            except OSError:
+                logger.debug("Skipping unreadable bootstrap file {}", file_path)
+                continue
+            if _is_workspace_template_content(content, filename):
+                continue
+            parts.append(f"## {filename}\n\n{content}")
+        combined = "\n\n".join(parts)
+        if not combined:
+            return ""
+        if self.archive_bootstrap_max_chars > 0 and len(combined) > self.archive_bootstrap_max_chars:
+            combined = (
+                truncate_text(combined, self.archive_bootstrap_max_chars)
+                + " … (bootstrap truncated for archive)"
+            )
+        return combined
+
+    def _build_archive_payload(
+        self,
+        messages: list[dict[str, Any]],
+    ) -> tuple[str, list[dict[str, Any]]]:
+        return format_messages_for_archive(
+            messages,
+            max_media_bytes=self.archive_media_max_bytes,
+            extract_max_chars=self.archive_extract_max_chars,
+            max_images=self.archive_max_images,
+        )
+
+    def _truncate_archive_payload(
+        self,
+        system_text: str,
+        transcript_text: str,
+        image_count: int,
+    ) -> str | None:
+        """Fit transcript text into remaining input budget after system and images."""
+        if image_count > 0 and not transcript_text.strip():
+            return ""
+        input_budget = self._input_token_budget
+        if input_budget <= 0:
+            return truncate_text(transcript_text, _RAW_ARCHIVE_MAX_CHARS)
+        system_tokens = _estimate_text_tokens(system_text)
+        image_reserve = image_count * ARCHIVE_IMAGE_TOKEN_RESERVE
+        transcript_budget = (
+            input_budget - system_tokens - image_reserve - ARCHIVE_SYSTEM_OVERHEAD
+        )
+        if transcript_budget <= 0:
+            return None if image_count == 0 else ""
+        return self._truncate_to_token_budget(
+            transcript_text,
+            max_tokens=min(transcript_budget, input_budget),
+        )
+
+    def _build_archive_user_content(
+        self,
+        transcript_text: str,
+        image_blocks: list[dict[str, Any]],
+    ) -> str | list[dict[str, Any]]:
+        header = _ARCHIVE_TRANSCRIPT_HEADER
+        body = transcript_text.strip() or "(see images above)"
+        text = f"{header}{body}"
+        if not image_blocks:
+            return text
+        return [*image_blocks, {"type": "text", "text": text}]
+
+    def _raw_archive_fallback(self, messages: list[dict[str, Any]]) -> None:
+        """Fallback: dump formatted messages without LLM summarization."""
+        formatted_text, image_blocks = self._build_archive_payload(messages)
+        if not has_archivable_content(formatted_text, image_blocks):
+            return
+        bootstrap = self._load_bootstrap_context()
+        system = render_template(
+            "agent/consolidator_archive.md",
+            strip=True,
+            bootstrap_context=bootstrap,
+        )
+        truncated = self._truncate_archive_payload(system, formatted_text, 0)
+        if truncated is None:
+            return
+        for block in image_blocks:
+            path = (block.get("_meta") or {}).get("path", "")
+            if path:
+                truncated += f"\n[image: {path}]"
+        truncated = truncate_text(truncated, _RAW_ARCHIVE_MAX_CHARS)
+        self.store.append_history(
+            f"[RAW] {len(messages)} messages\n{truncated}",
+            max_chars=_RAW_ARCHIVE_MAX_CHARS,
+        )
+        logger.warning(
+            "Memory consolidation degraded: raw-archived {} messages", len(messages)
+        )
+
     async def archive(self, messages: list[dict]) -> str | None:
         """Summarize messages via LLM and append to history.jsonl.
 
@@ -646,32 +939,48 @@ class Consolidator:
         """
         if not messages:
             return None
+
+        formatted_text, image_blocks = self._build_archive_payload(messages)
+        if not has_archivable_content(formatted_text, image_blocks):
+            return None
+
+        bootstrap = self._load_bootstrap_context()
+        system = render_template(
+            "agent/consolidator_archive.md",
+            strip=True,
+            bootstrap_context=bootstrap,
+        )
+        vision_count = _count_archive_vision_images(image_blocks)
+        truncated = self._truncate_archive_payload(
+            system,
+            formatted_text,
+            vision_count,
+        )
+        if truncated is None and vision_count == 0:
+            return None
+
+        user_content = self._build_archive_user_content(truncated or "", image_blocks)
+
         try:
-            formatted = MemoryStore._format_messages(messages)
-            formatted = self._truncate_to_token_budget(formatted)
             response = await self.provider.chat_with_retry(
                 model=self.model,
                 messages=[
-                    {
-                        "role": "system",
-                        "content": render_template(
-                            "agent/consolidator_archive.md",
-                            strip=True,
-                        ),
-                    },
-                    {"role": "user", "content": formatted},
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_content},
                 ],
                 tools=None,
                 tool_choice=None,
             )
             if response.finish_reason == "error":
                 raise RuntimeError(f"LLM returned error: {response.content}")
-            summary = response.content or "[no summary]"
+            summary = _normalize_archive_summary(response.content)
+            if summary is None:
+                return None
             self.store.append_history(summary, max_chars=_ARCHIVE_SUMMARY_MAX_CHARS)
             return summary
         except Exception:
             logger.warning("Consolidation LLM call failed, raw-dumping to history")
-            self.store.raw_archive(messages)
+            self._raw_archive_fallback(messages)
             return None
 
     async def maybe_consolidate_by_tokens(

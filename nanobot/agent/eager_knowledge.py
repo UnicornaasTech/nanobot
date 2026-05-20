@@ -205,12 +205,16 @@ class EagerKnowledgeManager:
         enriched = enrich_messages_for_archive(chunk)
         summary = await self.consolidator.archive(enriched)
         self._advance_cursor(session, cursor, len(chunk))
+        if summary:
+            summary_tag = "ok"
+        else:
+            summary_tag = "skip"
         logger.info(
             "Eager knowledge batch flush for {} ({} msgs, reason={}, summary={})",
             session_key,
             len(chunk),
             reason,
-            "ok" if summary else "raw",
+            summary_tag,
         )
 
     def _flush_singleton_raw(
@@ -223,19 +227,49 @@ class EagerKnowledgeManager:
         reason: str,
     ) -> None:
         enriched = enrich_messages_for_archive(chunk)
-        from nanobot.agent.memory import MemoryStore
+        formatted_text, image_blocks = self.consolidator._build_archive_payload(enriched)
+        from nanobot.agent.memory import has_archivable_content
 
-        formatted = MemoryStore._format_messages(enriched)
-        if not formatted.strip():
+        if not has_archivable_content(formatted_text, image_blocks):
             self._advance_cursor(session, cursor, len(chunk))
             logger.debug(
                 "Eager knowledge singleton skip (no archivable content) for {}",
                 session_key,
             )
             return
-        header = f"[EAGER singleton {session_key}]"
-        entry = f"{header}\n{formatted}"
-        self.consolidator.store.append_history(entry)
+        from nanobot.agent.memory import _RAW_ARCHIVE_MAX_CHARS
+        from nanobot.utils.helpers import truncate_text
+        from nanobot.utils.prompt_templates import render_template
+
+        bootstrap = self.consolidator._load_bootstrap_context()
+        system_text = render_template(
+            "agent/consolidator_archive.md",
+            strip=True,
+            bootstrap_context=bootstrap,
+        )
+        truncated = self.consolidator._truncate_archive_payload(
+            system_text,
+            formatted_text,
+            0,
+        )
+        body = truncated if truncated is not None else formatted_text
+        for block in image_blocks:
+            if block.get("type") != "image_url":
+                continue
+            path = (block.get("_meta") or {}).get("path", "")
+            if path:
+                body += f"\n[image: {path}]"
+        body = truncate_text(body, _RAW_ARCHIVE_MAX_CHARS)
+        if not body.strip():
+            self._advance_cursor(session, cursor, len(chunk))
+            logger.debug(
+                "Eager knowledge singleton skip (truncated to empty) for {}",
+                session_key,
+            )
+            return
+        header = f"[single raw message {session_key}]"
+        entry = f"{header}\n{body}"
+        self.consolidator.store.append_history(entry, max_chars=_RAW_ARCHIVE_MAX_CHARS)
         self._advance_cursor(session, cursor, len(chunk))
         logger.info(
             "Eager knowledge singleton flush for {} ({} msgs, reason={})",

@@ -183,11 +183,35 @@ class AgentLoop:
         preset_snapshot_loader: preset_helpers.PresetSnapshotLoader | None = None,
         runtime_model_publisher: Callable[[str, str | None], None] | None = None,
         eager_knowledge: EagerKnowledgeConfig | None = None,
+        archive_media_max_bytes: int | None = None,
+        archive_extract_max_chars: int | None = None,
+        archive_bootstrap_max_chars: int | None = None,
+        archive_max_images: int | None = None,
     ):
         from nanobot.config.schema import ToolsConfig
 
         _tc = tools_config or ToolsConfig()
         defaults = AgentDefaults()
+        _archive_media_max_bytes = (
+            archive_media_max_bytes
+            if archive_media_max_bytes is not None
+            else defaults.archive_media_max_bytes
+        )
+        _archive_extract_max_chars = (
+            archive_extract_max_chars
+            if archive_extract_max_chars is not None
+            else defaults.archive_extract_max_chars
+        )
+        _archive_bootstrap_max_chars = (
+            archive_bootstrap_max_chars
+            if archive_bootstrap_max_chars is not None
+            else defaults.archive_bootstrap_max_chars
+        )
+        _archive_max_images = (
+            archive_max_images
+            if archive_max_images is not None
+            else defaults.archive_max_images
+        )
         self.bus = bus
         self.channels_config = channels_config
         self.provider = provider
@@ -281,6 +305,11 @@ class AgentLoop:
             get_tool_definitions=self.tools.get_definitions,
             max_completion_tokens=provider.generation.max_tokens,
             consolidation_ratio=consolidation_ratio,
+            workspace=workspace,
+            archive_media_max_bytes=_archive_media_max_bytes,
+            archive_extract_max_chars=_archive_extract_max_chars,
+            archive_bootstrap_max_chars=_archive_bootstrap_max_chars,
+            archive_max_images=_archive_max_images,
         )
         self.auto_compact = AutoCompact(
             sessions=self.sessions,
@@ -365,6 +394,10 @@ class AgentLoop:
             provider_snapshot_loader=provider_snapshot_loader,
             preset_snapshot_loader=preset_snapshot_loader,
             eager_knowledge=defaults.eager_knowledge,
+            archive_media_max_bytes=defaults.archive_media_max_bytes,
+            archive_extract_max_chars=defaults.archive_extract_max_chars,
+            archive_bootstrap_max_chars=defaults.archive_bootstrap_max_chars,
+            archive_max_images=defaults.archive_max_images,
             **extra,
         )
 
@@ -1194,7 +1227,7 @@ class AgentLoop:
             pending_queue=pending_queue,
         )
         self._save_turn(session, all_msgs, 1 + len(history))
-        session.enforce_file_cap(on_archive=self.context.memory.raw_archive)
+        session.enforce_file_cap(on_archive=self.consolidator._raw_archive_fallback)
         self._clear_runtime_checkpoint(session)
         self.sessions.save(session)
         self._schedule_background(
@@ -1464,7 +1497,7 @@ class AgentLoop:
             last_msg["media"] = list(dict.fromkeys([*media, *ctx.generated_media]))
 
         self._save_turn(ctx.session, ctx.all_messages, ctx.save_skip)
-        ctx.session.enforce_file_cap(on_archive=self.context.memory.raw_archive)
+        ctx.session.enforce_file_cap(on_archive=self.consolidator._raw_archive_fallback)
         self._clear_pending_user_turn(ctx.session)
         self._clear_runtime_checkpoint(ctx.session)
         self.sessions.save(ctx.session)
