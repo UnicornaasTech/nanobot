@@ -26,6 +26,54 @@ from nanobot.channels.instagram import (
 from nanobot.channels.instagram_review_state import compose_chat_id
 
 
+def test_legacy_top_level_config_rejected() -> None:
+    with pytest.raises(ValueError, match="accounts\\[\\]"):
+        InstagramConfig.model_validate(
+            {
+                "enabled": True,
+                "consentGranted": True,
+                "pageAccessToken": "tok",
+                "pageId": "PAGE1",
+                "slackBotToken": "xoxb-test",
+                "slackDraftChannel": "C01234567",
+                "slackAppToken": "xapp-test-token",
+            }
+        )
+
+
+def test_hyphenated_account_keys_register_distinct_webhook_routes() -> None:
+    bus = MessageBus()
+    cfg = InstagramConfig(
+        enabled=True,
+        consent_granted=True,
+        use_webhook=True,
+        slack_bot_token="xoxb-test",
+        slack_draft_channel="C01234567",
+        slack_app_token="xapp-test-token",
+        accounts=[
+            InstagramAccountConfig(
+                account_key="brand-a",
+                page_id="PAGE_A",
+                page_access_token="token_a",
+                app_secret="secret_a",
+                verify_token="verify_a",
+            ),
+            InstagramAccountConfig(
+                account_key="brand_a",
+                page_id="PAGE_B",
+                page_access_token="token_b",
+                app_secret="secret_b",
+                verify_token="verify_b",
+            ),
+        ],
+    )
+    ch = InstagramChannel(cfg.model_dump(by_alias=True), bus)
+    assert ch.app is not None
+    rules = {rule.rule for rule in ch.app.url_map.iter_rules()}
+    assert "/webhook/instagram/brand-a" in rules
+    assert "/webhook/instagram/brand_a" in rules
+
+
 def test_send_message_is_disabled() -> None:
     ch = InstagramChannel.__new__(InstagramChannel)
     with pytest.raises(NotImplementedError, match="Slack"):
@@ -38,10 +86,6 @@ def _channel(*, page_id: str = "PAGE1") -> InstagramChannel:
         enabled=True,
         consent_granted=True,
         use_webhook=True,
-        app_secret="meta_secret",
-        verify_token="verify_me",
-        page_access_token="page_token",
-        page_id=page_id,
         slack_bot_token="xoxb-test",
         slack_draft_channel="C01234567",
         slack_app_token="xapp-test-token",
@@ -77,7 +121,7 @@ def test_meta_signature_rejects_bad_sig() -> None:
     client = ch.app.test_client()
     body = b'{"object":"instagram","entry":[]}'
     rv = client.post(
-        "/webhook/instagram",
+        "/webhook/instagram/default",
         data=body,
         headers={
             "Content-Type": "application/json",
@@ -93,7 +137,7 @@ def test_meta_signature_accepts_valid_sig() -> None:
     body = b'{"object":"instagram","entry":[]}'
     sig = "sha256=" + hmac.new(b"meta_secret", body, hashlib.sha256).hexdigest()
     rv = client.post(
-        "/webhook/instagram",
+        "/webhook/instagram/default",
         data=body,
         headers={"Content-Type": "application/json", "X-Hub-Signature-256": sig},
     )

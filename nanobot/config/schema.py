@@ -41,6 +41,15 @@ class ChannelsConfig(Base):
     transcription_language: str | None = Field(default=None, pattern=r"^[a-z]{2,3}$")  # Optional ISO-639-1 hint for audio transcription
 
 
+class EagerKnowledgeConfig(Base):
+    """Eager promotion of session traffic into global history (fork-local)."""
+
+    enabled: bool = False
+    min_batch: int = Field(default=3, ge=1)
+    singleton_idle_s: int = Field(default=120, ge=0)
+    max_batch: int = Field(default=20, ge=1)
+
+
 class DreamConfig(Base):
     """Dream memory consolidation configuration."""
 
@@ -156,6 +165,7 @@ class AgentDefaults(Base):
         serialization_alias="consolidationRatio",
     )  # Consolidation target ratio (0.5 = 50% of budget retained after compression)
     dream: DreamConfig = Field(default_factory=DreamConfig)
+    eager_knowledge: EagerKnowledgeConfig = Field(default_factory=EagerKnowledgeConfig)
 
 
 class AgentsConfig(Base):

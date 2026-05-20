@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterator
 import tiktoken
 from loguru import logger
 
+from nanobot.agent.eager_knowledge import eager_consolidation_start
 from nanobot.agent.runner import AgentRunner, AgentRunSpec
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.session.manager import Session
@@ -565,8 +566,15 @@ class Consolidator:
         end_idx = self._replay_overflow_boundary(session, replay_max_messages)
         if end_idx is None:
             return None
-        chunk = session.messages[session.last_consolidated:end_idx]
+        start_idx = eager_consolidation_start(session)
+        if end_idx <= start_idx:
+            session.last_consolidated = end_idx
+            self.sessions.save(session)
+            return None
+        chunk = session.messages[start_idx:end_idx]
         if not chunk:
+            session.last_consolidated = end_idx
+            self.sessions.save(session)
             return None
         logger.info(
             "Replay-window consolidation for {}: chunk={} msgs, replay_max={}",
@@ -726,8 +734,27 @@ class Consolidator:
 
                 end_idx = boundary[0]
 
-                chunk = session.messages[session.last_consolidated:end_idx]
+                start_idx = eager_consolidation_start(session)
+                if end_idx <= start_idx:
+                    session.last_consolidated = end_idx
+                    self.sessions.save(session)
+                    try:
+                        estimated, source = self.estimate_session_prompt_tokens(
+                            session,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Token estimation failed for {}", session.key
+                        )
+                        estimated, source = 0, "error"
+                    if estimated <= target:
+                        break
+                    continue
+
+                chunk = session.messages[start_idx:end_idx]
                 if not chunk:
+                    session.last_consolidated = end_idx
+                    self.sessions.save(session)
                     break
 
                 logger.info(

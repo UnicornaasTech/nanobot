@@ -9,6 +9,7 @@ import pytest
 from nanobot.agent.loop import AgentLoop
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
+from nanobot.config.schema import EagerKnowledgeConfig
 from nanobot.providers.base import LLMResponse
 
 
@@ -19,9 +20,16 @@ def _make_loop(tmp_path: Path) -> AgentLoop:
     provider.chat_with_retry = AsyncMock(
         return_value=LLMResponse(content="should-not-run", tool_calls=[])
     )
-    loop = AgentLoop(bus=bus, provider=provider, workspace=tmp_path, model="test-model")
+    loop = AgentLoop(
+        bus=bus,
+        provider=provider,
+        workspace=tmp_path,
+        model="test-model",
+        eager_knowledge=EagerKnowledgeConfig(enabled=True, singleton_idle_s=0),
+    )
     loop.tools.get_definitions = MagicMock(return_value=[])
     loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
+    loop.eager_knowledge.schedule = MagicMock()  # type: ignore[method-assign]
     return loop
 
 
@@ -46,6 +54,7 @@ async def test_no_reply_silent_append_no_llm_no_outbound(tmp_path: Path) -> None
     assert session.metadata.get("pending_user_turn") is None
 
     assert loop.bus.outbound_size == 0
+    loop.eager_knowledge.schedule.assert_called_once_with("slack:C123")
 
 
 @pytest.mark.asyncio

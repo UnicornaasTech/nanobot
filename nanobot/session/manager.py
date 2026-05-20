@@ -247,6 +247,9 @@ class Session:
         dropped = len(self.messages) - len(retained)
         self.messages = retained
         self.last_consolidated = max(0, self.last_consolidated - dropped)
+        from nanobot.agent.eager_knowledge import adjust_eager_cursor_after_prefix_drop
+
+        adjust_eager_cursor_after_prefix_drop(self, dropped)
         self.updated_at = datetime.now()
 
     def enforce_file_cap(
@@ -261,14 +264,20 @@ class Session:
         before = list(self.messages)
         before_last_consolidated = self.last_consolidated
         before_count = len(before)
+        from nanobot.agent.eager_knowledge import read_eager_cursor
+
+        before_eager_cursor = read_eager_cursor(self)
         self.retain_recent_legal_suffix(limit)
         dropped_count = before_count - len(self.messages)
         if dropped_count <= 0:
             return
 
         dropped = before[:dropped_count]
-        already_consolidated = min(before_last_consolidated, dropped_count)
-        archive_chunk = dropped[already_consolidated:]
+        already_archived = max(
+            min(before_last_consolidated, dropped_count),
+            min(before_eager_cursor, dropped_count),
+        )
+        archive_chunk = dropped[already_archived:]
         if archive_chunk and on_archive:
             on_archive(archive_chunk)
         logger.info(

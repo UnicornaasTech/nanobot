@@ -17,6 +17,7 @@ from loguru import logger
 from nanobot.agent import model_presets as preset_helpers
 from nanobot.agent.autocompact import AutoCompact
 from nanobot.agent.context import ContextBuilder
+from nanobot.agent.eager_knowledge import EagerKnowledgeManager, slack_provenance_from_inbound
 from nanobot.agent.hook import AgentHook, CompositeHook
 from nanobot.agent.memory import Consolidator, Dream
 from nanobot.agent.progress_hook import AgentProgressHook
@@ -34,7 +35,7 @@ from nanobot.agent.unified_delivery import (
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
-from nanobot.config.schema import AgentDefaults, ModelPresetConfig
+from nanobot.config.schema import AgentDefaults, EagerKnowledgeConfig, ModelPresetConfig
 from nanobot.providers.base import LLMProvider
 from nanobot.providers.factory import ProviderSnapshot
 from nanobot.session.manager import Session, SessionManager
@@ -181,6 +182,7 @@ class AgentLoop:
         model_preset: str | None = None,
         preset_snapshot_loader: preset_helpers.PresetSnapshotLoader | None = None,
         runtime_model_publisher: Callable[[str, str | None], None] | None = None,
+        eager_knowledge: EagerKnowledgeConfig | None = None,
     ):
         from nanobot.config.schema import ToolsConfig
 
@@ -285,6 +287,16 @@ class AgentLoop:
             consolidator=self.consolidator,
             session_ttl_minutes=session_ttl_minutes,
         )
+        _eager_cfg = eager_knowledge if eager_knowledge is not None else defaults.eager_knowledge
+        self.eager_knowledge = EagerKnowledgeManager(
+            sessions=self.sessions,
+            consolidator=self.consolidator,
+            config=_eager_cfg,
+            schedule_background=self._schedule_background,
+            get_session_lock=lambda key: self._session_locks.setdefault(
+                key, asyncio.Lock()
+            ),
+        )
         self.dream = Dream(
             store=self.context.memory,
             provider=provider,
@@ -352,6 +364,7 @@ class AgentLoop:
             model_preset=defaults.model_preset,
             provider_snapshot_loader=provider_snapshot_loader,
             preset_snapshot_loader=preset_snapshot_loader,
+            eager_knowledge=defaults.eager_knowledge,
             **extra,
         )
 
@@ -582,6 +595,7 @@ class AgentLoop:
         if has_text or media_paths:
             extra: dict[str, Any] = {"media": list(media_paths)} if media_paths else {}
             extra.update(kwargs)
+            extra.update(slack_provenance_from_inbound(msg))
             text = msg.content if isinstance(msg.content, str) else ""
             session.add_message("user", text, **extra)
             self._mark_pending_user_turn(session)
@@ -617,11 +631,13 @@ class AgentLoop:
             extra: dict[str, Any] = (
                 {"media": list(media_paths)} if media_paths else {}
             )
+            extra.update(slack_provenance_from_inbound(work_msg))
             text = (
                 work_msg.content if isinstance(work_msg.content, str) else ""
             )
             session.add_message("user", text, **extra)
             self.sessions.save(session)
+            self.eager_knowledge.schedule(session_key)
 
     async def _append_no_reply_when_session_unlocked(self, msg: InboundMessage) -> None:
         """Persist a ``no_reply`` turn without injecting it into an active LLM run."""
@@ -859,6 +875,10 @@ class AgentLoop:
                     self._schedule_background,
                     active_session_keys=self._pending_queues.keys(),
                 )
+                if self.eager_knowledge.enabled:
+                    self._schedule_background(
+                        self.eager_knowledge.flush_idle_singletons()
+                    )
                 continue
             except asyncio.CancelledError:
                 # Preserve real task cancellation so shutdown can complete cleanly.
@@ -1454,6 +1474,7 @@ class AgentLoop:
                 replay_max_messages=self._max_messages,
             )
         )
+        self.eager_knowledge.schedule(ctx.session.key)
         return "ok"
 
     async def _state_respond(self, ctx: TurnContext) -> str:

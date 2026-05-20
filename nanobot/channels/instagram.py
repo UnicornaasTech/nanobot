@@ -67,6 +67,22 @@ _SLACK_ACTION_VALUE_SOFT_LIMIT = 1800
 _MAX_CUSTOMER_TEXT_CHARS = 3000
 _WEBHOOK_PATH_PREFIX = "/webhook/instagram/"
 
+# Top-level channel keys removed in favor of ``accounts[]`` only.
+_LEGACY_CHANNEL_CONFIG_KEYS = frozenset(
+    {
+        "app_secret",
+        "appSecret",
+        "verify_token",
+        "verifyToken",
+        "page_access_token",
+        "pageAccessToken",
+        "page_id",
+        "pageId",
+        "ig_user_id",
+        "igUserId",
+    }
+)
+
 
 class InstagramAccountConfig(Base):
     """Per-account Instagram + internal Meta app credentials."""
@@ -90,13 +106,6 @@ class InstagramConfig(Base):
     consent_granted: bool = False
     streaming: bool = False
 
-    # Legacy single-account fields (normalized into ``accounts`` when empty).
-    app_secret: str = ""
-    verify_token: str = ""
-    page_access_token: str = ""
-    page_id: str = ""
-    ig_user_id: str = ""
-
     accounts: list[InstagramAccountConfig] = Field(default_factory=list)
 
     use_webhook: bool = True
@@ -112,22 +121,21 @@ class InstagramConfig(Base):
 
     allow_from: list[str] = Field(default_factory=lambda: ["*"])
 
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_legacy_channel_fields(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            legacy = sorted(k for k in data if k in _LEGACY_CHANNEL_CONFIG_KEYS)
+            if legacy:
+                raise ValueError(
+                    "channels.instagram no longer supports top-level "
+                    f"{', '.join(legacy)}; move credentials into accounts[] "
+                    "(see docs/prospr-custom-implementations.md)."
+                )
+        return data
+
     @model_validator(mode="after")
-    def _normalize_accounts(self) -> InstagramConfig:
-        if not self.accounts:
-            if self.page_access_token or self.page_id:
-                key = (self.page_id or "default").strip() or "default"
-                self.accounts = [
-                    InstagramAccountConfig(
-                        account_key=key,
-                        label=key,
-                        page_id=self.page_id,
-                        page_access_token=self.page_access_token,
-                        ig_user_id=self.ig_user_id,
-                        app_secret=self.app_secret,
-                        verify_token=self.verify_token,
-                    ),
-                ]
+    def _ensure_account_keys(self) -> InstagramConfig:
         for acc in self.accounts:
             if not acc.account_key:
                 acc.account_key = (acc.page_id or "account").strip() or "account"
@@ -247,7 +255,7 @@ class InstagramChannel(BaseChannel):
 
         self.app = Flask(__name__)
 
-        for acc in self._account_list():
+        for idx, acc in enumerate(self._account_list()):
             path = self._webhook_path_for_account(acc.account_key)
 
             def make_verify_handler(account: InstagramAccountConfig):
@@ -279,40 +287,19 @@ class InstagramChannel(BaseChannel):
 
                 return ig_receive
 
+            # Endpoint ids are index-based so hyphen/underscore variants cannot collide.
             self.app.add_url_rule(
                 path,
-                endpoint=f"ig_verify_{acc.account_key}",
+                endpoint=f"ig_verify_{idx}",
                 view_func=make_verify_handler(acc),
                 methods=["GET"],
             )
             self.app.add_url_rule(
                 path,
-                endpoint=f"ig_receive_{acc.account_key}",
+                endpoint=f"ig_receive_{idx}",
                 view_func=make_receive_handler(acc),
                 methods=["POST"],
             )
-
-        # Legacy single-route webhook when exactly one account (backward compatibility).
-        if len(self._account_list()) == 1:
-            sole = self._account_list()[0]
-
-            @self.app.route("/webhook/instagram", methods=["GET"])
-            def ig_verify_legacy():
-                mode = request.args.get("hub.mode")
-                token = request.args.get("hub.verify_token")
-                challenge = request.args.get("hub.challenge")
-                if mode == "subscribe" and token == sole.verify_token and challenge is not None:
-                    self.logger.info("Instagram webhook verified (legacy path).")
-                    return Response(str(challenge), status=200, mimetype="text/plain")
-                return Response("Forbidden", status=403, mimetype="text/plain")
-
-            @self.app.route("/webhook/instagram", methods=["POST"])
-            def ig_receive_legacy():
-                if not self._verify_meta_signature(request, sole):
-                    return "Unauthorized", 401
-                payload = request.get_json(force=True)
-                self._handle_ig_payload(payload, sole)
-                return jsonify({"status": "ok"}), 200
 
     def send_message(self, *args: Any, **kwargs: Any) -> None:
         """Spec / legacy name — direct Instagram send is never exposed to the agent."""

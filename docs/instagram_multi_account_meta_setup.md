@@ -53,8 +53,6 @@ When you enable `useWebhook: true`, register **this app’s** webhook for **this
 - Subscribe to `messages` (and fields Meta requires for Instagram DMs).
 - Subscribe the Page to this app.
 
-If you have only one account, the legacy path `/webhook/instagram` also works.
-
 ### 5) Validate Graph API access (per account)
 
 ```http
@@ -103,10 +101,6 @@ Set `useWebhook: false` to start with polling only. Each account still needs `pa
   }
 }
 ```
-
-### Legacy single-account config
-
-Top-level `pageAccessToken`, `pageId`, `appSecret`, and `verifyToken` are still accepted. They are normalized into a single `accounts` entry at startup.
 
 ## Routing behavior
 

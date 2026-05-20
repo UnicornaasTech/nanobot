@@ -11,7 +11,7 @@ Optional extras are defined in **`pyproject.toml`** at the repo root:
 | Extra | Purpose |
 |--------|--------|
 | **`gmail`** | Google OAuth + Gmail API client libraries for `create_gmail_draft` |
-| **`instagram`** | Flask + werkzeug (Meta **`/webhook/instagram`** when `useWebhook` is `true`); Slack draft approvals use **Socket Mode** (no Slack HTTP route in nanobot) |
+| **`instagram`** | Flask + werkzeug (Meta **`/webhook/instagram/{accountKey}`** when `useWebhook` is `true`); Slack draft approvals use **Socket Mode** (no Slack HTTP route in nanobot) |
 | **`dev`** | pytest, ruff, Flask for tests, etc. |
 
 ### Checked-out source (recommended for this fork)
@@ -56,8 +56,8 @@ Inbound mail is **always pulled** over IMAP (nanobot connects to Gmail). There i
 ### Instagram (Meta → nanobot)
 
 - Set **`useWebhook`** to **`false`**. Meta will not call your server for new DMs; nanobot uses the **Graph API** (`GET /{page-id}/conversations?platform=INSTAGRAM`, …) on **`pollIntervalSeconds`** instead.
-- You still need a valid **`pageId`**, **`pageAccessToken`**, and **`pollIntervalSeconds`** set to a positive value (default **60**).
-- Later, when you have a public URL, set **`useWebhook`** to **`true`**, add **`appSecret`** / **`verifyToken`**, configure Meta’s webhook, and optionally keep **`pollFallbackEnabled`** **`true`** for redundancy.
+- Each **`accounts[]`** entry still needs **`pageId`**, **`pageAccessToken`**, and channel-level **`pollIntervalSeconds`** set to a positive value (default **60**).
+- Later, when you have a public URL, set **`useWebhook`** to **`true`**, add per-account **`appSecret`** / **`verifyToken`**, configure Meta’s webhook for that account, and optionally keep **`pollFallbackEnabled`** **`true`** for redundancy.
 
 ### Slack (human Send / Edit / Discard)
 
@@ -87,15 +87,19 @@ Instagram draft approvals use **Slack Socket Mode** only: button clicks and moda
   "enabled": true,
   "consentGranted": true,
   "useWebhook": false,
-  "pageId": "YOUR_FACEBOOK_PAGE_ID",
-  "pageAccessToken": "YOUR_PAGE_ACCESS_TOKEN",
   "pollIntervalSeconds": 60,
   "slackBotToken": "xoxb-...",
   "slackDraftChannel": "C0XXXXXXXXX",
   "slackAppToken": "xapp-...",
-  "webhookHost": "0.0.0.0",
-  "webhookPort": 5005,
-  "allowFrom": ["*"]
+  "allowFrom": ["*"],
+  "accounts": [
+    {
+      "accountKey": "brand_main",
+      "label": "Brand Main",
+      "pageId": "YOUR_FACEBOOK_PAGE_ID",
+      "pageAccessToken": "YOUR_PAGE_ACCESS_TOKEN"
+    }
+  ]
 }
 ```
 
@@ -189,13 +193,13 @@ Install the **`[instagram]`** extra ([Python dependencies](#python-dependencies)
 
 **If you use Meta webhooks (`useWebhook: true`):**
 
-1. **App Dashboard** → note **App secret** → maps to `appSecret` in config.
+1. **App Dashboard** → note **App secret** → maps to that account’s `appSecret` in `accounts[]`.
 2. **Webhooks** ([Instagram / Messenger webhook docs](https://developers.facebook.com/docs/messenger-platform/instagram/features/webhook/)):
-   - Callback URL: `https://YOUR_PUBLIC_HOST/webhook/instagram` (must match how you expose nanobot; default app path is `/webhook/instagram`).
-   - **Verify token**: any long random string you choose → `verifyToken` in config (must match exactly).
+   - Callback URL: `https://YOUR_PUBLIC_HOST/webhook/instagram/{accountKey}` (must match the account’s `accountKey` in config).
+   - **Verify token**: any long random string you choose → that account’s `verifyToken` (must match exactly).
    - Subscribe to **messages** (and any other fields Meta lists for Instagram messaging).
-3. **Page access token** with permissions for Instagram messaging (long-lived token recommended for servers). Typical flow: User token with needed scopes → [Page access token](https://developers.facebook.com/docs/pages/access-tokens) → `pageAccessToken` in config.
-4. **Page ID** (numeric string for the Facebook Page linked to Instagram) → `pageId`. Required for **poll fallback** (`GET /{page-id}/conversations?platform=INSTAGRAM`). Optional for webhook-only if you disable polling and accept no Graph backfill.
+3. **Page access token** with permissions for Instagram messaging (long-lived token recommended for servers). Typical flow: User token with needed scopes → [Page access token](https://developers.facebook.com/docs/pages/access-tokens) → `pageAccessToken` on the account entry.
+4. **Page ID** (numeric string for the Facebook Page linked to Instagram) → `pageId` on the account entry. Required for **poll fallback** (`GET /{page-id}/conversations?platform=INSTAGRAM`). Optional for webhook-only if you disable polling and accept no Graph backfill.
 
 Use [Graph API Explorer](https://developers.facebook.com/tools/explorer/) to confirm `/{page-id}/conversations?platform=INSTAGRAM` works with your token.
 
@@ -209,7 +213,7 @@ Use [Graph API Explorer](https://developers.facebook.com/tools/explorer/) to con
 
 ### 5. Networking / ports
 
-Default bind: **`webhookHost`** `0.0.0.0`, **`webhookPort`** `5005`. When **`useWebhook`** is **`true`**, put TLS termination (or ngrok) in front so **Meta** can reach `https://.../webhook/instagram`. Slack does not call this URL for Instagram button actions (Socket Mode).
+Default bind: **`webhookHost`** `0.0.0.0`, **`webhookPort`** `5005`. When **`useWebhook`** is **`true`**, put TLS termination (or ngrok) in front so **Meta** can reach `https://.../webhook/instagram/{accountKey}`. Slack does not call this URL for Instagram button actions (Socket Mode).
 
 ### 6. `~/.nanobot/config.json` — `channels.instagram`
 
@@ -219,11 +223,6 @@ Default bind: **`webhookHost`** `0.0.0.0`, **`webhookPort`** `5005`. When **`use
     "instagram": {
       "enabled": true,
       "consentGranted": true,
-      "appSecret": "your-meta-app-secret",
-      "verifyToken": "your-random-verify-string",
-      "pageAccessToken": "your-page-access-token",
-      "pageId": "your-facebook-page-id",
-      "igUserId": "",
       "useWebhook": true,
       "pollFallbackEnabled": true,
       "pollIntervalSeconds": 60,
@@ -232,13 +231,24 @@ Default bind: **`webhookHost`** `0.0.0.0`, **`webhookPort`** `5005`. When **`use
       "slackAppToken": "xapp-...",
       "webhookHost": "0.0.0.0",
       "webhookPort": 5005,
-      "allowFrom": ["*"]
+      "allowFrom": ["*"],
+      "accounts": [
+        {
+          "accountKey": "brand_main",
+          "label": "Brand Main",
+          "pageId": "your-facebook-page-id",
+          "pageAccessToken": "your-page-access-token",
+          "igUserId": "",
+          "appSecret": "your-meta-app-secret",
+          "verifyToken": "your-random-verify-string"
+        }
+      ]
     }
   }
 }
 ```
 
-- **`useWebhook`:** `true` = Meta pushes DMs immediately. `false` = poll-only (needs `pageId` + token); use if you cannot expose webhooks yet.
+- **`useWebhook`:** `true` = Meta pushes DMs immediately. `false` = poll-only (needs per-account `pageId` + token); use if you cannot expose webhooks yet.
 - **`pollFallbackEnabled`:** when `true` with webhooks, still polls the Conversations API on an interval (≤60s) to catch missed deliveries.
 - **`igUserId`:** optional; when set with **poll** mode, messages “from” that ID can be skipped to avoid treating your bot as the customer (if Meta returns your IGSID there).
 
@@ -250,7 +260,7 @@ Use one **`accounts`** array entry per Instagram account. Each account should ha
 
 **Webhooks later:** register each Meta app to  
 `https://YOUR_PUBLIC_HOST/webhook/instagram/{accountKey}`  
-(with matching per-account `verifyToken` / `appSecret`). Legacy single-account setups may still use `/webhook/instagram`.
+(with matching per-account `verifyToken` / `appSecret`).
 
 Full Meta setup steps: [`docs/instagram_multi_account_meta_setup.md`](instagram_multi_account_meta_setup.md).
 
@@ -289,8 +299,6 @@ Full Meta setup steps: [`docs/instagram_multi_account_meta_setup.md`](instagram_
   }
 }
 ```
-
-Legacy top-level `pageAccessToken` / `pageId` / `appSecret` / `verifyToken` still work for a single account (normalized into one `accounts` entry).
 
 **References:** [Instagram Messaging get started](https://developers.facebook.com/docs/messenger-platform/instagram/get-started/), [Webhook verification](https://developers.facebook.com/docs/messenger-platform/webhooks/), [Send API](https://developers.facebook.com/docs/messenger-platform/instagram/features/send-message/), [Page conversations](https://developers.facebook.com/docs/graph-api/reference/page/conversations/), [Slack Socket Mode](https://api.slack.com/apis/connections/socket).
 
