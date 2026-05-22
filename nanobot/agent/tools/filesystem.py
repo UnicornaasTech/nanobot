@@ -777,7 +777,10 @@ class EditFileTool(_FsTool):
             matches = _find_matches(content, norm_old)
 
             if not matches:
-                return self._not_found_msg(old_text, content, path)
+                msg = self._not_found_msg(old_text, content, path)
+                if warning and "modified since last read" in warning:
+                    msg = f"{msg}\n{warning}"
+                return msg
             count = len(matches)
             if count > 1 and not replace_all:
                 line_numbers = [match.line for match in matches]

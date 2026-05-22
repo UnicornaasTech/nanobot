@@ -1,7 +1,7 @@
 ## Prospr fork customizations
 
 This is our fork of the official nanobot repo.
-Thus, when creating changes, always attempt to minimize overlap with original public upstream code to avoid merge conflicts.
+IMPORTANT: Thus, when creating changes, **always attempt to minimize overlap with original public upstream code to avoid merge conflicts**.
 
 Our extensions:
 

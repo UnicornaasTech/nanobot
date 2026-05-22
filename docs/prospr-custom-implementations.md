@@ -91,6 +91,12 @@ When `agents.defaults.eagerKnowledge.enabled` is **true**, session traffic is pr
 
 **Tests:** `tests/agent/test_eager_knowledge.py`, `tests/agent/test_loop_no_reply.py`
 
+### Agent loop tweaks (local)
+
+- **Dream** (`memory.py`, `dream_phase*.md`): Defer batches stuck on repeated stale `edit_file`; prompts nudge read-after-edit and fewer auto-skills.
+- **`edit_file`** (`filesystem.py`): Stale-read warning included in `old_text` not-found errors when applicable.
+- **Provider retry** (`base.py`): Also retry on truncated/non-JSON bodies (`expecting value`, `jsondecodeerror`).
+
 ### Unified session: delivery-target guard (`unified_delivery.py`)
 
 Extends upstream **`agents.defaults.unifiedSession`** (`unified:default` session shared across channels).

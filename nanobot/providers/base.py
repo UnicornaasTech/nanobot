@@ -111,6 +111,8 @@ class LLMProvider(ABC):
         "connection",
         "server error",
         "temporarily unavailable",
+        "expecting value",  # json.JSONDecodeError on truncated/non-JSON API bodies
+        "jsondecodeerror",
         "速率限制",
     )
     _RETRYABLE_STATUS_CODES = frozenset({408, 409, 429})

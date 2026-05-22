@@ -1133,6 +1133,8 @@ class Dream:
     _SOUL_FILE_MAX_CHARS = 16_000
     _USER_FILE_MAX_CHARS = 16_000
     _HISTORY_ENTRY_PREVIEW_MAX_CHARS = 4_000
+    _DEFERRED_STALE_EDIT_MAX_CHARS = 8_000
+    _STALE_EDIT_RE = re.compile(r"old_text not found in ([^.\n]+(?:\.[^.\s\n]+)?)")
 
     def __init__(
         self,
@@ -1218,6 +1220,57 @@ class Dream:
                 desc = m.group(1).strip() if m else "(no description)"
                 entries[d.name] = desc
         return [f"{name} — {desc}" for name, desc in sorted(entries.items())]
+
+    def _repeated_stale_edit_paths(self, result: Any | None) -> list[str]:
+        """Return paths with repeated stale edit_file failures in a Dream run."""
+        if not result:
+            return []
+        counts: dict[str, int] = {}
+        for event in result.tool_events or []:
+            if event.get("name") != "edit_file" or event.get("status") != "error":
+                continue
+            match = self._STALE_EDIT_RE.search(event.get("detail", ""))
+            if not match:
+                continue
+            path = match.group(1)
+            counts[path] = counts.get(path, 0) + 1
+
+        if counts:
+            return sorted(path for path, count in counts.items() if count >= 2)
+
+        for message in result.messages or []:
+            if message.get("role") != "tool" or message.get("name") != "edit_file":
+                continue
+            content = str(message.get("content") or "")
+            match = self._STALE_EDIT_RE.search(content)
+            if not match:
+                continue
+            path = match.group(1)
+            counts[path] = counts.get(path, 0) + 1
+
+        return sorted(path for path, count in counts.items() if count >= 2)
+
+    def _defer_stale_edit_batch(
+        self,
+        *,
+        batch: list[dict[str, Any]],
+        analysis: str,
+        paths: list[str],
+    ) -> int:
+        """Persist a compact breadcrumb so a stale edit loop does not replay forever."""
+        start_cursor = batch[0]["cursor"]
+        end_cursor = batch[-1]["cursor"]
+        path_text = ", ".join(paths) if paths else "(unknown)"
+        entry = (
+            "[DREAM-DEFERRED stale-edit]\n"
+            f"Cursor range: {start_cursor}-{end_cursor}\n"
+            f"Files with repeated old_text misses: {path_text}\n\n"
+            "Dream could not finish applying the analysis because repeated edit_file "
+            "calls targeted text that was no longer present. Re-evaluate this analysis "
+            "against the current memory files; skip facts already present.\n\n"
+            f"{analysis.strip()}"
+        )
+        return self.store.append_history(entry, max_chars=self._DEFERRED_STALE_EDIT_MAX_CHARS)
 
     # -- main entry ----------------------------------------------------------
 
@@ -1403,10 +1456,29 @@ class Dream:
             )
         else:
             reason = result.stop_reason if result else "exception"
-            logger.warning(
-                "Dream incomplete ({}): cursor NOT advanced, will retry next cron cycle",
-                reason,
+            stale_paths = (
+                self._repeated_stale_edit_paths(result)
+                if reason == "max_iterations"
+                else []
             )
+            if stale_paths:
+                deferred_cursor = self._defer_stale_edit_batch(
+                    batch=batch,
+                    analysis=analysis,
+                    paths=stale_paths,
+                )
+                new_cursor = batch[-1]["cursor"]
+                self.store.set_last_dream_cursor(new_cursor)
+                logger.warning(
+                    "Dream deferred stale edit loop for {} (deferred cursor {}); "
+                    "cursor advanced to {}",
+                    ", ".join(stale_paths), deferred_cursor, new_cursor,
+                )
+            else:
+                logger.warning(
+                    "Dream incomplete ({}): cursor NOT advanced, will retry next cron cycle",
+                    reason,
+                )
 
         self.store.compact_history()
 
