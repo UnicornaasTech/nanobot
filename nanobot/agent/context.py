@@ -6,10 +6,11 @@ import platform
 from contextlib import suppress
 from importlib.resources import files as pkg_files
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
+from nanobot.session.goal_state import goal_state_runtime_lines
 from nanobot.utils.helpers import (
     current_time_str,
     detect_image_mime,
@@ -21,7 +22,7 @@ from nanobot.utils.prompt_templates import render_template
 class ContextBuilder:
     """Builds the context (system prompt + messages) for the agent."""
 
-    BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"]
+    BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md"]
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
     _MAX_RECENT_HISTORY = 50
     _MAX_HISTORY_CHARS = 32_000  # hard cap on recent history section size
@@ -45,6 +46,8 @@ class ContextBuilder:
         bootstrap = self._load_bootstrap_files()
         if bootstrap:
             parts.append(bootstrap)
+
+        parts.append(render_template("agent/tool_contract.md"))
 
         memory = self.memory.get_memory_context()
         if memory and not self._is_template_content(self.memory.read_memory(), "memory/MEMORY.md"):
@@ -90,15 +93,20 @@ class ContextBuilder:
 
     @staticmethod
     def _build_runtime_context(
-        channel: str | None, chat_id: str | None, timezone: str | None = None,
+        channel: str | None,
+        chat_id: str | None,
+        timezone: str | None = None,
         sender_id: str | None = None,
+        supplemental_lines: Sequence[str] | None = None,
     ) -> str:
-        """Build untrusted runtime metadata block for injection before the user message."""
+        """Build untrusted runtime metadata block appended after user content."""
         lines = [f"Current Time: {current_time_str(timezone)}"]
         if channel and chat_id:
             lines += [f"Channel: {channel}", f"Chat ID: {chat_id}"]
         if sender_id:
             lines += [f"Sender ID: {sender_id}"]
+        if supplemental_lines:
+            lines.extend(supplemental_lines)
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines) + "\n" + ContextBuilder._RUNTIME_CONTEXT_END
 
     @staticmethod
@@ -147,17 +155,27 @@ class ContextBuilder:
         current_role: str = "user",
         sender_id: str | None = None,
         session_summary: str | None = None,
+        session_metadata: Mapping[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
-        runtime_ctx = self._build_runtime_context(channel, chat_id, self.timezone, sender_id=sender_id)
+        extra = goal_state_runtime_lines(session_metadata)
+        runtime_ctx = self._build_runtime_context(
+            channel,
+            chat_id,
+            self.timezone,
+            sender_id=sender_id,
+            supplemental_lines=extra or None,
+        )
         user_content = self._build_user_content(current_message, media)
 
         # Merge runtime context and user content into a single user message
         # to avoid consecutive same-role messages that some providers reject.
+        # Runtime context is appended to keep the user-content prefix stable
+        # for prompt-cache hits (the context changes every turn due to time).
         if isinstance(user_content, str):
-            merged = f"{runtime_ctx}\n\n{user_content}"
+            merged = f"{user_content}\n\n{runtime_ctx}"
         else:
-            merged = [{"type": "text", "text": runtime_ctx}] + user_content
+            merged = user_content + [{"type": "text", "text": runtime_ctx}]
         messages = [
             {"role": "system", "content": self.build_system_prompt(skill_names, channel=channel, session_summary=session_summary)},
             *history,
@@ -194,12 +212,3 @@ class ContextBuilder:
         if not images:
             return text
         return images + [{"type": "text", "text": text}]
-
-    def add_tool_result(
-        self, messages: list[dict[str, Any]],
-        tool_call_id: str, tool_name: str, result: Any,
-    ) -> list[dict[str, Any]]:
-        """Add a tool result to the message list."""
-        messages.append({"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": result})
-        return messages
-

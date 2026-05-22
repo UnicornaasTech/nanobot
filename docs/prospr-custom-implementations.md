@@ -4,13 +4,16 @@ Reference for **fork-specific** behavior on top of upstream nanobot (`HKUDS/nano
 
 Operational setup (Google Cloud, Meta dashboards, ngrok, etc.) stays in vendor docs.
 
-**Private repo:** `prospr-app/nanobot-prospr` — as of `private/main`, **3 commits** ahead of `public/main` (`HKUDS/nanobot`):
+**Private repo:** `prospr-app/nanobot-prospr` — fork-only commits on top of upstream `HKUDS/nanobot` `main`.
+
+**Upstream baseline:** merged `public/main` @ `8c0b2c1a` (2026-05-22); prior common ancestor `26665823`.
 
 | Commit     | Summary                                                                                          |
 | ---------- | ------------------------------------------------------------------------------------------------ |
 | `881cba4b` | Gmail + Instagram channels/tools; Slack **persist-without-reply** (`no_reply`); devcontainer     |
 | `32bb1862` | Log line for read-only (`no_reply`) persists                                                     |
 | `42ee6ea1` | Multi-account Instagram, `create_instagram_draft`, unified-session delivery guard, deploy script |
+| (later)    | Eager knowledge, Dream/edit_file/provider-retry tweaks — see git log on `main`                   |
 
 ---
 
