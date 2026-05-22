@@ -168,6 +168,22 @@ Install from repo root: `pip install -e '.[gmail,instagram]'`
 - **Outbound disabled:** `send()` and `send_message()` always raise `NotImplementedError` directing the agent to `create_gmail_draft`. No SMTP `sendmail()` path runs even if SMTP fields are set.
 - **`autoReplyEnabled`:** Present on `EmailConfig` (default `true`) but **not consulted** for delivery; outbound is blocked unconditionally in code.
 
+**Gmail IMAP credentials (`imapPassword`)** — separate from `tools.gmailDraft` OAuth:
+
+| Use for `imapPassword` | Do **not** use |
+| ---------------------- | -------------- |
+| Google **App Password** (16 letters) for the mailbox in `imapUsername` | Normal Google sign-in password |
+| | `tools.gmailDraft` refresh token or OAuth client secret |
+
+1. **2-Step Verification** must be **On** for the mailbox ([Google Account → Security](https://myaccount.google.com/security)). On **Google Workspace**, an admin may need to allow 2SV and app passwords for the user/OU.
+2. **Create an app password:** [App passwords](https://myaccount.google.com/apppasswords) → app **Mail** (or custom name e.g. `nanobot-imap`) → copy the **16-character** password (shown as four groups of four; spaces are optional, hyphens are not part of the secret).
+3. **Enable IMAP** in Gmail → Settings → **Forwarding and POP/IMAP** → [Enable IMAP](https://support.google.com/mail/answer/7126229). Workspace admins can restrict IMAP org-wide.
+4. Set `imapPassword` to that value, or `"${GMAIL_PASSWORD}"` with `GMAIL_PASSWORD` set in the **same environment as the gateway process** (e.g. systemd `Environment=` / `EnvironmentFile=` — a shell export alone is not enough if the service does not inherit it). Config `${VAR}` refs are resolved at startup (`nanobot/config/loader.py`); missing vars fail fast with a clear error.
+
+Startup log `IMAP IDLE unavailable ([AUTHENTICATIONFAILED] Invalid credentials)` means Gmail rejected `client.login(imapUsername, imapPassword)` — fix credentials/IMAP policy, not nanobot channel code. Confirm the running gateway uses the config file you edited (`nanobot gateway -c /path` or default `~/.nanobot/config.json` for the service user).
+
+Full mailbox + OAuth draft setup: [`docs/prospr-customersupport-additions.md`](prospr-customersupport-additions.md#setup-gmail-mailbot-path).
+
 **Config example** (SMTP fields are ignored for send; omit or leave blank):
 
 ```json
@@ -179,7 +195,7 @@ Install from repo root: `pip install -e '.[gmail,instagram]'`
       "imapHost": "imap.gmail.com",
       "imapPort": 993,
       "imapUsername": "support@yourcompany.com",
-      "imapPassword": "your-app-password",
+      "imapPassword": "${GMAIL_IMAP_APP_PASSWORD}",
       "imapUseSsl": true,
       "imapIdleEnabled": true,
       "pollIntervalSeconds": 60,
@@ -195,12 +211,25 @@ Polling-only inbound (no IMAP IDLE): set `"imapIdleEnabled": false` (same `pollI
 
 - Tool name: **`create_gmail_draft`**
 - OAuth scope: `https://www.googleapis.com/auth/gmail.compose` (drafts only).
-- Credentials: `~/.nanobot/gmail_credentials.json`; token: `~/.nanobot/gmail_token.json`
-- One-time auth: `python3 -c "from nanobot.agent.tools.gmail_auth import get_gmail_service; get_gmail_service()"`
+- **Config-only OAuth** under `tools.gmailDraft` (`clientId`, `clientSecret`, `refreshToken`). Values may use `${ENV_VAR}` interpolation. Access tokens are cached **in memory only** — no `gmail_token.json` or credential files on disk.
 - Calls Gmail API `users.drafts.create` only — never `users.messages.send`.
-- Registered via tool auto-discovery (`nanobot/agent/tools/loader.py`). Enabled when `[gmail]` packages are importable.
+- Registered via tool auto-discovery (`nanobot/agent/tools/loader.py`). Enabled when `[gmail]` packages are importable **and** `tools.gmailDraft` is fully configured.
 
-**Config:** no tool-specific keys. Enable the email channel (above), install `pip install -e '.[gmail]'`, place OAuth client JSON at `~/.nanobot/gmail_credentials.json`, then run the one-time auth command in this section.
+**Config example** (install `pip install -e '.[gmail]'`, enable email channel for inbound):
+
+```json
+{
+  "tools": {
+    "gmailDraft": {
+      "clientId": "${GMAIL_CLIENT_ID}",
+      "clientSecret": "${GMAIL_CLIENT_SECRET}",
+      "refreshToken": "${GMAIL_REFRESH_TOKEN}"
+    }
+  }
+}
+```
+
+Obtain the refresh token once via `python3 scripts/gmail_draft_oauth_setup.py` (prompts for client ID/secret; no credential files on disk). See [`docs/prospr-customersupport-additions.md`](prospr-customersupport-additions.md) for full setup.
 
 ### Instagram channel (`nanobot/channels/instagram.py`)
 
@@ -413,7 +442,7 @@ Other `channels.slack` keys (`botToken`, `appToken`, `replyInThread`, `groupAllo
 | `imapHost`                                                                                        | string   | `""`             | Required when enabled.                                 |
 | `imapPort`                                                                                        | int      | `993`            |                                                        |
 | `imapUsername`                                                                                    | string   | `""`             |                                                        |
-| `imapPassword`                                                                                    | string   | `""`             | App password when 2FA enabled.                         |
+| `imapPassword`                                                                                    | string   | `""`             | Gmail/Workspace: **App Password** only (16 letters after 2SV); not login password or `gmailDraft` OAuth token. `${ENV_VAR}` supported. |
 | `imapMailbox`                                                                                     | string   | `"INBOX"`        |                                                        |
 | `imapUseSsl`                                                                                      | bool     | `true`           |                                                        |
 | `imapIdleEnabled`                                                                                 | bool     | `true`           | **Fork:** IDLE vs poll-only inbound.                   |
@@ -432,6 +461,8 @@ Other `channels.slack` keys (`botToken`, `appToken`, `replyInThread`, `groupAllo
 
 #### Example — Gmail IMAP inbound (draft-only outbound)
 
+Requires **2-Step Verification** + [App Password](https://myaccount.google.com/apppasswords) for Mail on `imapUsername`, and IMAP enabled in Gmail settings. Outbound replies use `tools.gmailDraft` (OAuth), not `imapPassword`.
+
 ```json
 {
   "channels": {
@@ -441,7 +472,7 @@ Other `channels.slack` keys (`botToken`, `appToken`, `replyInThread`, `groupAllo
       "imapHost": "imap.gmail.com",
       "imapPort": 993,
       "imapUsername": "support@yourcompany.com",
-      "imapPassword": "your-app-password",
+      "imapPassword": "${GMAIL_IMAP_APP_PASSWORD}",
       "imapUseSsl": true,
       "imapIdleEnabled": true,
       "pollIntervalSeconds": 60,
@@ -452,6 +483,8 @@ Other `channels.slack` keys (`botToken`, `appToken`, `replyInThread`, `groupAllo
   }
 }
 ```
+
+On systemd, define `GMAIL_IMAP_APP_PASSWORD` in the unit or an `EnvironmentFile` loaded by the gateway service user, then restart the unit after config changes.
 
 ### `channels.instagram` (channel-level)
 

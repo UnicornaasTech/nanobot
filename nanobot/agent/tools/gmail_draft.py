@@ -16,6 +16,7 @@ from typing import Any
 
 from nanobot.agent.tools.base import Tool, tool_parameters
 from nanobot.agent.tools.context import ToolContext
+from nanobot.agent.tools.gmail_auth import GmailDraftToolConfig
 from nanobot.agent.tools.schema import StringSchema, tool_parameters_schema
 
 
@@ -26,15 +27,23 @@ def create_gmail_draft(
     thread_id: str | None = None,
     in_reply_to: str | None = None,
     references: str | None = None,
+    *,
+    gmail_draft_config: GmailDraftToolConfig | None = None,
 ) -> dict[str, Any]:
     """
     Creates a draft in Gmail. Does NOT send.
 
     Raises:
         RuntimeError: Guard against a future ``send`` parameter on this function.
+        ValueError: When ``gmail_draft_config`` is missing or incomplete.
     """
     if "send" in create_gmail_draft.__code__.co_varnames:
         raise RuntimeError("Policy violation: send parameter must never be added to this tool.")
+
+    if gmail_draft_config is None:
+        raise ValueError(
+            "Gmail draft OAuth config is required. Set tools.gmailDraft in ~/.nanobot/config.json."
+        )
 
     msg = MIMEText(body, "plain")
     msg["To"] = to
@@ -51,7 +60,7 @@ def create_gmail_draft(
 
     from nanobot.agent.tools.gmail_auth import get_gmail_service
 
-    service = get_gmail_service()
+    service = get_gmail_service(gmail_draft_config)
     draft = service.users().drafts().create(userId="me", body=body_payload).execute()
 
     draft_id = draft["id"]
@@ -90,20 +99,31 @@ class CreateGmailDraftTool(Tool):
     description = (
         "Creates a Gmail draft for human review. NEVER sends the email. "
         "Always use this instead of any send operation. "
-        "Requires OAuth credentials at ~/.nanobot/gmail_credentials.json "
-        "and optional dependency group [gmail]."
+        "Requires tools.gmailDraft OAuth settings in config and optional dependency group [gmail]."
     )
     _scopes = {"core", "subagent"}
+
+    config_key = "gmail_draft"
+
+    @classmethod
+    def config_cls(cls):
+        return GmailDraftToolConfig
 
     @classmethod
     def enabled(cls, ctx: ToolContext) -> bool:
         try:
             import google.auth  # noqa: F401
-            import google_auth_oauthlib  # noqa: F401
             import googleapiclient  # noqa: F401
         except ImportError:
             return False
-        return True
+        return ctx.config.gmail_draft.is_configured()
+
+    @classmethod
+    def create(cls, ctx: ToolContext) -> Tool:
+        return cls(gmail_draft_config=ctx.config.gmail_draft)
+
+    def __init__(self, *, gmail_draft_config: GmailDraftToolConfig) -> None:
+        self._gmail_draft_config = gmail_draft_config
 
     async def execute(
         self,
@@ -123,8 +143,9 @@ class CreateGmailDraftTool(Tool):
                 thread_id=thread_id or None,
                 in_reply_to=in_reply_to or None,
                 references=references or None,
+                gmail_draft_config=self._gmail_draft_config,
             )
-        except FileNotFoundError as e:
+        except ValueError as e:
             return f"Error: {e}"
         except Exception as e:
             return f"Error creating Gmail draft: {e}"

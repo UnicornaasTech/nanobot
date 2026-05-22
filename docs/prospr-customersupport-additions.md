@@ -115,7 +115,7 @@ Install the **`[gmail]`** extra ([Python dependencies](#python-dependencies) —
 
 ### 2. Google Cloud — Gmail API & OAuth (drafts)
 
-Follow the official flow (adapted for our paths and scope):
+Follow the official flow (adapted for our config keys and scope):
 
 1. Create or select a [Google Cloud project](https://developers.google.com/workspace/guides/create-project).
 2. **Enable the Gmail API**: [Enable Gmail API](https://console.cloud.google.com/flows/enableapi?apiid=gmail.googleapis.com).
@@ -124,18 +124,41 @@ Follow the official flow (adapted for our paths and scope):
    - Add **Data access** scope: `https://www.googleapis.com/auth/gmail.compose` (see [Gmail API scopes](https://developers.google.com/workspace/gmail/api/auth/scopes)).
    - *External* user type is required if the mailbox owner is outside your Workspace org; you may need verification for wide production use. *Internal* works for Workspace-only testing.
 4. **Create OAuth client**: [Clients](https://console.developers.google.com/auth/clients) → type **Desktop app** (same pattern as the [Python quickstart](https://developers.google.com/workspace/gmail/api/quickstart/python)).
-5. Download the client JSON and save it as **`~/.nanobot/gmail_credentials.json`** (not just `credentials.json` in the project root — nanobot looks in `~/.nanobot/`).
+5. Note the **client ID** and **client secret** from the downloaded JSON (`installed.client_id`, `installed.client_secret`).
 
-### 3. One-time browser auth (refresh token)
+### 3. One-time refresh token (browser)
 
-Run once on a machine with a browser (the flow opens localhost):
+From the repo root (with `pip install -e '.[gmail]'`):
 
 ```bash
-cd /path/to/nanobot   # same repo where you ran pip install -e '.[gmail]'
-python3 -c "from nanobot.agent.tools.gmail_auth import get_gmail_service; get_gmail_service()"
+python3 scripts/gmail_draft_oauth_setup.py
 ```
 
-This creates **`~/.nanobot/gmail_token.json`**. After that, headless runs can refresh tokens without a browser.
+The script prompts for your Desktop OAuth **client ID** and **client secret** (not a `credentials.json` file), opens a browser to sign in as the support mailbox, and prints `GMAIL_REFRESH_TOKEN` plus a sample `tools.gmailDraft` config block. Copy the refresh token into your secret store.
+
+Alternatively, use any flow that yields a refresh token (e.g. [Python quickstart](https://developers.google.com/workspace/gmail/api/quickstart/python)).
+
+Nanobot does **not** write OAuth tokens to disk. Set environment variables (or inject into config):
+
+- `GMAIL_CLIENT_ID`
+- `GMAIL_CLIENT_SECRET`
+- `GMAIL_REFRESH_TOKEN`
+
+Add to `~/.nanobot/config.json`:
+
+```json
+{
+  "tools": {
+    "gmailDraft": {
+      "clientId": "${GMAIL_CLIENT_ID}",
+      "clientSecret": "${GMAIL_CLIENT_SECRET}",
+      "refreshToken": "${GMAIL_REFRESH_TOKEN}"
+    }
+  }
+}
+```
+
+**Migration:** If you previously used `~/.nanobot/gmail_token.json`, read the `refresh_token` field from that file once, move it to `${GMAIL_REFRESH_TOKEN}`, then delete `gmail_token.json` and `gmail_credentials.json`.
 
 ### 4. Gmail IMAP — inbound email channel
 
@@ -143,9 +166,9 @@ This creates **`~/.nanobot/gmail_token.json`**. After that, headless runs can re
 2. If the account uses **2-Step Verification**, create an [App Password](https://support.google.com/accounts/answer/185833) and use it as `imapPassword` — not your normal login password.
 3. **DKIM/SPF:** Gmail→Gmail often includes `Authentication-Results`. If you poll mail that lacks those headers, you may need `verifyDkim` / `verifySpf` `false` in config (weaker anti-spoofing).
 
-### 5. `~/.nanobot/config.json` — `channels.email`
+### 5. `~/.nanobot/config.json` — `channels.email` + `tools.gmailDraft`
 
-SMTP is **not** used for outbound (`create_gmail_draft` only). Omit `smtpHost` or leave blank.
+SMTP is **not** used for outbound (`create_gmail_draft` only). Omit `smtpHost` or leave blank. Combine with `tools.gmailDraft` from step 3.
 
 ```json
 {
@@ -162,6 +185,13 @@ SMTP is **not** used for outbound (`create_gmail_draft` only). Omit `smtpHost` o
       "pollIntervalSeconds": 60,
       "autoReplyEnabled": true,
       "allowFrom": ["*"]
+    }
+  },
+  "tools": {
+    "gmailDraft": {
+      "clientId": "${GMAIL_CLIENT_ID}",
+      "clientSecret": "${GMAIL_CLIENT_SECRET}",
+      "refreshToken": "${GMAIL_REFRESH_TOKEN}"
     }
   }
 }
@@ -315,7 +345,7 @@ Full Meta setup steps: [`docs/instagram_multi_account_meta_setup.md`](instagram_
 ### Outbound (drafts only)
 
 - **Mechanism:** Agent tool `create_gmail_draft` → Gmail API `users.drafts.create` — **never** SMTP and never `users.messages.send`.
-- **Credentials file:** `~/.nanobot/gmail_credentials.json` (OAuth client JSON). Token: `~/.nanobot/gmail_token.json`.
+- **Credentials:** `tools.gmailDraft` in config (`clientId`, `clientSecret`, `refreshToken`); access tokens in memory only.
 
 ### Optional Python packages
 

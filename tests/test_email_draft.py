@@ -50,6 +50,7 @@ def test_imap_only_validate_config() -> None:
 
 def test_draft_creates_not_sends(monkeypatch: pytest.MonkeyPatch) -> None:
     from nanobot.agent.tools import gmail_draft as gd
+    from nanobot.agent.tools.gmail_auth import GmailDraftToolConfig
 
     mock_service = MagicMock()
     exec_result = {
@@ -60,9 +61,14 @@ def test_draft_creates_not_sends(monkeypatch: pytest.MonkeyPatch) -> None:
         exec_result
     )
 
+    cfg = GmailDraftToolConfig(
+        client_id="id",
+        client_secret="secret",
+        refresh_token="refresh",
+    )
     monkeypatch.setattr(
         "nanobot.agent.tools.gmail_auth.get_gmail_service",
-        lambda: mock_service,
+        lambda _cfg: mock_service,
     )
 
     result = gd.create_gmail_draft(
@@ -70,6 +76,7 @@ def test_draft_creates_not_sends(monkeypatch: pytest.MonkeyPatch) -> None:
         subject="Hi",
         body="Body",
         thread_id="th1",
+        gmail_draft_config=cfg,
     )
     assert result["status"] == "draft_created_not_sent"
     assert result["draft_id"] == "draft123"
