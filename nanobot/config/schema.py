@@ -190,6 +190,22 @@ class AgentDefaults(Base):
     )
     dream: DreamConfig = Field(default_factory=DreamConfig)
     eager_knowledge: EagerKnowledgeConfig = Field(default_factory=EagerKnowledgeConfig)
+    # Fork-local: alternate memory prompts for de-identified, pattern-only storage (CS).
+    generic_memory_only: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("genericMemoryOnly"),
+        serialization_alias="genericMemoryOnly",
+    )
+
+    @model_validator(mode="after")
+    def _reject_generic_memory_with_eager_knowledge(self) -> AgentDefaults:
+        if self.generic_memory_only and self.eager_knowledge.enabled:
+            raise ValueError(
+                "agents.defaults.genericMemoryOnly cannot be enabled together with "
+                "agents.defaults.eagerKnowledge.enabled — disable eagerKnowledge when "
+                "using generic memory prompts."
+            )
+        return self
 
 
 class AgentsConfig(Base):

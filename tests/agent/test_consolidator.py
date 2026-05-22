@@ -51,6 +51,30 @@ def consolidator(store, mock_provider, tmp_path):
 
 
 @pytest.fixture
+def consolidator_generic(store, mock_provider, tmp_path):
+    sessions = MagicMock()
+    sessions.save = MagicMock()
+    _session_cache: dict[str, MagicMock] = {}
+    sessions.get_or_create = MagicMock(side_effect=lambda key: _session_cache.get(key, MagicMock()))
+    sessions._session_cache = _session_cache
+    return Consolidator(
+        store=store,
+        provider=mock_provider,
+        model="test-model",
+        sessions=sessions,
+        context_window_tokens=8192,
+        build_messages=MagicMock(return_value=[]),
+        get_tool_definitions=MagicMock(return_value=[]),
+        max_completion_tokens=100,
+        workspace=tmp_path,
+        archive_extract_max_chars=500,
+        archive_bootstrap_max_chars=2000,
+        archive_max_images=2,
+        generic_memory_only=True,
+    )
+
+
+@pytest.fixture
 def consolidator_tight(store, mock_provider, tmp_path):
     """Small context window for token-budget / truncation tests."""
     sessions = MagicMock()
@@ -131,6 +155,31 @@ class TestConsolidatorSummarize:
         assert "do NOT summarize" in system
         assert "Always reply in Finnish" in system
         assert "Conversation transcript" in (user if isinstance(user, str) else user[-1]["text"])
+
+    async def test_archive_uses_generic_prompt_markers(
+        self, consolidator_generic, mock_provider, store,
+    ):
+        mock_provider.chat_with_retry.return_value = MagicMock(
+            content="- Recurring refund requests need receipt photo.",
+        )
+        await consolidator_generic.archive([{"role": "user", "content": "refund case"}])
+        system = mock_provider.chat_with_retry.await_args.kwargs["messages"][0]["content"]
+        assert "generalized support and product patterns" in system
+        assert "Forbidden in every bullet" in system
+
+    async def test_generic_raw_fallback_withholds_transcript(
+        self, consolidator_generic, mock_provider, store,
+    ):
+        mock_provider.chat_with_retry.side_effect = RuntimeError("API error")
+        result = await consolidator_generic.archive(
+            [{"role": "user", "content": "secret customer data"}],
+        )
+        assert result is None
+        entries = store.read_unprocessed_history(since_cursor=0)
+        assert len(entries) == 1
+        assert "genericMemoryOnly" in entries[0]["content"]
+        assert "secret customer data" not in entries[0]["content"]
+        assert "[RAW]" not in entries[0]["content"]
 
     async def test_format_messages_truncates_extract(self, tmp_path):
         big = "x" * 50_000

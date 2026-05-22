@@ -201,11 +201,17 @@ class AgentLoop:
         archive_extract_max_chars: int | None = None,
         archive_bootstrap_max_chars: int | None = None,
         archive_max_images: int | None = None,
+        generic_memory_only: bool | None = None,
     ):
         from nanobot.config.schema import ToolsConfig
 
         _tc = tools_config or ToolsConfig()
         defaults = AgentDefaults()
+        _generic_memory_only = (
+            generic_memory_only
+            if generic_memory_only is not None
+            else defaults.generic_memory_only
+        )
         _archive_media_max_bytes = (
             archive_media_max_bytes
             if archive_media_max_bytes is not None
@@ -331,6 +337,7 @@ class AgentLoop:
             archive_extract_max_chars=_archive_extract_max_chars,
             archive_bootstrap_max_chars=_archive_bootstrap_max_chars,
             archive_max_images=_archive_max_images,
+            generic_memory_only=_generic_memory_only,
         )
         self.auto_compact = AutoCompact(
             sessions=self.sessions,
@@ -351,6 +358,7 @@ class AgentLoop:
             store=self.context.memory,
             provider=provider,
             model=self.model,
+            generic_memory_only=_generic_memory_only,
         )
         self.model_presets: dict[str, ModelPresetConfig] = model_presets or {}
         self._active_preset: str | None = None
@@ -419,6 +427,7 @@ class AgentLoop:
             archive_extract_max_chars=defaults.archive_extract_max_chars,
             archive_bootstrap_max_chars=defaults.archive_bootstrap_max_chars,
             archive_max_images=defaults.archive_max_images,
+            generic_memory_only=defaults.generic_memory_only,
             **extra,
         )
 

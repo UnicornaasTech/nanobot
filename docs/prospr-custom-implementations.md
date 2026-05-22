@@ -94,9 +94,45 @@ When `agents.defaults.eagerKnowledge.enabled` is **true**, session traffic is pr
 
 **Tests:** `tests/agent/test_eager_knowledge.py`, `tests/agent/test_loop_no_reply.py`
 
+### Generic memory prompts (`genericMemoryOnly`)
+
+Customer-support deployments can store **generalized phenomena only** (playbooks, recurring issues, product patterns) without contradicting default memory behavior in `SOUL.md` / `USER.md`.
+
+When `agents.defaults.genericMemoryOnly` is **true**, Consolidator and Dream use alternate bundled templates (`*_generic.md`) instead of the upstream `consolidator_archive.md` / `dream_phase1.md` / `dream_phase2.md`. Template selection: [`nanobot/agent/memory_prompts.py`](nanobot/agent/memory_prompts.py).
+
+| Piece | Behavior |
+| ----- | -------- |
+| **`Consolidator.archive()`** | Summarizes only cross-case patterns; forbids customer PII in `history.jsonl` bullets. |
+| **Archive LLM failure** | Appends a short withheld marker — **no** `[RAW]` transcript dump. |
+| **`Dream`** | Phase 1/2 use generic prompts: `USER.md` = operator/team only; `MEMORY.md` = generalized playbooks. |
+| **Mutual exclusion** | Config load **fails** if `genericMemoryOnly` and `eagerKnowledge.enabled` are both true (eager singleton raw flushes would bypass de-identification). |
+
+**Config** (`agents.defaults.genericMemoryOnly`):
+
+| Key | Type | Default | Meaning |
+| --- | ---- | ------- | ------- |
+| `genericMemoryOnly` | bool | `false` | Use de-identified memory-gathering prompts for Consolidator + Dream. |
+
+**Config example** (customer support; eager knowledge off):
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "genericMemoryOnly": true,
+      "eagerKnowledge": { "enabled": false }
+    }
+  }
+}
+```
+
+See also upstream memory overview: [`docs/memory.md`](memory.md).
+
+**Tests:** `tests/config/test_generic_memory_config.py`, `tests/agent/test_consolidator.py`, `tests/agent/test_dream.py`
+
 ### Agent loop tweaks (local)
 
-- **Dream** (`memory.py`, `dream_phase*.md`): Defer batches stuck on repeated stale `edit_file`; prompts nudge read-after-edit and fewer auto-skills.
+- **Dream** (`memory.py`, `dream_phase*.md`, optional `*_generic.md`): Defer batches stuck on repeated stale `edit_file`; prompts nudge read-after-edit and fewer auto-skills.
 - **`edit_file`** (`filesystem.py`): Stale-read warning included in `old_text` not-found errors when applicable.
 - **Provider retry** (`base.py`): Also retry on truncated/non-JSON bodies (`expecting value`, `jsondecodeerror`).
 
@@ -263,6 +299,7 @@ Fragments below merge into `~/.nanobot/config.json`. Longer setup runbooks: [`do
 | Key | Type | Default | Fork behavior |
 |-----|------|---------|----------------|
 | `unifiedSession` | bool | `false` | When `true`, mid-turn follow-ups only inject if delivery target matches active turn; see [Unified session](#unified-session-delivery-target-guard-unified_deliverypy). |
+| `genericMemoryOnly` | bool | `false` | Alternate Consolidator/Dream prompts for pattern-only memory; **cannot** combine with `eagerKnowledge.enabled`. See [Generic memory prompts](#generic-memory-prompts-genericmemoryonly). |
 | `eagerKnowledge` | object | — | Fork-only; see [Eager knowledge](#eager-knowledge-non-unified-cross-channel-recall). |
 | `eagerKnowledge.enabled` | bool | `false` | Promote session traffic into `memory/history.jsonl` soon after persist. |
 | `eagerKnowledge.minBatch` | int | `3` | LLM archive when pending chunk reaches this size. |
@@ -298,6 +335,19 @@ Fragments below merge into `~/.nanobot/config.json`. Longer setup runbooks: [`do
         "singletonIdleS": 120,
         "maxBatch": 20
       }
+    }
+  }
+}
+```
+
+#### Example — `genericMemoryOnly`
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "genericMemoryOnly": true,
+      "eagerKnowledge": { "enabled": false }
     }
   }
 }

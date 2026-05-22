@@ -40,6 +40,19 @@ def dream(store, mock_provider, mock_runner):
     return d
 
 
+@pytest.fixture
+def dream_generic(store, mock_provider, mock_runner):
+    d = Dream(
+        store=store,
+        provider=mock_provider,
+        model="test-model",
+        max_batch_size=5,
+        generic_memory_only=True,
+    )
+    d._runner = mock_runner
+    return d
+
+
 def _make_run_result(
     stop_reason="completed",
     final_content=None,
@@ -98,6 +111,17 @@ class TestDreamRun:
         # After Dream, cursor is advanced and 3, compact keeps last max_history_entries
         entries = store.read_unprocessed_history(since_cursor=0)
         assert all(e["cursor"] > 0 for e in entries)
+
+    async def test_phase1_uses_generic_prompt(
+        self, dream_generic, mock_provider, mock_runner, store,
+    ):
+        store.append_history("refund workflow discussed")
+        mock_provider.chat_with_retry.return_value = MagicMock(content="[SKIP]")
+        mock_runner.run = AsyncMock(return_value=_make_run_result())
+        await dream_generic.run()
+        system = mock_provider.chat_with_retry.call_args.kwargs["messages"][0]["content"]
+        assert "customer-support mode" in system
+        assert "Never store:" in system
 
     async def test_skill_phase_uses_builtin_skill_creator_path(self, dream, mock_provider, mock_runner, store):
         """Dream should point skill creation guidance at the builtin skill-creator template."""

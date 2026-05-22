@@ -278,6 +278,7 @@ def settings_payload(*, requires_restart: bool = False) -> dict[str, Any]:
                 "max_iterations": defaults.dream.max_iterations,
                 "annotate_line_ages": defaults.dream.annotate_line_ages,
             },
+            "generic_memory_only": defaults.generic_memory_only,
             "unified_session": defaults.unified_session,
         },
         "advanced": {

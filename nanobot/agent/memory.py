@@ -18,6 +18,7 @@ import tiktoken
 from loguru import logger
 
 from nanobot.agent.eager_knowledge import eager_consolidation_start
+from nanobot.agent.memory_prompts import resolve_memory_template
 from nanobot.agent.runner import AgentRunner, AgentRunSpec
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.session.manager import Session
@@ -648,6 +649,7 @@ class Consolidator:
         archive_extract_max_chars: int = 8_000,
         archive_bootstrap_max_chars: int = 12_000,
         archive_max_images: int = 5,
+        generic_memory_only: bool = False,
     ):
         self.store = store
         self.provider = provider
@@ -661,6 +663,7 @@ class Consolidator:
         self.archive_extract_max_chars = archive_extract_max_chars
         self.archive_bootstrap_max_chars = archive_bootstrap_max_chars
         self.archive_max_images = archive_max_images
+        self.generic_memory_only = generic_memory_only
         self._build_messages = build_messages
         self._get_tool_definitions = get_tool_definitions
         self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
@@ -906,14 +909,32 @@ class Consolidator:
             return text
         return [*image_blocks, {"type": "text", "text": text}]
 
+    def _consolidator_archive_template(self) -> str:
+        return resolve_memory_template(
+            "consolidator_archive",
+            generic_memory_only=self.generic_memory_only,
+        )
+
     def _raw_archive_fallback(self, messages: list[dict[str, Any]]) -> None:
-        """Fallback: dump formatted messages without LLM summarization."""
+        """Fallback when LLM archive fails: raw transcript or generic withheld marker."""
+        if self.generic_memory_only:
+            self.store.append_history(
+                "[consolidation failed; transcript withheld under genericMemoryOnly] "
+                f"{len(messages)} messages",
+                max_chars=_RAW_ARCHIVE_MAX_CHARS,
+            )
+            logger.warning(
+                "Memory consolidation failed under genericMemoryOnly; "
+                "withheld transcript for {} messages",
+                len(messages),
+            )
+            return
         formatted_text, image_blocks = self._build_archive_payload(messages)
         if not has_archivable_content(formatted_text, image_blocks):
             return
         bootstrap = self._load_bootstrap_context()
         system = render_template(
-            "agent/consolidator_archive.md",
+            self._consolidator_archive_template(),
             strip=True,
             bootstrap_context=bootstrap,
         )
@@ -947,7 +968,7 @@ class Consolidator:
 
         bootstrap = self._load_bootstrap_context()
         system = render_template(
-            "agent/consolidator_archive.md",
+            self._consolidator_archive_template(),
             strip=True,
             bootstrap_context=bootstrap,
         )
@@ -1221,6 +1242,7 @@ class Dream:
         max_iterations: int = 10,
         max_tool_result_chars: int = 16_000,
         annotate_line_ages: bool = True,
+        generic_memory_only: bool = False,
     ):
         self.store = store
         self.provider = provider
@@ -1232,6 +1254,7 @@ class Dream:
         # Default True keeps the #3212 behavior; set False to feed MEMORY.md raw
         # (e.g. if a specific LLM reacts poorly to the `← Nd` suffix).
         self.annotate_line_ages = annotate_line_ages
+        self.generic_memory_only = generic_memory_only
         self._runner = AgentRunner(provider)
         self._tools = self._build_tools()
 
@@ -1456,7 +1479,10 @@ class Dream:
                     {
                         "role": "system",
                         "content": render_template(
-                            "agent/dream_phase1.md",
+                            resolve_memory_template(
+                                "dream_phase1",
+                                generic_memory_only=self.generic_memory_only,
+                            ),
                             strip=True,
                             stale_threshold_days=_STALE_THRESHOLD_DAYS,
                         ),
@@ -1488,7 +1514,10 @@ class Dream:
             {
                 "role": "system",
                 "content": render_template(
-                    "agent/dream_phase2.md",
+                    resolve_memory_template(
+                        "dream_phase2",
+                        generic_memory_only=self.generic_memory_only,
+                    ),
                     strip=True,
                     skill_creator_path=str(skill_creator_path),
                 ),
