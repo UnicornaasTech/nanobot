@@ -300,7 +300,7 @@ class TestConsolidationUnaffectedByUnifiedSession:
     """maybe_consolidate_by_tokens() behaviour is identical regardless of session key."""
 
     @pytest.mark.asyncio
-    async def test_consolidation_skips_empty_session_for_unified_key(self):
+    async def test_consolidation_skips_empty_session_for_unified_key(self, tmp_path: Path):
         """Empty unified:default session → consolidation exits immediately, archive not called."""
         from nanobot.agent.memory import Consolidator, MemoryStore
 
@@ -320,6 +320,7 @@ class TestConsolidationUnaffectedByUnifiedSession:
             build_messages=MagicMock(return_value=[]),
             get_tool_definitions=MagicMock(return_value=[]),
             max_completion_tokens=100,
+            workspace=tmp_path,
         )
         consolidator.archive = AsyncMock()
 
@@ -331,7 +332,7 @@ class TestConsolidationUnaffectedByUnifiedSession:
         consolidator.archive.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_consolidation_behaviour_identical_for_any_key(self):
+    async def test_consolidation_behaviour_identical_for_any_key(self, tmp_path: Path):
         """archive call count is the same for 'telegram:123' and 'unified:default'
         under identical token conditions."""
         from nanobot.agent.memory import Consolidator, MemoryStore
@@ -353,6 +354,7 @@ class TestConsolidationUnaffectedByUnifiedSession:
                 build_messages=MagicMock(return_value=[]),
                 get_tool_definitions=MagicMock(return_value=[]),
                 max_completion_tokens=100,
+                workspace=tmp_path,
             )
 
             session = Session(key=key)
@@ -365,7 +367,7 @@ class TestConsolidationUnaffectedByUnifiedSession:
         assert archive_calls["telegram:123"] == archive_calls["unified:default"] == 0
 
     @pytest.mark.asyncio
-    async def test_consolidation_triggers_when_over_budget_unified_key(self):
+    async def test_consolidation_triggers_when_over_budget_unified_key(self, tmp_path: Path):
         """When tokens exceed budget, consolidation attempts to find a boundary —
         behaviour is identical to any other session key."""
         from nanobot.agent.memory import Consolidator, MemoryStore
@@ -383,6 +385,7 @@ class TestConsolidationUnaffectedByUnifiedSession:
             build_messages=MagicMock(return_value=[]),
             get_tool_definitions=MagicMock(return_value=[]),
             max_completion_tokens=100,
+            workspace=tmp_path,
         )
 
         session = Session(key="unified:default")
