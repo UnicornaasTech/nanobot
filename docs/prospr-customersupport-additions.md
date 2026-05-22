@@ -121,7 +121,7 @@ Follow the official flow (adapted for our config keys and scope):
 2. **Enable the Gmail API**: [Enable Gmail API](https://console.cloud.google.com/flows/enableapi?apiid=gmail.googleapis.com).
 3. **OAuth consent screen** ([Branding / Audience / scopes](https://developers.google.com/workspace/guides/configure-oauth-consent)):
    - Configure app name, support email, etc.
-   - Add **Data access** scope: `https://www.googleapis.com/auth/gmail.compose` (see [Gmail API scopes](https://developers.google.com/workspace/gmail/api/auth/scopes)).
+   - Add **Data access** scopes: `gmail.compose` and `gmail.readonly` (see [Gmail API scopes](https://developers.google.com/workspace/gmail/api/auth/scopes)).
    - *External* user type is required if the mailbox owner is outside your Workspace org; you may need verification for wide production use. *Internal* works for Workspace-only testing.
 4. **Create OAuth client**: [Clients](https://console.developers.google.com/auth/clients) → type **Desktop app** (same pattern as the [Python quickstart](https://developers.google.com/workspace/gmail/api/quickstart/python)).
 5. Note the **client ID** and **client secret** from the downloaded JSON (`installed.client_id`, `installed.client_secret`).

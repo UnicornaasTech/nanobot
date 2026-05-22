@@ -49,6 +49,9 @@ class EmailConfig(Base):
     from_address: str = ""
 
     auto_reply_enabled: bool = True
+    # Final agent replies for email sessions are posted here (Slack channel/DM target)
+    # instead of attempting email outbound. Requires channels.slack enabled.
+    outbound_slack_channel: str = ""
     imap_idle_enabled: bool = True  # Gmail/IMAP IDLE for near-real-time inbound (falls back to poll)
     poll_interval_seconds: int = 60  # Max 60s between checks when IDLE is off or as IDLE cycle cap
     mark_seen: bool = True
@@ -477,6 +480,7 @@ class EmailChannel(BaseChannel):
                     "subject": subject,
                     "date": date_value,
                     "sender_email": sender,
+                    "email_body": body,
                     "uid": uid,
                 }
                 messages.append(

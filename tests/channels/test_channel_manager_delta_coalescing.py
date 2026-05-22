@@ -438,3 +438,190 @@ class TestRetryWaitFiltering:
         sent = send_mock.await_args_list[0].args[0]
         assert sent.content == "final answer"
         assert not sent.metadata.get("_retry_wait")
+
+
+class EmailOutboundSlackChannel(BaseChannel):
+    """Stub email channel with outbound Slack reroute config."""
+
+    name = "email"
+    display_name = "Email"
+
+    def __init__(self, config, bus):
+        super().__init__(config, bus)
+        self._send_mock = AsyncMock(side_effect=NotImplementedError("email send disabled"))
+
+    async def start(self):
+        pass
+
+    async def stop(self):
+        pass
+
+    async def send(self, msg):
+        return await self._send_mock(msg)
+
+
+@pytest.fixture
+def email_slack_manager(config, bus):
+    """Manager with email (reroute config) and slack mock channels."""
+    mgr = ChannelManager(config, bus)
+    mgr.channels["email"] = EmailOutboundSlackChannel(
+        {"outboundSlackChannel": "#support-ai"},
+        bus,
+    )
+    mgr.channels["slack"] = MockChannel({}, bus)
+    return mgr
+
+
+class TestEmailFinalOutboundSlackReroute:
+    """Final email-session replies reroute to Slack when configured."""
+
+    def test_should_reroute_excludes_progress_and_stream(self):
+        final = OutboundMessage(channel="email", chat_id="a@b.com", content="done", metadata={})
+        progress = OutboundMessage(
+            channel="email",
+            chat_id="a@b.com",
+            content="",
+            metadata={"_progress": True, "_tool_events": []},
+        )
+        delta = OutboundMessage(
+            channel="email",
+            chat_id="a@b.com",
+            content="x",
+            metadata={"_stream_delta": True},
+        )
+        streamed_final = OutboundMessage(
+            channel="email",
+            chat_id="a@b.com",
+            content="done",
+            metadata={"_streamed": True},
+        )
+        assert ChannelManager._should_reroute_email_final_outbound(final) is True
+        assert ChannelManager._should_reroute_email_final_outbound(progress) is False
+        assert ChannelManager._should_reroute_email_final_outbound(delta) is False
+        assert ChannelManager._should_reroute_email_final_outbound(streamed_final) is False
+
+    def test_build_report_includes_context(self):
+        msg = OutboundMessage(
+            channel="email",
+            chat_id="user@example.com",
+            content="Agent answer here.",
+            metadata={
+                "sender_email": "user@example.com",
+                "subject": "Help needed",
+                "message_id": "<abc@mail>",
+            },
+        )
+        text = ChannelManager._build_email_slack_report_content(msg)
+        assert "user@example.com" in text
+        assert "Help needed" in text
+        assert "<abc@mail>" in text
+        assert "Agent answer here." in text
+
+    @pytest.mark.asyncio
+    async def test_final_rerouted_to_slack(self, email_slack_manager, bus):
+        await bus.publish_outbound(OutboundMessage(
+            channel="email",
+            chat_id="user@example.com",
+            content="Draft ready for review.",
+            metadata={"sender_email": "user@example.com", "subject": "Question"},
+        ))
+
+        task = asyncio.create_task(email_slack_manager._dispatch_outbound())
+        try:
+            for _ in range(40):
+                slack = email_slack_manager.channels["slack"]._send_mock
+                if slack.await_count >= 1:
+                    break
+                await asyncio.sleep(0.05)
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        email_slack_manager.channels["email"]._send_mock.assert_not_awaited()
+        slack_send = email_slack_manager.channels["slack"]._send_mock
+        assert slack_send.await_count == 1
+        sent = slack_send.await_args_list[0].args[0]
+        assert sent.channel == "slack"
+        assert sent.chat_id == "#support-ai"
+        assert sent.metadata.get("_email_report") is True
+        assert "Draft ready for review." in sent.content
+        assert "Question" in sent.content
+
+    @pytest.mark.asyncio
+    async def test_progress_not_rerouted(self, email_slack_manager, bus):
+        email_slack_manager.channels["email"].send_progress = False
+        await bus.publish_outbound(OutboundMessage(
+            channel="email",
+            chat_id="user@example.com",
+            content="tool done",
+            metadata={"_progress": True},
+        ))
+
+        task = asyncio.create_task(email_slack_manager._dispatch_outbound())
+        try:
+            await asyncio.sleep(0.25)
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        email_slack_manager.channels["slack"]._send_mock.assert_not_awaited()
+        email_slack_manager.channels["email"]._send_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_missing_slack_channel_drops_without_email_send(self, config, bus):
+        mgr = ChannelManager(config, bus)
+        mgr.channels["email"] = EmailOutboundSlackChannel(
+            {"outboundSlackChannel": "#support-ai"},
+            bus,
+        )
+
+        await bus.publish_outbound(OutboundMessage(
+            channel="email",
+            chat_id="user@example.com",
+            content="Final only on Slack.",
+            metadata={},
+        ))
+
+        task = asyncio.create_task(mgr._dispatch_outbound())
+        try:
+            await asyncio.sleep(0.25)
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        mgr.channels["email"]._send_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_missing_reroute_target_drops_without_email_send(self, config, bus):
+        mgr = ChannelManager(config, bus)
+        mgr.channels["email"] = EmailOutboundSlackChannel({}, bus)
+        mgr.channels["slack"] = MockChannel({}, bus)
+
+        await bus.publish_outbound(OutboundMessage(
+            channel="email",
+            chat_id="user@example.com",
+            content="Final only on Slack.",
+            metadata={},
+        ))
+
+        task = asyncio.create_task(mgr._dispatch_outbound())
+        try:
+            await asyncio.sleep(0.25)
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        mgr.channels["email"]._send_mock.assert_not_awaited()
+        mgr.channels["slack"]._send_mock.assert_not_awaited()

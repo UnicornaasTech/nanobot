@@ -7,7 +7,7 @@ refreshToken). Access tokens are cached in memory only; nothing is written to di
 Google documentation:
 
 - Gmail API overview: https://developers.google.com/workspace/gmail/api/guides
-- OAuth scopes (``gmail.compose`` creates drafts; does not send):
+- OAuth scopes (``gmail.compose`` drafts; ``gmail.readonly`` resolves reply threads):
   https://developers.google.com/workspace/gmail/api/auth/scopes
 
 Google client libraries are imported lazily so the rest of nanobot works
@@ -20,7 +20,10 @@ from typing import Any
 
 from nanobot.config.schema import Base
 
-SCOPES = ["https://www.googleapis.com/auth/gmail.compose"]
+SCOPES = [
+    "https://www.googleapis.com/auth/gmail.compose",
+    "https://www.googleapis.com/auth/gmail.readonly",
+]
 TOKEN_URI = "https://oauth2.googleapis.com/token"
 
 _cached_creds: Any = None

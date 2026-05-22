@@ -284,6 +284,92 @@ class ChannelManager:
 
         return False
 
+    def _email_outbound_slack_target(self) -> str:
+        """Configured Slack destination for email-session final reports."""
+        email_ch = self.channels.get("email")
+        if email_ch is None:
+            return ""
+        cfg = email_ch.config
+        if isinstance(cfg, dict):
+            raw = cfg.get("outbound_slack_channel") or cfg.get("outboundSlackChannel")
+        else:
+            raw = getattr(cfg, "outbound_slack_channel", "")
+        return str(raw or "").strip()
+
+    @staticmethod
+    def _should_reroute_email_final_outbound(msg: OutboundMessage) -> bool:
+        """True when *msg* is a final email-session reply (not progress/stream control)."""
+        if msg.channel != "email":
+            return False
+        md = msg.metadata or {}
+        if md.get("_progress"):
+            return False
+        if md.get("_stream_delta") or md.get("_stream_end"):
+            return False
+        if md.get("_retry_wait"):
+            return False
+        # Final messages marked as already streamed should not be rerouted:
+        # they were intentionally consumed by delta streaming semantics.
+        if md.get("_streamed"):
+            return False
+        return True
+
+    @staticmethod
+    def _build_email_slack_report_content(msg: OutboundMessage) -> str:
+        """Format agent final text with inbound email context for Slack."""
+        md = msg.metadata or {}
+        sender = str(md.get("sender_email") or msg.chat_id or "").strip()
+        subject = str(md.get("subject") or "").strip()
+        message_id = str(md.get("message_id") or "").strip()
+        lines: list[str] = []
+        if sender or subject:
+            header = f"*Email session* — From: `{sender or 'unknown'}`"
+            if subject:
+                header += f" · Subject: {subject}"
+            if message_id:
+                header += f" · Message-ID: `{message_id}`"
+            lines.extend([header, ""])
+        body = (msg.content or "").strip()
+        if body:
+            lines.append(body)
+        elif not lines:
+            return "(empty agent response)"
+        return "\n".join(lines)
+
+    async def _try_send_email_final_via_slack(self, msg: OutboundMessage) -> bool:
+        """Reroute eligible email finals to Slack. Returns True if handled (sent or dropped)."""
+        if not self._should_reroute_email_final_outbound(msg):
+            return False
+
+        slack_target = self._email_outbound_slack_target()
+        if not slack_target:
+            logger.warning(
+                "Email final outbound has no configured outboundSlackChannel; "
+                "dropping message for {}",
+                msg.chat_id,
+            )
+            return True
+
+        slack_ch = self.channels.get("slack")
+        if slack_ch is None:
+            logger.warning(
+                "Email final outbound is configured for Slack ({}) but the slack channel "
+                "is not enabled; dropping message for {}",
+                slack_target,
+                msg.chat_id,
+            )
+            return True
+
+        report = OutboundMessage(
+            channel="slack",
+            chat_id=slack_target,
+            content=self._build_email_slack_report_content(msg),
+            metadata={**(msg.metadata or {}), "_email_report": True},
+            media=list(msg.media or []),
+        )
+        await self._send_with_retry(slack_ch, report)
+        return True
+
     async def _dispatch_outbound(self) -> None:
         """Dispatch outbound messages to the appropriate channel."""
         logger.info("Outbound dispatcher started")
@@ -345,6 +431,9 @@ class ChannelManager:
                 if msg.metadata.get("_stream_delta") and not msg.metadata.get("_stream_end"):
                     msg, extra_pending = self._coalesce_stream_deltas(msg)
                     pending.extend(extra_pending)
+
+                if await self._try_send_email_final_via_slack(msg):
+                    continue
 
                 channel = self.channels.get(msg.channel)
                 if channel:

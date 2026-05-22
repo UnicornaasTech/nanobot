@@ -7,7 +7,8 @@ opens a local browser flow, and prints the refresh token for ``tools.gmailDraft`
 
 Requires: pip install -e '.[gmail]' from the repo root.
 
-Scope: https://www.googleapis.com/auth/gmail.compose (drafts only; does not send mail).
+Scopes: gmail.compose (drafts) + gmail.readonly (resolve reply threads / quote originals).
+Does not send mail.
 
 See docs/prospr-customersupport-additions.md — Setup: Gmail, step 3.
 """
@@ -18,7 +19,10 @@ import getpass
 import json
 import sys
 
-SCOPES = ["https://www.googleapis.com/auth/gmail.compose"]
+SCOPES = [
+    "https://www.googleapis.com/auth/gmail.compose",
+    "https://www.googleapis.com/auth/gmail.readonly",
+]
 
 OAUTH_CLIENT_CONFIG = {
     "installed": {
@@ -54,7 +58,7 @@ def main() -> int:
     print("Gmail draft OAuth setup (nanobot tools.gmailDraft)\n")
     print(
         "Use a Google Cloud OAuth client of type **Desktop app** with scope "
-        "gmail.compose enabled on the consent screen.\n"
+        "gmail.compose and gmail.readonly enabled on the consent screen.\n"
     )
 
     client_id = _prompt("OAuth client ID")

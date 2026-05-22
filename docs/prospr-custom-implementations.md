@@ -166,6 +166,7 @@ Install from repo root: `pip install -e '.[gmail,instagram]'`
 
 - **Inbound:** IMAP (`imapHost`, etc.). Optional **IMAP IDLE** when `imapIdleEnabled` is true (default); otherwise timer polling at `pollIntervalSeconds` (clamped **5–60** seconds).
 - **Outbound disabled:** `send()` and `send_message()` always raise `NotImplementedError` directing the agent to `create_gmail_draft`. No SMTP `sendmail()` path runs even if SMTP fields are set.
+- **Final reply reporting:** When `outboundSlackChannel` is set and `channels.slack` is enabled, the channel manager posts the agent’s **final** turn text to that Slack target (with From/Subject/Message-ID context). Progress/stream/retry traffic is not rerouted. If `outboundSlackChannel` is missing, the final outbound is dropped with a warning (no email send attempt). Set `sendProgress: false` on email to suppress mid-turn outbound attempts entirely.
 - **`autoReplyEnabled`:** Present on `EmailConfig` (default `true`) but **not consulted** for delivery; outbound is blocked unconditionally in code.
 
 **Gmail IMAP credentials (`imapPassword`)** — separate from `tools.gmailDraft` OAuth:
@@ -199,20 +200,28 @@ Full mailbox + OAuth draft setup: [`docs/prospr-customersupport-additions.md`](p
       "imapUseSsl": true,
       "imapIdleEnabled": true,
       "pollIntervalSeconds": 60,
+      "sendProgress": false,
+      "outboundSlackChannel": "#customer-support-ai",
       "allowFrom": ["*"]
+    },
+    "slack": {
+      "enabled": true,
+      "botToken": "xoxb-...",
+      "appToken": "xapp-..."
     }
   }
 }
 ```
 
-Polling-only inbound (no IMAP IDLE): set `"imapIdleEnabled": false` (same `pollIntervalSeconds` clamp, 5–60).
+`outboundSlackChannel` accepts Slack channel names (`#general`), channel IDs (`C…`), or user handles (`@name` → DM). Polling-only inbound (no IMAP IDLE): set `"imapIdleEnabled": false` (same `pollIntervalSeconds` clamp, 5–60).
 
 ### Gmail draft tool (`nanobot/agent/tools/gmail_auth.py`, `gmail_draft.py`)
 
 - Tool name: **`create_gmail_draft`**
-- OAuth scope: `https://www.googleapis.com/auth/gmail.compose` (drafts only).
+- OAuth scopes: `gmail.compose` (drafts) + `gmail.readonly` (resolve reply thread / quote original). Re-run `scripts/gmail_draft_oauth_setup.py` after upgrading if lookup fails.
 - **Config-only OAuth** under `tools.gmailDraft` (`clientId`, `clientSecret`, `refreshToken`). Values may use `${ENV_VAR}` interpolation. Access tokens are cached **in memory only** — no `gmail_token.json` or credential files on disk.
 - Calls Gmail API `users.drafts.create` only — never `users.messages.send`.
+- **Reply drafts:** on email sessions, `create_gmail_draft` auto-fills `in_reply_to` from inbound `message_id` (no LLM arg). The tool looks up the Gmail thread, sets `In-Reply-To` / `References`, matches subject (`Re:`), quotes the original below your reply body, and sets `threadId` so the draft appears on the conversation (not only in Drafts). Lookup/fallback failures are logged as warnings.
 - Registered via tool auto-discovery (`nanobot/agent/tools/loader.py`). Enabled when `[gmail]` packages are importable **and** `tools.gmailDraft` is fully configured.
 
 **Config example** (install `pip install -e '.[gmail]'`, enable email channel for inbound):
@@ -448,6 +457,8 @@ Other `channels.slack` keys (`botToken`, `appToken`, `replyInThread`, `groupAllo
 | `imapIdleEnabled`                                                                                 | bool     | `true`           | **Fork:** IDLE vs poll-only inbound.                   |
 | `pollIntervalSeconds`                                                                             | int      | `60`             | Clamped 5–60; used when IDLE off or as IDLE cycle cap. |
 | `autoReplyEnabled`                                                                                | bool     | `true`           | **Not enforced** for send (outbound always blocked).   |
+| `sendProgress`                                                                                    | bool     | `true` (global)  | Per-channel override; set `false` on email to skip progress outbound. |
+| `outboundSlackChannel`                                                                            | string   | `""`             | **Fork:** Slack target for final agent replies (`#channel`, `C…`, `@user`). Requires `channels.slack.enabled`. |
 | `markSeen`                                                                                        | bool     | `true`           |                                                        |
 | `maxBodyChars`                                                                                    | int      | `12000`          |                                                        |
 | `subjectPrefix`                                                                                   | string   | `"Re: "`         |                                                        |

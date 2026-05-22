@@ -60,6 +60,9 @@ def test_draft_creates_not_sends(monkeypatch: pytest.MonkeyPatch) -> None:
     mock_service.users.return_value.drafts.return_value.create.return_value.execute.return_value = (
         exec_result
     )
+    mock_service.users.return_value.messages.return_value.list.return_value.execute.return_value = {
+        "messages": []
+    }
 
     cfg = GmailDraftToolConfig(
         client_id="id",
@@ -76,6 +79,7 @@ def test_draft_creates_not_sends(monkeypatch: pytest.MonkeyPatch) -> None:
         subject="Hi",
         body="Body",
         thread_id="th1",
+        in_reply_to="<msg@example.com>",
         gmail_draft_config=cfg,
     )
     assert result["status"] == "draft_created_not_sent"
