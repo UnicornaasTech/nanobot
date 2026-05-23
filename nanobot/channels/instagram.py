@@ -28,9 +28,12 @@ import asyncio
 import hashlib
 import hmac
 import json
+import mimetypes
 import threading
 from contextlib import suppress
-from typing import Any
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import httpx
 from pydantic import Field, model_validator
@@ -42,6 +45,12 @@ from slack_sdk.web.async_client import AsyncWebClient
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
+from nanobot.config.paths import get_media_dir
+from nanobot.utils.document import SUPPORTED_EXTENSIONS
+from nanobot.utils.helpers import detect_image_mime, safe_filename
+
+if TYPE_CHECKING:
+    from nanobot.session.manager import SessionManager
 from nanobot.channels.instagram_review_state import (
     clear_slack_thread_ts,
     compose_chat_id,
@@ -66,6 +75,21 @@ _GRAPH_API = "https://graph.facebook.com/v19.0"
 _SLACK_ACTION_VALUE_SOFT_LIMIT = 1800
 _MAX_CUSTOMER_TEXT_CHARS = 3000
 _WEBHOOK_PATH_PREFIX = "/webhook/instagram/"
+_THREAD_CONTEXT_LIMIT = 20
+_MAX_BACKFILL_IMAGES = 5
+_THREAD_CONTEXT_CACHE_LIMIT = 10_000
+_DOWNLOAD_TIMEOUT_S = 30.0
+_MAX_ATTACHMENT_BYTES = 10_000_000
+_SLACK_REVIEW_PRIOR_MESSAGES = 3
+_SLACK_REVIEW_LINE_MAX_CHARS = 500
+_IMAGE_ATTACHMENT_TYPES = frozenset({"image", "sticker"})
+_DOCUMENT_MEDIA_EXTENSIONS = SUPPORTED_EXTENSIONS - {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+}
 
 # Top-level channel keys removed in favor of ``accounts[]`` only.
 _LEGACY_CHANNEL_CONFIG_KEYS = frozenset(
@@ -142,6 +166,15 @@ class InstagramConfig(Base):
         return self
 
 
+@dataclass(frozen=True)
+class _ParsedIgMessage:
+    """Normalized inbound DM payload before optional thread backfill."""
+
+    text: str
+    media: list[str]
+    markers: list[str]
+
+
 class InstagramChannel(BaseChannel):
     """Instagram DMs in, Slack-reviewed drafts out; Meta send only from human actions."""
 
@@ -151,11 +184,18 @@ class InstagramChannel(BaseChannel):
     _POLL_INTERVAL_MAX = _POLL_INTERVAL_MAX
     _MAX_SEEN_INBOUND_IDS = _MAX_SEEN_INBOUND_IDS
 
-    def __init__(self, config: Any, bus: MessageBus):
+    def __init__(
+        self,
+        config: Any,
+        bus: MessageBus,
+        *,
+        session_manager: SessionManager | None = None,
+    ):
         if isinstance(config, dict):
             config = InstagramConfig.model_validate(config)
         super().__init__(config, bus)
         self.config: InstagramConfig = config
+        self._session_manager = session_manager
         self._accounts_by_key: dict[str, InstagramAccountConfig] = {}
         self._accounts_by_page_id: dict[str, InstagramAccountConfig] = {}
         self._build_account_indexes()
@@ -169,6 +209,7 @@ class InstagramChannel(BaseChannel):
         self._web_client: AsyncWebClient | None = None
         self._socket_client: SocketModeClient | None = None
         self._seen_inbound_ids: set[str] = set()
+        self._thread_context_attempted: set[str] = set()
         self._setup_app()
 
     def _build_account_indexes(self) -> None:
@@ -225,23 +266,363 @@ class InstagramChannel(BaseChannel):
         self,
         account: InstagramAccountConfig,
         sender_id: str,
-        text: str,
+        parsed: _ParsedIgMessage,
         *,
         message_id: str | None,
         raw: dict[str, Any],
     ) -> None:
+        if not self.is_allowed(str(sender_id)):
+            self.logger.warning(
+                "Instagram DM from {} denied by allowFrom for account {}",
+                sender_id,
+                account.account_key,
+            )
+            return
         if message_id:
             if message_id in self._seen_inbound_ids:
                 return
             self._remember_inbound_id(message_id)
-        preview = text[:80] + "..." if len(text) > 80 else text
+        original_text = self._compose_customer_text(parsed)
+        if not original_text.strip():
+            return
+        preview = original_text[:80] + "..." if len(original_text) > 80 else original_text
         self.logger.info(
             "Instagram DM [{}] from {}: {}",
             account.account_key,
             sender_id,
             preview,
         )
-        self._publish_inbound_sync(account, sender_id, text, raw)
+        model_text, model_media = self._maybe_thread_backfill(
+            account,
+            sender_id,
+            original_text,
+            list(parsed.media),
+            exclude_message_id=message_id,
+        )
+        self._publish_inbound_sync(
+            account,
+            sender_id,
+            model_text,
+            raw,
+            media=model_media,
+            original_text=original_text,
+            message_id=message_id,
+        )
+
+    @staticmethod
+    def _compose_customer_text(parsed: _ParsedIgMessage) -> str:
+        parts = [parsed.text] if parsed.text else []
+        parts.extend(parsed.markers)
+        return "\n".join(part for part in parts if part).strip()
+
+    def _parse_inbound_message(
+        self,
+        message: dict[str, Any],
+        account: InstagramAccountConfig,
+        *,
+        file_id_prefix: str,
+    ) -> _ParsedIgMessage | None:
+        """Extract text, local attachment paths, and markers from a Meta message."""
+        text = str(message.get("text") or message.get("message") or "").strip()
+        media_paths: list[str] = []
+        markers: list[str] = []
+        attachments = self._iter_message_attachments(message)
+        for index, attachment in enumerate(attachments):
+            att_type = str(attachment.get("type") or "attachment").lower()
+            payload = attachment.get("payload") if isinstance(attachment.get("payload"), dict) else {}
+            url = str(payload.get("url") or "")
+            file_id = f"{file_id_prefix}_{index}"
+            if not url:
+                markers.append(f"[{att_type}: no url]")
+                continue
+            path = self._download_attachment_url(
+                url,
+                account,
+                file_id=file_id,
+                att_type=att_type,
+            )
+            if path is None:
+                markers.append(f"[{att_type}: download failed]")
+                continue
+            path_obj = Path(path)
+            label = att_type if att_type not in _IMAGE_ATTACHMENT_TYPES else "image"
+            markers.append(f"[{label}: {path_obj.name} — saved to {path}]")
+            if self._attachment_feeds_model_media(path_obj, att_type):
+                media_paths.append(path)
+        if not text and not media_paths and not markers:
+            return None
+        return _ParsedIgMessage(text=text, media=media_paths, markers=markers)
+
+    @staticmethod
+    def _attachment_feeds_model_media(path: Path, att_type: str) -> bool:
+        """Whether a downloaded file should be passed via ``InboundMessage.media``."""
+        if att_type in _IMAGE_ATTACHMENT_TYPES:
+            return True
+        return path.suffix.lower() in _DOCUMENT_MEDIA_EXTENSIONS
+
+    @staticmethod
+    def _iter_message_attachments(message: dict[str, Any]) -> list[dict[str, Any]]:
+        attachments = message.get("attachments")
+        if isinstance(attachments, list):
+            return [item for item in attachments if isinstance(item, dict)]
+        if isinstance(attachments, dict):
+            data = attachments.get("data")
+            if isinstance(data, list):
+                return [item for item in data if isinstance(item, dict)]
+        return []
+
+    @staticmethod
+    def _extension_for_attachment(att_type: str, content_type: str | None) -> str:
+        if content_type:
+            mime = content_type.split(";")[0].strip().lower()
+            ext = mimetypes.guess_extension(mime)
+            if ext:
+                return ext
+        return {
+            "image": ".jpg",
+            "sticker": ".webp",
+            "video": ".mp4",
+            "audio": ".m4a",
+            "file": ".bin",
+            "ig_reel": ".mp4",
+            "reel": ".mp4",
+        }.get(att_type, ".bin")
+
+    def _download_attachment_url(
+        self,
+        url: str,
+        account: InstagramAccountConfig,
+        *,
+        file_id: str,
+        att_type: str,
+    ) -> str | None:
+        if not url:
+            return None
+        media_dir = get_media_dir("instagram")
+        request_params: dict[str, str] = {}
+        if account.page_access_token and "access_token=" not in url:
+            request_params["access_token"] = account.page_access_token
+        try:
+            with httpx.Client(timeout=_DOWNLOAD_TIMEOUT_S, follow_redirects=True) as client:
+                response = client.get(url, params=request_params or None)
+                response.raise_for_status()
+                if len(response.content) > _MAX_ATTACHMENT_BYTES:
+                    self.logger.warning(
+                        "Instagram attachment {} exceeds size cap ({} bytes)",
+                        file_id,
+                        len(response.content),
+                    )
+                    return None
+                content_type = response.headers.get("content-type")
+                if not content_type and response.content:
+                    content_type = detect_image_mime(response.content)
+                ext = self._extension_for_attachment(att_type, content_type)
+                path = media_dir / safe_filename(f"{file_id}{ext}")
+                path.write_bytes(response.content)
+            return str(path)
+        except Exception:
+            self.logger.warning("Failed to download Instagram attachment {}", file_id)
+            return None
+
+    def _session_has_history(self, chat_id: str) -> bool:
+        if self._session_manager is None:
+            return False
+        session_key = f"{self.name}:{chat_id}"
+        session = self._session_manager.get_or_create(session_key)
+        for message in session.messages:
+            if message.get("role") != "user":
+                continue
+            content = message.get("content", "")
+            if isinstance(content, str) and content.strip():
+                return True
+            media = message.get("media")
+            if isinstance(media, list) and media:
+                return True
+        return False
+
+    def _should_attempt_thread_backfill(self, chat_id: str) -> bool:
+        if self._session_manager is None:
+            return False
+        if chat_id in self._thread_context_attempted:
+            return False
+        if self._session_has_history(chat_id):
+            self._thread_context_attempted.add(chat_id)
+            return False
+        return True
+
+    def _remember_thread_backfill_attempt(self, chat_id: str) -> None:
+        if len(self._thread_context_attempted) >= _THREAD_CONTEXT_CACHE_LIMIT:
+            self._thread_context_attempted.clear()
+        self._thread_context_attempted.add(chat_id)
+
+    def _maybe_thread_backfill(
+        self,
+        account: InstagramAccountConfig,
+        sender_id: str,
+        current_text: str,
+        current_media: list[str],
+        *,
+        exclude_message_id: str | None,
+    ) -> tuple[str, list[str]]:
+        chat_id = compose_chat_id(account.account_key, sender_id)
+        if not self._should_attempt_thread_backfill(chat_id):
+            return current_text, current_media
+        if not account.page_id or not account.page_access_token:
+            self._remember_thread_backfill_attempt(chat_id)
+            return current_text, current_media
+        try:
+            prior_messages = self._fetch_customer_thread_messages(account, sender_id)
+        except Exception:
+            self.logger.exception(
+                "Instagram thread backfill failed for {}",
+                chat_id,
+            )
+            self._remember_thread_backfill_attempt(chat_id)
+            return current_text, current_media
+        context_text, context_media = self._format_thread_backfill(
+            account,
+            prior_messages,
+            exclude_message_id=exclude_message_id,
+        )
+        self._remember_thread_backfill_attempt(chat_id)
+        if not context_text and not context_media:
+            return current_text, current_media
+        if context_text:
+            model_text = (
+                "Instagram thread context before this message:\n"
+                f"{context_text}\n\nCurrent message:\n{current_text}"
+            )
+        else:
+            model_text = current_text
+        return model_text, context_media + current_media
+
+    def _fetch_customer_thread_messages(
+        self,
+        account: InstagramAccountConfig,
+        customer_id: str,
+    ) -> list[dict[str, Any]]:
+        """Fetch recent messages in the customer's DM thread via Graph API."""
+        limit = _THREAD_CONTEXT_LIMIT + 1
+        url = f"{_GRAPH_API}/{account.page_id}/conversations"
+        params = {
+            "platform": "INSTAGRAM",
+            "user_id": customer_id,
+            "fields": (
+                f"messages.limit({limit})"
+                "{message,from,id,created_time,attachments{type,payload}}"
+            ),
+            "access_token": account.page_access_token,
+        }
+        with httpx.Client(timeout=_DOWNLOAD_TIMEOUT_S) as client:
+            response = client.get(url, params=params)
+            response.raise_for_status()
+            data = response.json()
+        if isinstance(data.get("error"), dict):
+            raise RuntimeError(f"Graph API error: {data['error']}")
+        for conv in data.get("data", []):
+            messages = (conv.get("messages") or {}).get("data", [])
+            if messages:
+                return self._sort_graph_messages(messages)
+        return self._fetch_customer_thread_messages_fallback(account, customer_id, limit=limit)
+
+    def _fetch_customer_thread_messages_fallback(
+        self,
+        account: InstagramAccountConfig,
+        customer_id: str,
+        *,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Scan page conversations when user_id filter is unavailable."""
+        url = f"{_GRAPH_API}/{account.page_id}/conversations"
+        params = {
+            "platform": "INSTAGRAM",
+            "fields": (
+                f"messages.limit({limit})"
+                "{message,from,id,created_time,attachments{type,payload}}"
+            ),
+            "access_token": account.page_access_token,
+        }
+        with httpx.Client(timeout=_DOWNLOAD_TIMEOUT_S) as client:
+            response = client.get(url, params=params)
+            response.raise_for_status()
+            data = response.json()
+        if isinstance(data.get("error"), dict):
+            raise RuntimeError(f"Graph API error: {data['error']}")
+        for conv in data.get("data", []):
+            messages = (conv.get("messages") or {}).get("data", [])
+            if not messages:
+                continue
+            senders = {
+                str((msg.get("from") or {}).get("id") or "")
+                for msg in messages
+                if isinstance(msg, dict)
+            }
+            if customer_id in senders:
+                return self._sort_graph_messages(messages)
+        return []
+
+    @staticmethod
+    def _sort_graph_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Graph returns messages newest-first; normalize to chronological order."""
+        return sorted(messages, key=lambda item: str(item.get("created_time") or ""))
+
+    def _image_attachment_urls(self, message: dict[str, Any]) -> list[str]:
+        urls: list[str] = []
+        for attachment in self._iter_message_attachments(message):
+            att_type = str(attachment.get("type") or "").lower()
+            if att_type not in _IMAGE_ATTACHMENT_TYPES:
+                continue
+            payload = attachment.get("payload") if isinstance(attachment.get("payload"), dict) else {}
+            url = str(payload.get("url") or "")
+            if url:
+                urls.append(url)
+        return urls
+
+    def _format_thread_backfill(
+        self,
+        account: InstagramAccountConfig,
+        messages: list[dict[str, Any]],
+        *,
+        exclude_message_id: str | None,
+    ) -> tuple[str, list[str]]:
+        skip_ids = {account.page_id, account.ig_user_id} - {""}
+        filtered: list[dict[str, Any]] = []
+        for msg in messages:
+            mid = str(msg.get("id") or "")
+            if exclude_message_id and mid == exclude_message_id:
+                continue
+            from_obj = msg.get("from") or {}
+            sender_id = str(from_obj.get("id") or "")
+            if not sender_id or sender_id in skip_ids:
+                continue
+            filtered.append(msg)
+        if len(filtered) > _THREAD_CONTEXT_LIMIT:
+            filtered = filtered[-_THREAD_CONTEXT_LIMIT :]
+        lines: list[str] = []
+        image_jobs: list[tuple[str, str, str]] = []
+        for msg in filtered:
+            mid = str(msg.get("id") or "msg")
+            line_text = self._graph_message_preview(msg)
+            if line_text == "(no text)":
+                continue
+            if len(line_text) > 500:
+                line_text = line_text[:500] + "…"
+            lines.append(f"- customer: {line_text}")
+            created = str(msg.get("created_time") or "")
+            for index, url in enumerate(self._image_attachment_urls(msg)):
+                image_jobs.append((created, url, f"hist_{mid}_{index}"))
+        context_media: list[str] = []
+        image_jobs.sort(key=lambda item: item[0])
+        for _created, url, file_id in image_jobs[-_MAX_BACKFILL_IMAGES :]:
+            path = self._download_attachment_url(
+                url,
+                account,
+                file_id=file_id,
+                att_type="image",
+            )
+            if path:
+                context_media.append(path)
+        return "\n".join(lines), context_media
 
     def _webhook_path_for_account(self, account_key: str) -> str:
         return f"{_WEBHOOK_PATH_PREFIX}{account_key}"
@@ -354,6 +735,7 @@ class InstagramChannel(BaseChannel):
             sender_display_name=str(md.get("instagram_sender_name") or ""),
             account_key=account_key,
             account_label=account_label,
+            current_message_id=str(md.get("message_id") or "") or None,
         )
 
     def _validate_startup_config(self) -> list[str]:
@@ -537,26 +919,34 @@ class InstagramChannel(BaseChannel):
         sender_id: str,
         text: str,
         raw: dict[str, Any],
+        *,
+        media: list[str] | None = None,
+        original_text: str | None = None,
+        message_id: str | None = None,
     ) -> None:
         if self._loop is None:
             self.logger.error("Event loop not set; dropping Instagram DM")
             return
         chat_id = compose_chat_id(account.account_key, sender_id)
+        customer_text = original_text if original_text is not None else text
         meta: dict[str, Any] = {
             "platform": "instagram",
             "raw": raw,
-            "instagram_original_dm": text,
+            "instagram_original_dm": customer_text,
             "instagram_account_key": account.account_key,
             "instagram_account_label": account.display_label(),
             "instagram_page_id": account.page_id,
             "instagram_sender_id": sender_id,
         }
+        if message_id:
+            meta["message_id"] = message_id
         label = account.display_label()
         msg = InboundMessage(
             channel=self.name,
             sender_id=str(sender_id),
             chat_id=chat_id,
             content=f"[Instagram DM — {label} from {sender_id}]\n{text}",
+            media=list(media or []),
             metadata=meta,
         )
 
@@ -585,16 +975,24 @@ class InstagramChannel(BaseChannel):
                 )
                 continue
             for messaging in entry.get("messaging", []):
-                sender_id = messaging.get("sender", {}).get("id")
-                message = messaging.get("message") or {}
-                text = message.get("text")
-                if not text or not sender_id:
+                sender_obj = messaging.get("sender") or {}
+                sender_id = sender_obj.get("id")
+                if not sender_id:
                     continue
+                message = messaging.get("message") or {}
                 mid = message.get("mid") or message.get("id")
+                file_prefix = str(mid or "webhook")
+                parsed = self._parse_inbound_message(
+                    message,
+                    resolved,
+                    file_id_prefix=file_prefix,
+                )
+                if parsed is None:
+                    continue
                 self._ingest_inbound_dm(
                     resolved,
                     str(sender_id),
-                    str(text),
+                    parsed,
                     message_id=str(mid) if mid else None,
                     raw=messaging,
                 )
@@ -628,7 +1026,10 @@ class InstagramChannel(BaseChannel):
         url = f"{_GRAPH_API}/{account.page_id}/conversations"
         params = {
             "platform": "INSTAGRAM",
-            "fields": "messages.limit(10){message,from,id,created_time}",
+            "fields": (
+                "messages.limit(10)"
+                "{message,from,id,created_time,attachments{type,payload}}"
+            ),
             "access_token": account.page_access_token,
         }
         with httpx.Client(timeout=30.0) as client:
@@ -643,15 +1044,22 @@ class InstagramChannel(BaseChannel):
                 mid = msg.get("id")
                 from_obj = msg.get("from") or {}
                 sender_id = from_obj.get("id")
-                text = msg.get("message")
-                if not sender_id or not text:
+                if not sender_id:
                     continue
                 if str(sender_id) in skip_ids:
+                    continue
+                file_prefix = str(mid or "poll")
+                parsed = self._parse_inbound_message(
+                    msg,
+                    account,
+                    file_id_prefix=file_prefix,
+                )
+                if parsed is None:
                     continue
                 self._ingest_inbound_dm(
                     account,
                     str(sender_id),
-                    str(text),
+                    parsed,
                     message_id=str(mid) if mid else None,
                     raw={"poll": True, "account_key": account.account_key, "message": msg},
                 )
@@ -670,6 +1078,101 @@ class InstagramChannel(BaseChannel):
             "draft": draft,
             "original": original[:300],
         }
+
+    @staticmethod
+    def _truncate_slack_line(text: str, *, max_chars: int = _SLACK_REVIEW_LINE_MAX_CHARS) -> str:
+        text = text.strip()
+        if len(text) <= max_chars:
+            return text
+        return text[: max_chars - 1].rstrip() + "…"
+
+    def _graph_message_preview(self, message: dict[str, Any]) -> str:
+        """Short customer-visible text for Slack (no attachment re-download)."""
+        text = str(message.get("text") or message.get("message") or "").strip()
+        parts = [text] if text else []
+        for attachment in self._iter_message_attachments(message):
+            att_type = str(attachment.get("type") or "attachment")
+            payload = attachment.get("payload")
+            if isinstance(payload, dict) and payload.get("title"):
+                title = str(payload["title"]).strip()
+                parts.append(f"[{att_type}: {title[:80]}]")
+            else:
+                parts.append(f"[{att_type}]")
+        return "\n".join(parts) if parts else "(no text)"
+
+    @staticmethod
+    def _normalize_for_thread_match(text: str) -> str:
+        """Compare customer text without attachment marker lines."""
+        lines = [
+            line
+            for line in text.splitlines()
+            if line.strip() and not line.strip().startswith("[")
+        ]
+        return "\n".join(lines).strip()
+
+    def _build_slack_customer_thread_display(
+        self,
+        account: InstagramAccountConfig | None,
+        customer_id: str,
+        current_message: str,
+        *,
+        current_message_id: str | None = None,
+    ) -> str:
+        """Up to three prior customer messages plus the current one for Slack review."""
+        current = current_message.strip()
+        if account is None or not account.page_id or not account.page_access_token:
+            return self._truncate_slack_line(current)
+        try:
+            thread_messages = self._fetch_customer_thread_messages(account, customer_id)
+        except Exception:
+            self.logger.warning(
+                "Slack review thread context unavailable for customer {}",
+                customer_id,
+            )
+            return self._truncate_slack_line(current)
+        skip_ids = {account.page_id, account.ig_user_id} - {""}
+        entries: list[tuple[str, str, str]] = []
+        for msg in thread_messages:
+            from_obj = msg.get("from") or {}
+            sender_id = str(from_obj.get("id") or "")
+            if not sender_id or sender_id in skip_ids:
+                continue
+            entries.append((
+                str(msg.get("id") or ""),
+                str(msg.get("created_time") or ""),
+                self._graph_message_preview(msg),
+            ))
+        if not entries:
+            return self._truncate_slack_line(current)
+        current_index: int | None = None
+        if current_message_id:
+            current_index = next(
+                (index for index, entry in enumerate(entries) if entry[0] == current_message_id),
+                None,
+            )
+        if current_index is None:
+            normalized_current = self._normalize_for_thread_match(current)
+            if normalized_current:
+                current_index = next(
+                    (
+                        index
+                        for index, entry in enumerate(entries)
+                        if self._normalize_for_thread_match(entry[2]) == normalized_current
+                    ),
+                    None,
+                )
+        if current_index is not None:
+            prior_start = max(0, current_index - _SLACK_REVIEW_PRIOR_MESSAGES)
+            prior = [entry[2] for entry in entries[prior_start:current_index]]
+        else:
+            # Current message not in Graph yet — show recent thread + explicit current.
+            prior = [entry[2] for entry in entries[-_SLACK_REVIEW_PRIOR_MESSAGES :]]
+        if not prior:
+            return self._truncate_slack_line(current)
+        lines = ["*Recent messages:*"]
+        lines.extend(f"• {self._truncate_slack_line(line)}" for line in prior)
+        lines.append(f"*Current message:*\n{self._truncate_slack_line(current)}")
+        return "\n".join(lines)
 
     def post_draft_to_slack(
         self,
@@ -705,6 +1208,7 @@ class InstagramChannel(BaseChannel):
         sender_display_name: str = "",
         account_key: str = "",
         account_label: str = "",
+        current_message_id: str | None = None,
     ) -> None:
         """Post an Instagram review card to Slack (does not call Instagram)."""
         parsed_key, customer_id = parse_chat_id(chat_id)
@@ -732,7 +1236,12 @@ class InstagramChannel(BaseChannel):
             if is_tool_draft
             else ":speech_balloon: *Instagram DM — no reply suggested*"
         )
-        customer_text = original_message
+        customer_text = self._build_slack_customer_thread_display(
+            account,
+            customer_id,
+            original_message,
+            current_message_id=current_message_id,
+        )
         if len(customer_text) > _MAX_CUSTOMER_TEXT_CHARS:
             customer_text = customer_text[:_MAX_CUSTOMER_TEXT_CHARS] + "\n…(truncated)"
 
@@ -745,7 +1254,7 @@ class InstagramChannel(BaseChannel):
                         f"{header}\n"
                         f"{account_line}"
                         f"*From:* `{customer_id}`{name_str}\n"
-                        f"*Customer message:*\n{customer_text}"
+                        f"*Customer thread:*\n{customer_text}"
                     ),
                 },
             },

@@ -117,6 +117,8 @@ class ChannelManager:
                             kwargs["static_dist_path"] = static_path
                     if self._webui_runtime_model_name is not None:
                         kwargs["runtime_model_name"] = self._webui_runtime_model_name
+                elif cls.name == "instagram" and self._session_manager is not None:
+                    kwargs["session_manager"] = self._session_manager
                 channel = cls(section, self.bus, **kwargs)
                 channel.transcription_provider = transcription_provider
                 channel.transcription_api_key = transcription_key

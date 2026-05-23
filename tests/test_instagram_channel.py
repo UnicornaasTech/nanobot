@@ -16,14 +16,18 @@ pytest.importorskip("flask")
 
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.instagram import (
+    _MAX_BACKFILL_IMAGES,
+    _THREAD_CONTEXT_LIMIT,
     ACTION_DISCARD,
     ACTION_SEND,
     CALLBACK_EDIT_MODAL,
     InstagramAccountConfig,
     InstagramChannel,
     InstagramConfig,
+    _ParsedIgMessage,
 )
 from nanobot.channels.instagram_review_state import compose_chat_id
+from nanobot.session.manager import SessionManager
 
 
 def test_legacy_top_level_config_rejected() -> None:
@@ -268,7 +272,7 @@ def test_post_draft_builds_correct_blocks(monkeypatch: pytest.MonkeyPatch) -> No
     assert ACTION_SEND in flat
     assert "ig_draft_edit_send" in flat
     assert ACTION_DISCARD in flat
-    assert "Customer message" in flat
+    assert "Customer thread" in flat
     assert "hello" in flat
     assert captured["body"].get("thread_ts") == "100.001"
 
@@ -519,13 +523,15 @@ def test_ingest_dedupes_by_message_id() -> None:
     published = 0
     account = _sole_account(ch)
 
-    def fake_publish(_account, _sender: str, _text: str, _raw: dict) -> None:
+    def fake_publish(_account, _sender: str, _text: str, _raw: dict, **kwargs: object) -> None:
         nonlocal published
         published += 1
 
     ch._publish_inbound_sync = fake_publish  # type: ignore[method-assign]
-    ch._ingest_inbound_dm(account, "u1", "hello", message_id="m1", raw={})
-    ch._ingest_inbound_dm(account, "u1", "hello again", message_id="m1", raw={})
+    hello = _ParsedIgMessage(text="hello", media=[], markers=[])
+    again = _ParsedIgMessage(text="hello again", media=[], markers=[])
+    ch._ingest_inbound_dm(account, "u1", hello, message_id="m1", raw={})
+    ch._ingest_inbound_dm(account, "u1", again, message_id="m1", raw={})
     assert published == 1
     assert "m1" in ch._seen_inbound_ids
 
@@ -534,8 +540,8 @@ def test_poll_conversations_ingests_customer_messages(monkeypatch: pytest.Monkey
     ch = _channel()
     ingested: list[tuple[str, str, str]] = []
 
-    def capture(account, sender: str, text: str, *, message_id, raw):
-        ingested.append((account.account_key, sender, text))
+    def capture(account, sender: str, parsed: _ParsedIgMessage, *, message_id, raw):
+        ingested.append((account.account_key, sender, parsed.text))
 
     monkeypatch.setattr(ch, "_ingest_inbound_dm", capture)
 
@@ -735,3 +741,334 @@ def test_send_uses_matching_account_token(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setattr("nanobot.channels.instagram.httpx.Client", FakeClient)
     ch._send_instagram_message("CUST", "hello", "acct_a")
     assert tokens == ["token_a"]
+
+
+def test_parse_inbound_message_downloads_image(monkeypatch: pytest.MonkeyPatch) -> None:
+    ch = _channel()
+    account = _sole_account(ch)
+    monkeypatch.setattr(
+        ch,
+        "_download_attachment_url",
+        lambda url, acc, *, file_id, att_type: f"/tmp/{file_id}.jpg",
+    )
+    parsed = ch._parse_inbound_message(
+        {
+            "text": "see this",
+            "attachments": [{"type": "image", "payload": {"url": "https://cdn.example/a.jpg"}}],
+        },
+        account,
+        file_id_prefix="mid1",
+    )
+    assert parsed is not None
+    assert parsed.text == "see this"
+    assert parsed.media == ["/tmp/mid1_0.jpg"]
+    assert "[image:" in parsed.markers[0]
+
+
+def test_parse_inbound_message_image_download_failure_marker() -> None:
+    ch = _channel()
+    account = _sole_account(ch)
+    parsed = ch._parse_inbound_message(
+        {
+            "attachments": [{"type": "image", "payload": {"url": "https://cdn.example/a.jpg"}}],
+        },
+        account,
+        file_id_prefix="mid2",
+    )
+    assert parsed is not None
+    assert parsed.media == []
+    assert parsed.markers == ["[image: download failed]"]
+
+
+def test_parse_inbound_message_downloads_pdf_to_media(monkeypatch: pytest.MonkeyPatch) -> None:
+    ch = _channel()
+    account = _sole_account(ch)
+    monkeypatch.setattr(
+        ch,
+        "_download_attachment_url",
+        lambda url, acc, *, file_id, att_type: f"/tmp/{file_id}.pdf",
+    )
+    parsed = ch._parse_inbound_message(
+        {
+            "text": "invoice",
+            "attachments": [{"type": "file", "payload": {"url": "https://cdn.example/doc.pdf"}}],
+        },
+        account,
+        file_id_prefix="mid3",
+    )
+    assert parsed is not None
+    assert parsed.media == ["/tmp/mid3_0.pdf"]
+    assert "saved to" in parsed.markers[0]
+
+
+def test_parse_inbound_message_video_marker_without_media(monkeypatch: pytest.MonkeyPatch) -> None:
+    ch = _channel()
+    account = _sole_account(ch)
+    monkeypatch.setattr(
+        ch,
+        "_download_attachment_url",
+        lambda url, acc, *, file_id, att_type: f"/tmp/{file_id}.mp4",
+    )
+    parsed = ch._parse_inbound_message(
+        {
+            "attachments": [{"type": "video", "payload": {"url": "https://cdn.example/v.mp4"}}],
+        },
+        account,
+        file_id_prefix="mid4",
+    )
+    assert parsed is not None
+    assert parsed.media == []
+    assert "[video:" in parsed.markers[0]
+
+
+def test_webhook_ingests_image_only_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    ch = _channel()
+    ingested: list[_ParsedIgMessage] = []
+
+    def capture(_account, _sender: str, parsed: _ParsedIgMessage, *, message_id, raw):
+        ingested.append(parsed)
+
+    monkeypatch.setattr(ch, "_ingest_inbound_dm", capture)
+    monkeypatch.setattr(
+        ch,
+        "_parse_inbound_message",
+        lambda message, account, *, file_id_prefix: _ParsedIgMessage(
+            text="",
+            media=["/tmp/photo.jpg"],
+            markers=["[image: photo.jpg]"],
+        ),
+    )
+    ch._handle_ig_payload(
+        {
+            "entry": [
+                {
+                    "id": "PAGE1",
+                    "messaging": [
+                        {
+                            "sender": {"id": "USER1"},
+                            "message": {
+                                "mid": "m-img",
+                                "attachments": [
+                                    {"type": "image", "payload": {"url": "https://x"}},
+                                ],
+                            },
+                        },
+                    ],
+                },
+            ],
+        },
+    )
+    assert len(ingested) == 1
+    assert ingested[0].media == ["/tmp/photo.jpg"]
+
+
+def test_backfill_skipped_when_session_has_history(tmp_path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    sessions = SessionManager(workspace)
+    chat_id = compose_chat_id("default", "USER1")
+    session = sessions.get_or_create(f"instagram:{chat_id}")
+    session.add_message("user", "prior turn")
+    sessions.save(session)
+
+    ch = _channel()
+    ch._session_manager = sessions
+    ch._remember_thread_backfill_attempt(chat_id)
+
+    model_text, model_media = ch._maybe_thread_backfill(
+        _sole_account(ch),
+        "USER1",
+        "new message",
+        [],
+        exclude_message_id="mid-new",
+    )
+    assert model_text == "new message"
+    assert model_media == []
+
+
+def test_backfill_includes_prior_context(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    sessions = SessionManager(workspace)
+    ch = _channel()
+    ch._session_manager = sessions
+    account = _sole_account(ch)
+
+    prior = [
+        {"id": "old1", "message": "first", "from": {"id": "USER1"}, "created_time": "1"},
+        {"id": "old2", "message": "second", "from": {"id": "USER1"}, "created_time": "2"},
+    ]
+    monkeypatch.setattr(ch, "_fetch_customer_thread_messages", lambda acc, cid: prior)
+
+    model_text, model_media = ch._maybe_thread_backfill(
+        account,
+        "USER1",
+        "latest",
+        [],
+        exclude_message_id="mid-new",
+    )
+    assert "Instagram thread context before this message:" in model_text
+    assert "first" in model_text
+    assert "second" in model_text
+    assert "Current message:\nlatest" in model_text
+    assert model_media == []
+
+
+def test_format_thread_backfill_caps_messages_and_images(monkeypatch: pytest.MonkeyPatch) -> None:
+    ch = _channel()
+    account = _sole_account(ch)
+    messages = []
+    for index in range(_THREAD_CONTEXT_LIMIT + 5):
+        messages.append({
+            "id": f"mid{index}",
+            "message": f"msg {index}",
+            "from": {"id": "USER1"},
+            "created_time": str(index),
+            "attachments": [
+                {"type": "image", "payload": {"url": f"https://cdn/{index}.jpg"}},
+            ],
+        })
+    monkeypatch.setattr(
+        ch,
+        "_download_attachment_url",
+        lambda url, acc, *, file_id, att_type: f"/tmp/{file_id}.jpg",
+    )
+    context_text, context_media = ch._format_thread_backfill(
+        account,
+        messages,
+        exclude_message_id=None,
+    )
+    assert context_text.count("- customer:") == _THREAD_CONTEXT_LIMIT
+    assert len(context_media) == _MAX_BACKFILL_IMAGES
+
+
+def test_ingest_denied_when_not_in_allow_from() -> None:
+    bus = MessageBus()
+    cfg = InstagramConfig(
+        enabled=True,
+        consent_granted=True,
+        use_webhook=False,
+        slack_bot_token="xoxb-test",
+        slack_draft_channel="C01234567",
+        slack_app_token="xapp-test-token",
+        allow_from=["OTHER_USER"],
+        accounts=[
+            InstagramAccountConfig(
+                account_key="default",
+                page_id="PAGE1",
+                page_access_token="token",
+            ),
+        ],
+    )
+    ch = InstagramChannel(cfg.model_dump(by_alias=True), bus)
+    published: list[str] = []
+
+    def fake_publish(*_args, **_kwargs) -> None:
+        published.append("yes")
+
+    ch._publish_inbound_sync = fake_publish  # type: ignore[method-assign]
+    parsed = _ParsedIgMessage(text="hello", media=[], markers=[])
+    ch._ingest_inbound_dm(
+        _sole_account(ch),
+        "DENIED_USER",
+        parsed,
+        message_id="m-deny",
+        raw={},
+    )
+    assert published == []
+
+
+def test_slack_thread_display_splits_by_message_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    ch = _channel()
+    account = _sole_account(ch)
+    messages = [
+        {"id": "m1", "message": "older", "from": {"id": "U1"}, "created_time": "1"},
+        {"id": "m2", "message": "middle", "from": {"id": "U1"}, "created_time": "2"},
+        {
+            "id": "m3",
+            "message": "latest",
+            "from": {"id": "U1"},
+            "created_time": "3",
+            "attachments": [{"type": "image", "payload": {"url": "https://x"}}],
+        },
+    ]
+    monkeypatch.setattr(ch, "_fetch_customer_thread_messages", lambda acc, cid: messages)
+    display = ch._build_slack_customer_thread_display(
+        account,
+        "U1",
+        "[image: saved.jpg — saved to /tmp/saved.jpg]\nlatest",
+        current_message_id="m3",
+    )
+    assert "older" in display
+    assert "middle" in display
+    assert "*Current message:*" in display
+    assert "saved.jpg" in display
+    assert display.index("older") < display.index("middle")
+    assert display.index("middle") < display.index("*Current message:*")
+
+
+def test_post_review_shows_prior_messages(monkeypatch: pytest.MonkeyPatch) -> None:
+    ch = _channel()
+    captured: dict = {}
+
+    def fake_slack_api(method: str, body: dict, token: str) -> dict:
+        captured["body"] = body
+        return {"ok": True, "ts": "500.001"}
+
+    monkeypatch.setattr(ch, "_slack_api", fake_slack_api)
+    monkeypatch.setattr(
+        ch,
+        "_build_slack_customer_thread_display",
+        lambda account, customer_id, current, **kwargs: (
+            "*Recent messages:*\n"
+            "• older one\n"
+            "• middle\n"
+            "*Current message:*\n"
+            f"{current}"
+        ),
+    )
+    ch.post_review_to_slack(
+        compose_chat_id("default", "uid5"),
+        "latest",
+        "draft",
+        review_mode="tool_draft",
+        allow_send=True,
+        account_key="default",
+    )
+    flat = json.dumps(captured["body"]["blocks"])
+    assert "Recent messages" in flat
+    assert "older one" in flat
+    assert "latest" in flat
+
+
+@pytest.mark.asyncio
+async def test_publish_inbound_includes_media_and_original_text() -> None:
+    ch = _channel()
+    ch._loop = asyncio.get_running_loop()
+    captured: list[dict] = []
+
+    async def capture(msg):
+        captured.append({
+            "media": list(msg.media),
+            "original": msg.metadata.get("instagram_original_dm"),
+            "content_tail": msg.content.split("\n", 1)[-1],
+        })
+
+    ch.bus.publish_inbound = capture  # type: ignore[method-assign]
+    account = _sole_account(ch)
+    ch._publish_inbound_sync(
+        account,
+        "CUST1",
+        "Instagram thread context before this message:\n-old\n\nCurrent message:\nhello",
+        {"test": True},
+        media=["/tmp/a.jpg"],
+        original_text="hello",
+        message_id="mid-1",
+    )
+    for _ in range(50):
+        if captured:
+            break
+        await asyncio.sleep(0.02)
+    assert captured[0]["media"] == ["/tmp/a.jpg"]
+    assert captured[0]["original"] == "hello"
+    assert captured[0]["content_tail"].startswith("Instagram thread context")
