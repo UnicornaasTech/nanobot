@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from email.utils import parsedate_to_datetime
 from collections.abc import Callable
 from contextlib import suppress
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -34,6 +34,10 @@ def _default_webui_dist() -> Path | None:
 
 # Retry delays for message sending (exponential backoff: 1s, 2s, 4s)
 _SEND_RETRY_DELAYS = (1, 2, 4)
+
+# ~1 printed page for customer email in Slack thread replies.
+_EMAIL_SLACK_THREAD_CUSTOMER_MAX_CHARS = 4000
+_EMAIL_SLACK_THREAD_AGENT_MAX_CHARS = 12_000
 
 _BOOL_CAMEL_ALIASES: dict[str, str] = {
     "send_progress": "sendProgress",
@@ -329,25 +333,103 @@ class ChannelManager:
             return raw
 
     @staticmethod
-    def _build_email_slack_report_content(msg: OutboundMessage) -> str:
-        """Format agent final text with inbound email context for Slack."""
+    def _truncate_email_slack_text(text: str, max_chars: int) -> str:
+        cleaned = (text or "").strip()
+        if len(cleaned) <= max_chars:
+            return cleaned
+        return cleaned[:max_chars].rstrip() + "\n…(truncated)"
+
+    @staticmethod
+    def _build_email_slack_report_header(msg: OutboundMessage) -> str:
+        """One-line heads-up for the channel; details go in a thread reply."""
         md = msg.metadata or {}
         sender = str(md.get("sender_email") or msg.chat_id or "").strip()
         subject = str(md.get("subject") or "").strip()
         received_at = ChannelManager._format_email_received_at(str(md.get("date") or ""))
-        lines: list[str] = []
-        if sender or subject:
-            header = f"EMAIL DRAFT: From: {sender or 'unknown'}"
-            if subject:
-                header += f" · Subject: {subject}"
-            header += f" · Received at {received_at}"
-            lines.extend([header, ""])
+        header = f"EMAIL DRAFT: From: {sender or 'unknown'}"
+        if subject:
+            header += f" · Subject: {subject}"
+        header += f" · Received at {received_at}"
+        return f"{header}\n\n_(Customer email and agent reply in thread.)_"
+
+    @staticmethod
+    def _build_email_slack_report_thread_content(msg: OutboundMessage) -> str:
+        """Thread reply: truncated customer body and agent final reply."""
+        md = msg.metadata or {}
+        customer = ChannelManager._truncate_email_slack_text(
+            str(md.get("email_body") or ""),
+            _EMAIL_SLACK_THREAD_CUSTOMER_MAX_CHARS,
+        )
+        agent = ChannelManager._truncate_email_slack_text(
+            str(msg.content or ""),
+            _EMAIL_SLACK_THREAD_AGENT_MAX_CHARS,
+        )
+        parts: list[str] = []
+        if customer:
+            parts.extend(["*Customer email:*", customer, ""])
+        else:
+            parts.extend(["*Customer email:*", "_(empty)_", ""])
+        parts.extend(["*--------------------------------*", ""])
+        if agent:
+            parts.extend(["*Agent reply:*", agent])
+        else:
+            parts.extend(["*Agent reply:*", "_(empty)_"])
+        return "\n".join(parts).strip()
+
+    @staticmethod
+    def _build_email_slack_report_content(msg: OutboundMessage) -> str:
+        """Legacy single-message format (header + agent body); used in tests/fallback."""
+        header = ChannelManager._build_email_slack_report_header(msg)
         body = (msg.content or "").strip()
         if body:
-            lines.append(body)
-        elif not lines:
-            return "(empty agent response)"
-        return "\n".join(lines)
+            return f"{header}\n\n{body}"
+        return header
+
+    @staticmethod
+    def _slack_message_ts_from_response(response: Any) -> str | None:
+        getter = getattr(response, "get", None)
+        if not callable(getter):
+            return None
+        ts = getter("ts")
+        if isinstance(ts, str) and ts:
+            return ts
+        message = getter("message")
+        message_get = getattr(message, "get", None)
+        if callable(message_get):
+            inner = message_get("ts")
+            if isinstance(inner, str) and inner:
+                return inner
+        return None
+
+    async def _post_slack_email_report_parent(
+        self,
+        slack_ch: BaseChannel,
+        slack_target: str,
+        header_text: str,
+    ) -> tuple[str | None, bool]:
+        """Post channel heads-up via Slack web client.
+
+        Returns ``(parent_ts, posted)`` where ``posted`` indicates whether the
+        parent message was accepted by Slack regardless of ``ts`` extraction.
+        """
+        web_client = getattr(slack_ch, "_web_client", None)
+        resolve_target = getattr(slack_ch, "_resolve_target_chat_id", None)
+        if web_client is None or resolve_target is None:
+            return None, False
+        to_mrkdwn = getattr(slack_ch, "_to_mrkdwn", None)
+        try:
+            channel_id = await resolve_target(slack_target)
+            text = header_text.strip() or " "
+            if callable(to_mrkdwn):
+                text = to_mrkdwn(text)
+            response = await web_client.chat_postMessage(channel=channel_id, text=text)
+            return self._slack_message_ts_from_response(response), True
+        except Exception:
+            logger.exception(
+                "Failed to post email heads-up parent message to Slack ({})",
+                slack_target,
+            )
+            return None, False
 
     async def _try_send_email_final_via_slack(self, msg: OutboundMessage) -> bool:
         """Reroute eligible email finals to Slack. Returns True if handled (sent or dropped)."""
@@ -373,14 +455,50 @@ class ChannelManager:
             )
             return True
 
-        report = OutboundMessage(
-            channel="slack",
-            chat_id=slack_target,
-            content=self._build_email_slack_report_content(msg),
-            metadata={**(msg.metadata or {}), "_email_report": True},
-            media=list(msg.media or []),
+        base_metadata = {**(msg.metadata or {}), "_email_report": True}
+        header = self._build_email_slack_report_header(msg)
+        thread_body = self._build_email_slack_report_thread_content(msg)
+        parent_ts, parent_posted = await self._post_slack_email_report_parent(
+            slack_ch, slack_target, header
         )
-        await self._send_with_retry(slack_ch, report)
+
+        if parent_ts and thread_body:
+            thread_metadata = {
+                **base_metadata,
+                "_email_report_thread": True,
+                "slack": {"thread_ts": parent_ts},
+            }
+            thread = OutboundMessage(
+                channel="slack",
+                chat_id=slack_target,
+                content=thread_body,
+                metadata=thread_metadata,
+                media=list(msg.media or []),
+            )
+            await self._send_with_retry(slack_ch, thread)
+        elif parent_posted and thread_body:
+            logger.warning(
+                "Email heads-up posted to Slack ({}) but parent ts unavailable; "
+                "sending detail as non-thread reply",
+                slack_target,
+            )
+            detail = OutboundMessage(
+                channel="slack",
+                chat_id=slack_target,
+                content=thread_body,
+                metadata={**base_metadata, "_email_report_thread": True},
+                media=list(msg.media or []),
+            )
+            await self._send_with_retry(slack_ch, detail)
+        else:
+            combined = OutboundMessage(
+                channel="slack",
+                chat_id=slack_target,
+                content=self._build_email_slack_report_content(msg),
+                metadata=dict(base_metadata),
+                media=list(msg.media or []),
+            )
+            await self._send_with_retry(slack_ch, combined)
         return True
 
     async def _dispatch_outbound(self) -> None:

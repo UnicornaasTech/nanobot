@@ -212,6 +212,21 @@ class MessageTool(Tool, ContextAware):
         if not channel or not chat_id:
             return "Error: No target channel/chat specified"
 
+        # Fork: in email sessions, the channel manager posts a deterministic
+        # heads-up (header + threaded customer body + agent reply) to
+        # channels.email.outboundSlackChannel based on the final email reply.
+        # Block message() sends entirely while processing email so we never
+        # produce duplicate heads-up posts. The LLM should put status / error
+        # information in the final reply text instead; it will appear in the
+        # threaded "Agent reply" section automatically.
+        if default_channel == "email":
+            return (
+                "Message suppressed: in email sessions, status and errors are delivered "
+                "via the final email reply (reported to channels.email.outboundSlackChannel "
+                "automatically). Put the information in your final answer instead of "
+                "calling message()."
+            )
+
         if not self._send_callback:
             return "Error: Message sending not configured"
 

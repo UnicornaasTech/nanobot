@@ -1,13 +1,16 @@
 """Tests for ChannelManager delta coalescing to reduce streaming latency."""
 import asyncio
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
-from nanobot.channels.manager import ChannelManager
+from nanobot.channels.manager import (
+    _EMAIL_SLACK_THREAD_CUSTOMER_MAX_CHARS,
+    ChannelManager,
+)
 from nanobot.config.schema import Config
 
 
@@ -35,6 +38,25 @@ class MockChannel(BaseChannel):
     async def send_delta(self, chat_id, delta, metadata=None):
         """Override send_delta for testing."""
         return await self._send_delta_mock(chat_id, delta, metadata)
+
+
+class SlackLikeMockChannel(MockChannel):
+    """Slack channel stub with web client for email heads-up parent posts."""
+
+    name = "slack"
+    display_name = "Slack"
+
+    def __init__(self, config, bus):
+        super().__init__(config, bus)
+        self._web_client = MagicMock()
+        self._web_client.chat_postMessage = AsyncMock(
+            return_value={"ts": "1234567890.000001"},
+        )
+        self._resolve_target_chat_id = AsyncMock(side_effect=lambda target: target)
+
+    @staticmethod
+    def _to_mrkdwn(text: str) -> str:
+        return text
 
 
 @pytest.fixture
@@ -468,7 +490,7 @@ def email_slack_manager(config, bus):
         {"outboundSlackChannel": "#support-ai"},
         bus,
     )
-    mgr.channels["slack"] = MockChannel({}, bus)
+    mgr.channels["slack"] = SlackLikeMockChannel({}, bus)
     return mgr
 
 
@@ -504,7 +526,7 @@ class TestEmailFinalOutboundSlackReroute:
         assert ChannelManager._format_email_received_at("") == "unknown"
         assert ChannelManager._format_email_received_at("not-a-date") == "not-a-date"
 
-    def test_build_report_includes_context(self):
+    def test_build_report_header_and_thread_content(self):
         msg = OutboundMessage(
             channel="email",
             chat_id="user@example.com",
@@ -514,15 +536,49 @@ class TestEmailFinalOutboundSlackReroute:
                 "subject": "Help needed",
                 "message_id": "<abc@mail>",
                 "date": "Sat, 23 May 2026 10:15:00 +0300",
+                "email_body": "Customer question body.",
+            },
+        )
+        header = ChannelManager._build_email_slack_report_header(msg)
+        thread = ChannelManager._build_email_slack_report_thread_content(msg)
+        assert header.startswith("EMAIL DRAFT: From: user@example.com")
+        assert "Subject: Help needed" in header
+        assert "Received at" in header
+        assert "2026-05-23" in header
+        assert "Customer email and agent reply in thread" in header
+        assert "Agent answer here." not in header
+        assert "*Customer email:*" in thread
+        assert "Customer question body." in thread
+        assert "*Agent reply:*" in thread
+        assert "Agent answer here." in thread
+        assert "<abc@mail>" not in header
+
+    def test_build_report_thread_truncates_customer_body(self):
+        long_body = "x" * (_EMAIL_SLACK_THREAD_CUSTOMER_MAX_CHARS + 500)
+        msg = OutboundMessage(
+            channel="email",
+            chat_id="user@example.com",
+            content="Short reply.",
+            metadata={"email_body": long_body},
+        )
+        thread = ChannelManager._build_email_slack_report_thread_content(msg)
+        assert "…(truncated)" in thread
+        assert len(thread) < len(long_body)
+
+    def test_build_report_combined_fallback_includes_agent_body(self):
+        msg = OutboundMessage(
+            channel="email",
+            chat_id="user@example.com",
+            content="Agent answer here.",
+            metadata={
+                "sender_email": "user@example.com",
+                "subject": "Help needed",
+                "date": "Sat, 23 May 2026 10:15:00 +0300",
             },
         )
         text = ChannelManager._build_email_slack_report_content(msg)
-        assert text.startswith("EMAIL DRAFT: From: user@example.com")
-        assert "Subject: Help needed" in text
-        assert "Received at" in text
-        assert "2026-05-23" in text
-        assert "<abc@mail>" not in text
         assert "Agent answer here." in text
+        assert "Subject: Help needed" in text
 
     @pytest.mark.asyncio
     async def test_final_rerouted_to_slack(self, email_slack_manager, bus):
@@ -530,14 +586,18 @@ class TestEmailFinalOutboundSlackReroute:
             channel="email",
             chat_id="user@example.com",
             content="Draft ready for review.",
-            metadata={"sender_email": "user@example.com", "subject": "Question"},
+            metadata={
+                "sender_email": "user@example.com",
+                "subject": "Question",
+                "email_body": "Please help with my order.",
+            },
         ))
 
         task = asyncio.create_task(email_slack_manager._dispatch_outbound())
         try:
             for _ in range(40):
-                slack = email_slack_manager.channels["slack"]._send_mock
-                if slack.await_count >= 1:
+                slack = email_slack_manager.channels["slack"]
+                if slack._send_mock.await_count >= 1:
                     break
                 await asyncio.sleep(0.05)
         finally:
@@ -548,14 +608,54 @@ class TestEmailFinalOutboundSlackReroute:
                 pass
 
         email_slack_manager.channels["email"]._send_mock.assert_not_awaited()
-        slack_send = email_slack_manager.channels["slack"]._send_mock
-        assert slack_send.await_count == 1
-        sent = slack_send.await_args_list[0].args[0]
+        slack_ch = email_slack_manager.channels["slack"]
+        slack_ch._web_client.chat_postMessage.assert_awaited_once()
+        parent_kwargs = slack_ch._web_client.chat_postMessage.await_args.kwargs
+        assert "EMAIL DRAFT" in parent_kwargs["text"]
+        assert "Question" in parent_kwargs["text"]
+        assert "Draft ready for review." not in parent_kwargs["text"]
+
+        assert slack_ch._send_mock.await_count == 1
+        sent = slack_ch._send_mock.await_args_list[0].args[0]
         assert sent.channel == "slack"
         assert sent.chat_id == "#support-ai"
         assert sent.metadata.get("_email_report") is True
+        assert sent.metadata.get("_email_report_thread") is True
+        assert sent.metadata["slack"]["thread_ts"] == "1234567890.000001"
+        assert "Draft ready for review." in sent.content
+        assert "Please help with my order." in sent.content
+        assert "Question" not in sent.content
+
+    @pytest.mark.asyncio
+    async def test_final_reroute_falls_back_when_parent_post_fails(self, email_slack_manager, bus):
+        slack_ch = email_slack_manager.channels["slack"]
+        slack_ch._web_client.chat_postMessage = AsyncMock(side_effect=RuntimeError("slack down"))
+
+        await bus.publish_outbound(OutboundMessage(
+            channel="email",
+            chat_id="user@example.com",
+            content="Draft ready for review.",
+            metadata={"sender_email": "user@example.com", "subject": "Question"},
+        ))
+
+        task = asyncio.create_task(email_slack_manager._dispatch_outbound())
+        try:
+            for _ in range(40):
+                if slack_ch._send_mock.await_count >= 1:
+                    break
+                await asyncio.sleep(0.05)
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        assert slack_ch._send_mock.await_count == 1
+        sent = slack_ch._send_mock.await_args_list[0].args[0]
         assert "Draft ready for review." in sent.content
         assert "Question" in sent.content
+        assert sent.metadata.get("_email_report_thread") is not True
 
     @pytest.mark.asyncio
     async def test_progress_not_rerouted(self, email_slack_manager, bus):

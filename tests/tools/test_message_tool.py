@@ -120,6 +120,48 @@ async def test_message_tool_clears_metadata_when_context_has_none() -> None:
 
 
 @pytest.mark.asyncio
+async def test_message_tool_blocks_all_sends_in_email_session() -> None:
+    """Fork: in email sessions message() is suppressed; deterministic heads-up handles delivery."""
+    sent: list[OutboundMessage] = []
+
+    async def _send(msg: OutboundMessage) -> None:
+        sent.append(msg)
+
+    tool = MessageTool(send_callback=_send)
+    from nanobot.agent.tools.context import RequestContext
+
+    tool.set_context(RequestContext(channel="email", chat_id="user@example.com"))
+
+    same_target_result = await tool.execute(content="Heads-up to user")
+    cross_target_result = await tool.execute(
+        content="Notify ops",
+        channel="slack",
+        chat_id="#support-ai",
+    )
+
+    assert same_target_result.startswith("Message suppressed")
+    assert cross_target_result.startswith("Message suppressed")
+    assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_message_tool_non_email_session_still_sends() -> None:
+    sent: list[OutboundMessage] = []
+
+    async def _send(msg: OutboundMessage) -> None:
+        sent.append(msg)
+
+    tool = MessageTool(send_callback=_send)
+    from nanobot.agent.tools.context import RequestContext
+
+    tool.set_context(RequestContext(channel="slack", chat_id="C123"))
+
+    result = await tool.execute(content="hello", channel="slack", chat_id="C456")
+    assert result.startswith("Message sent to slack:C456")
+    assert len(sent) == 1
+
+
+@pytest.mark.asyncio
 async def test_message_tool_does_not_inherit_metadata_for_cross_target() -> None:
     sent: list[OutboundMessage] = []
 
