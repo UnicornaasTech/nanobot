@@ -915,7 +915,7 @@ Each fallback candidate can be either:
 
 String entries are preset names, not raw model names. If you want to use a model that is not already a preset, use the inline object form.
 
-Failover only runs when the primary provider returns a retryable model/provider error before any answer text has been streamed. Typical fallback cases include timeouts, connection errors, 5xx server errors, 429 rate limits, overloads, and quota/balance exhaustion. It does not run for malformed requests, authentication/permission errors, content filtering/refusals, or context-length/message-format errors.
+Failover runs when the primary provider returns a retryable model/provider error before any answer text has been streamed, and also when the primary returns a blank successful final reply after two silent retries on the same model (before the no-tools finalization step). Typical error fallback cases include timeouts, connection errors, 5xx server errors, 429 rate limits, overloads, and quota/balance exhaustion. It does not run for malformed requests, authentication/permission errors, content filtering/refusals, or context-length/message-format errors, and empty-response fallback is skipped when user-visible content was already streamed.
 
 If fallback candidates use smaller `contextWindowTokens` values, nanobot builds context using the smallest window in the active chain so every candidate can receive the same prompt.
 

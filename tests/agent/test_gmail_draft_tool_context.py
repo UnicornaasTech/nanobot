@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from unittest.mock import MagicMock
 
 import pytest
@@ -56,9 +55,10 @@ async def test_tool_passes_in_reply_to_from_email_context(monkeypatch: pytest.Mo
     )
 
     out = await tool.execute(to="cust@example.com", subject="Help", body="Sure.")
-    result = json.loads(out)
 
-    assert result["reply_in_thread"] is True
+    assert "draft_id" not in out.lower()
+    assert "Open in Gmail:" in out
+    assert "original email thread" in out
     assert captured["in_reply_to"] == "<orig@example.com>"
     assert captured["original_body"] == "Please assist."
     assert captured["original_from"] == "cust@example.com"

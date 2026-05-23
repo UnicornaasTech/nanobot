@@ -6,7 +6,7 @@ import asyncio
 import inspect
 import os
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -15,13 +15,16 @@ from loguru import logger
 from nanobot.agent.hook import AgentHook, AgentHookContext
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from nanobot.providers.fallback_provider import FallbackProvider
 from nanobot.utils.file_edit_events import (
+    StreamingFileEditTracker,
     build_file_edit_end_event,
     build_file_edit_error_event,
     build_file_edit_start_event,
-    prepare_file_edit_tracker as _prepare_file_edit_tracker,
     prepare_file_edit_trackers,
-    StreamingFileEditTracker,
+)
+from nanobot.utils.file_edit_events import (
+    prepare_file_edit_tracker as _prepare_file_edit_tracker,
 )
 from nanobot.utils.helpers import (
     IncrementalThinkExtractor,
@@ -422,22 +425,55 @@ class AgentRunner:
                         await hook.on_stream_end(context, resuming=False)
                     await hook.after_iteration(context)
                     continue
-                logger.warning(
-                    "Empty response on turn {} for {} after {} retries; attempting finalization",
-                    iteration,
-                    spec.session_key or "default",
-                    empty_content_retries,
+
+                fb_response = await self._try_empty_response_fallback(
+                    spec, messages_for_model, hook, context
                 )
-                if hook.wants_streaming():
-                    await hook.on_stream_end(context, resuming=False)
-                response = await self._request_finalization_retry(spec, messages_for_model)
-                retry_usage = self._usage_dict(response.usage)
-                self._accumulate_usage(usage, retry_usage)
-                raw_usage = self._merge_usage(raw_usage, retry_usage)
-                context.response = response
-                context.usage = dict(raw_usage)
-                context.tool_calls = list(response.tool_calls)
-                clean = hook.finalize_content(context, response.content)
+                if fb_response is not None:
+                    response = fb_response
+                    retry_usage = self._usage_dict(response.usage)
+                    self._accumulate_usage(usage, retry_usage)
+                    raw_usage = self._merge_usage(raw_usage, retry_usage)
+                    context.response = response
+                    context.usage = dict(raw_usage)
+                    context.tool_calls = list(response.tool_calls)
+                    clean = hook.finalize_content(context, response.content)
+                    empty_content_retries = 0
+                elif is_blank_text(clean):
+                    logger.warning(
+                        "Empty response on turn {} for {} after {} retries; attempting finalization",
+                        iteration,
+                        spec.session_key or "default",
+                        empty_content_retries,
+                    )
+                    if hook.wants_streaming():
+                        await hook.on_stream_end(context, resuming=False)
+                    response = await self._request_finalization_retry(spec, messages_for_model)
+                    retry_usage = self._usage_dict(response.usage)
+                    self._accumulate_usage(usage, retry_usage)
+                    raw_usage = self._merge_usage(raw_usage, retry_usage)
+                    context.response = response
+                    context.usage = dict(raw_usage)
+                    context.tool_calls = list(response.tool_calls)
+                    clean = hook.finalize_content(context, response.content)
+
+                    if is_blank_text(clean):
+                        logger.warning(
+                            "Empty finalization for {}; trying fallback",
+                            spec.session_key or "default",
+                        )
+                        fb_after = await self._try_empty_response_fallback(
+                            spec, messages_for_model, hook, context
+                        )
+                        if fb_after is not None:
+                            response = fb_after
+                            retry_usage = self._usage_dict(fb_after.usage)
+                            self._accumulate_usage(usage, retry_usage)
+                            raw_usage = self._merge_usage(raw_usage, retry_usage)
+                            context.response = response
+                            context.usage = dict(raw_usage)
+                            context.tool_calls = list(response.tool_calls)
+                            clean = hook.finalize_content(context, response.content)
 
             if response.finish_reason == "length" and not is_blank_text(clean):
                 length_recovery_count += 1
@@ -606,7 +642,10 @@ class AgentRunner:
         messages: list[dict[str, Any]],
         hook: AgentHook,
         context: AgentHookContext,
+        *,
+        provider: LLMProvider | None = None,
     ):
+        active_provider = provider or self.provider
         timeout_s: float | None = spec.llm_timeout_s
         if timeout_s is None:
             # Default to a finite timeout to avoid per-session lock starvation when an LLM
@@ -630,7 +669,7 @@ class AgentRunner:
             not wants_streaming
             and spec.stream_progress_deltas
             and spec.progress_callback is not None
-            and getattr(self.provider, "supports_progress_deltas", False) is True
+            and getattr(active_provider, "supports_progress_deltas", False) is True
         )
 
         progress_state: dict[str, bool] | None = None
@@ -665,7 +704,7 @@ class AgentRunner:
                 context.streamed_reasoning = True
                 await hook.emit_reasoning(delta)
 
-            coro = self.provider.chat_stream_with_retry(
+            coro = active_provider.chat_stream_with_retry(
                 **kwargs,
                 on_content_delta=_stream,
                 on_thinking_delta=_thinking,
@@ -696,13 +735,13 @@ class AgentRunner:
                     context.streamed_content = True
                     await spec.progress_callback(incremental)
 
-            coro = self.provider.chat_stream_with_retry(
+            coro = active_provider.chat_stream_with_retry(
                 **kwargs,
                 on_content_delta=_stream_progress,
                 on_tool_call_delta=_tool_call_delta if live_file_edits is not None else None,
             )
         else:
-            coro = self.provider.chat_with_retry(**kwargs)
+            coro = active_provider.chat_with_retry(**kwargs)
 
         # Streaming requests already have provider-level idle timeouts
         # (NANOBOT_STREAM_IDLE_TIMEOUT_S). Do not also apply the outer wall-clock
@@ -737,6 +776,56 @@ class AgentRunner:
         if progress_state and progress_state.get("reasoning_open"):
             await hook.emit_reasoning_end()
         return response
+
+    async def _request_model_with_provider(
+        self,
+        provider: LLMProvider,
+        spec: AgentRunSpec,
+        messages: list[dict[str, Any]],
+        hook: AgentHook,
+        context: AgentHookContext,
+    ):
+        return await self._request_model(
+            spec, messages, hook, context, provider=provider
+        )
+
+    async def _try_empty_response_fallback(
+        self,
+        spec: AgentRunSpec,
+        messages: list[dict[str, Any]],
+        hook: AgentHook,
+        context: AgentHookContext,
+    ) -> LLMResponse | None:
+        if not isinstance(self.provider, FallbackProvider):
+            return None
+        if not self.provider.has_fallbacks:
+            return None
+        if context.streamed_content:
+            return None
+
+        async def request_fn(
+            underlying_provider: LLMProvider,
+            preset: Any,
+        ) -> LLMResponse:
+            fb_spec = replace(
+                spec,
+                model=preset.model,
+                max_tokens=preset.max_tokens,
+                temperature=preset.temperature,
+                reasoning_effort=preset.reasoning_effort,
+            )
+            return await self._request_model_with_provider(
+                underlying_provider,
+                fb_spec,
+                messages,
+                hook,
+                context,
+            )
+
+        return await self.provider.try_on_empty_response(
+            request_fn,
+            skip_if_streamed=context.streamed_content,
+        )
 
     async def _request_finalization_retry(
         self,

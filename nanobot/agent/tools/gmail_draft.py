@@ -11,7 +11,6 @@ Threading: https://developers.google.com/workspace/gmail/api/guides/threads
 from __future__ import annotations
 
 import base64
-import json
 import re
 from dataclasses import dataclass
 from email.mime.text import MIMEText
@@ -354,6 +353,15 @@ def create_gmail_draft(
     }
 
 
+def _format_gmail_draft_tool_result(result: dict[str, Any]) -> str:
+    """Agent-facing success text (no internal draft_id — avoids noisy Slack reports)."""
+    lines = ["Gmail draft created for human review (not sent)."]
+    url = str(result.get("gmail_url") or "").strip()
+    if url:
+        lines.append(f"Open in Gmail: {url}")
+    return "\n".join(lines)
+
+
 @tool_parameters(
     tool_parameters_schema(
         to=StringSchema("Recipient email address"),
@@ -381,6 +389,10 @@ class CreateGmailDraftTool(Tool, ContextAware):
         "Creates a Gmail draft for human review. NEVER sends the email. "
         "On email sessions, reply threading and quoted originals are applied automatically "
         "from inbound metadata — put only your reply text in body. "
+        "On email sessions, your final reply is posted to channels.email.outboundSlackChannel "
+        "automatically (EMAIL DRAFT header). After success, put only a brief 1-2 sentence summary "
+        "in that final reply (no separate Slack heads-up; use message to Slack only for errors). "
+        "Do not repeat draft IDs or raw API fields. Only separately post to channels.email.outboundSlackChannel if you encounter an error and cannot create the draft."
         "Always use this instead of any send operation. "
         "Requires tools.gmailDraft OAuth settings in config and optional dependency group [gmail]."
     )
@@ -465,4 +477,4 @@ class CreateGmailDraftTool(Tool, ContextAware):
             return f"Error: {e}"
         except Exception as e:
             return f"Error creating Gmail draft: {e}"
-        return json.dumps(result, indent=2)
+        return _format_gmail_draft_tool_result(result)

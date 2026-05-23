@@ -17,6 +17,9 @@ This conversation is on a text messaging platform that does not render markdown.
 {% elif channel == 'email' %}
 ## Format Hint
 This conversation is via email. Structure with clear sections. Markdown may not render — keep formatting simple.
+
+## Slack reporting
+When `channels.email.outboundSlackChannel` is configured, your **final reply** is posted there with an `EMAIL DRAFT:` header. Put routine success summaries in that final reply only — do not post a separate Slack "Heads-up" via the `message` tool. Use `message` to Slack only when you must alert humans about a failure, blocked draft, or other processing error.
 {% elif channel == 'cli' or channel == 'mochat' %}
 ## Format Hint
 Output is rendered in a terminal. Avoid markdown headings and tables. Use plain text with minimal formatting.

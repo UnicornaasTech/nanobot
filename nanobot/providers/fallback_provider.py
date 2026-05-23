@@ -9,6 +9,7 @@ from typing import Any
 from loguru import logger
 
 from nanobot.providers.base import LLMProvider, LLMResponse
+from nanobot.utils.runtime import is_blank_text
 
 # Circuit breaker tuned to match OpenAICompatProvider's Responses API breaker.
 _PRIMARY_FAILURE_THRESHOLD = 3
@@ -98,6 +99,10 @@ class FallbackProvider(LLMProvider):
     @property
     def supports_progress_deltas(self) -> bool:
         return bool(getattr(self._primary, "supports_progress_deltas", False))
+
+    @property
+    def has_fallbacks(self) -> bool:
+        return self._has_fallbacks
 
     def _primary_available(self) -> bool:
         """Return True if the primary provider is not currently tripped."""
@@ -201,25 +206,9 @@ class FallbackProvider(LLMProvider):
                 )
                 continue
 
-            original_values = {
-                name: kwargs.get(name, _MISSING)
-                for name in ("model", "max_tokens", "temperature", "reasoning_effort")
-            }
-            kwargs["model"] = fallback_model
-            kwargs["max_tokens"] = fallback.max_tokens
-            kwargs["temperature"] = fallback.temperature
-            if fallback.reasoning_effort is None:
-                kwargs.pop("reasoning_effort", None)
-            else:
-                kwargs["reasoning_effort"] = fallback.reasoning_effort
-            try:
-                fallback_response = await call(fallback_provider, kwargs)
-            finally:
-                for name, value in original_values.items():
-                    if value is _MISSING:
-                        kwargs.pop(name, None)
-                    else:
-                        kwargs[name] = value
+            fallback_response = await self._call_with_fallback_preset(
+                call, fallback_provider, fallback, kwargs
+            )
 
             if fallback_response.finish_reason != "error":
                 logger.info(
@@ -247,6 +236,102 @@ class FallbackProvider(LLMProvider):
             content=f"Primary model '{primary_model}' circuit open and no fallbacks available",
             finish_reason="error",
         )
+
+    async def try_on_empty_response(
+        self,
+        request_fn: Callable[[LLMProvider, Any], Awaitable[LLMResponse]],
+        *,
+        skip_if_streamed: bool = False,
+    ) -> LLMResponse | None:
+        """Try fallback models when the primary returned a blank successful reply."""
+        if skip_if_streamed or not self._has_fallbacks:
+            return None
+
+        for idx, fallback in enumerate(self._fallback_presets):
+            fallback_model = fallback.model
+            if idx == 0:
+                logger.info(
+                    "Primary model returned empty response, trying fallback '{}'",
+                    fallback_model,
+                )
+            else:
+                logger.info(
+                    "Fallback '{}' also returned empty, trying next fallback '{}'",
+                    self._fallback_presets[idx - 1].model,
+                    fallback_model,
+                )
+            try:
+                fallback_provider = self._provider_factory(fallback)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to create provider for fallback '{}': {}",
+                    fallback_model,
+                    exc,
+                )
+                continue
+
+            try:
+                fallback_response = await request_fn(fallback_provider, fallback)
+            except Exception as exc:
+                logger.warning(
+                    "Fallback '{}' request failed after empty primary response: {}",
+                    fallback_model,
+                    exc,
+                )
+                continue
+
+            if fallback_response.finish_reason == "error":
+                logger.warning(
+                    "Fallback '{}' returned error after empty primary response: {}",
+                    fallback_model,
+                    (fallback_response.content or "")[:120],
+                )
+                continue
+
+            if not is_blank_text(fallback_response.content):
+                logger.info(
+                    "Fallback '{}' succeeded after primary empty response",
+                    fallback_model,
+                )
+                return fallback_response
+
+            logger.warning(
+                "Fallback '{}' returned empty response after primary empty response",
+                fallback_model,
+            )
+
+        logger.warning(
+            "All {} fallback model(s) returned empty after primary empty response",
+            len(self._fallback_presets),
+        )
+        return None
+
+    @staticmethod
+    async def _call_with_fallback_preset(
+        call: Callable[[LLMProvider, dict[str, Any]], Awaitable[LLMResponse]],
+        fallback_provider: LLMProvider,
+        fallback: Any,
+        kwargs: dict[str, Any],
+    ) -> LLMResponse:
+        original_values = {
+            name: kwargs.get(name, _MISSING)
+            for name in ("model", "max_tokens", "temperature", "reasoning_effort")
+        }
+        kwargs["model"] = fallback.model
+        kwargs["max_tokens"] = fallback.max_tokens
+        kwargs["temperature"] = fallback.temperature
+        if fallback.reasoning_effort is None:
+            kwargs.pop("reasoning_effort", None)
+        else:
+            kwargs["reasoning_effort"] = fallback.reasoning_effort
+        try:
+            return await call(fallback_provider, kwargs)
+        finally:
+            for name, value in original_values.items():
+                if value is _MISSING:
+                    kwargs.pop(name, None)
+                else:
+                    kwargs[name] = value
 
     @staticmethod
     def _should_fallback(response: LLMResponse) -> bool:

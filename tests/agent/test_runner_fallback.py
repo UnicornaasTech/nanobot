@@ -611,3 +611,69 @@ class TestGenerationForwarded:
         )
         assert fb.generation.temperature == 0.5
         assert fb.generation.max_tokens == 1024
+
+
+class TestHasFallbacks:
+    def test_true_when_presets_configured(self) -> None:
+        fb = FallbackProvider(
+            primary=_FakeProvider("primary"),
+            fallback_presets=[_fallback("a")],
+            provider_factory=MagicMock(),
+        )
+        assert fb.has_fallbacks is True
+
+    def test_false_when_empty(self) -> None:
+        fb = FallbackProvider(
+            primary=_FakeProvider("primary"),
+            fallback_presets=[],
+            provider_factory=MagicMock(),
+        )
+        assert fb.has_fallbacks is False
+
+
+class TestTryOnEmptyResponse:
+    @pytest.mark.asyncio
+    async def test_first_fallback_blank_second_succeeds(self) -> None:
+        fallback_a = _FakeProvider("a", _make_response(content=""))
+        fallback_b = _FakeProvider("b", _make_response("fallback ok"))
+        factory = MagicMock(side_effect=[fallback_a, fallback_b])
+
+        fb = FallbackProvider(
+            primary=_FakeProvider("primary"),
+            fallback_presets=[_fallback("fallback-a"), _fallback("fallback-b")],
+            provider_factory=factory,
+        )
+
+        async def request_fn(provider: LLMProvider, preset) -> LLMResponse:
+            return await provider.chat(model=preset.model)
+
+        result = await fb.try_on_empty_response(request_fn)
+        assert result is not None
+        assert result.content == "fallback ok"
+        assert factory.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_skip_if_streamed(self) -> None:
+        fb = FallbackProvider(
+            primary=_FakeProvider("primary"),
+            fallback_presets=[_fallback("fallback-a")],
+            provider_factory=MagicMock(),
+        )
+
+        async def request_fn(provider: LLMProvider, preset) -> LLMResponse:
+            return await provider.chat(model=preset.model)
+
+        assert await fb.try_on_empty_response(request_fn, skip_if_streamed=True) is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_no_fallbacks(self) -> None:
+        fb = FallbackProvider(
+            primary=_FakeProvider("primary"),
+            fallback_presets=[],
+            provider_factory=MagicMock(),
+        )
+
+        async def request_fn(provider: LLMProvider, preset) -> LLMResponse:
+            return await provider.chat(model=preset.model)
+
+        assert await fb.try_on_empty_response(request_fn) is None

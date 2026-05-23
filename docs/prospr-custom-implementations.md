@@ -58,12 +58,12 @@ With `"groupPolicy": "open"`, every channel message gets a full agent turn (upst
 
 When `agents.defaults.eagerKnowledge.enabled` is **true**, session traffic is promoted into `memory/history.jsonl` soon after persist — without waiting for token-overflow consolidation. Works with **`unifiedSession: false`** so each Slack channel/DM/thread keeps its own session file while **Recent History** and Dream still see channel ambient traffic.
 
-| Piece                                                            | Behavior                                                                                                                                                                                                                                                                                                             |
-| ---------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **`EagerKnowledgeManager`** (`nanobot/agent/eager_knowledge.py`) | Cursored flush (`_prospr_eager_cursor`). Batch ≥ `minBatch` → `Consolidator.archive()`. Smaller batches flush after `singletonIdleS` via raw `[EAGER singleton …]` append (no LLM). Token overflow / file-cap consolidation skip indices already covered by the eager cursor (no duplicate `history.jsonl` entries). |
+| Piece                                                            | Behavior                                                                                                                                                                                                                                                                                                                                                       |
+| ---------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`EagerKnowledgeManager`** (`nanobot/agent/eager_knowledge.py`) | Cursored flush (`_prospr_eager_cursor`). Batch ≥ `minBatch` → `Consolidator.archive()`. Smaller batches flush after `singletonIdleS` via raw `[EAGER singleton …]` append (no LLM). Token overflow / file-cap consolidation skip indices already covered by the eager cursor (no duplicate `history.jsonl` entries).                                           |
 | **`Consolidator.archive()`** (shared)                            | Skips empty payloads and no-op LLM outputs (`(nothing)`, `[no summary]`). Inlines session `media` (images to vision blocks, documents via text extraction) with per-file and prompt budget caps. System prompt includes labeled **REFERENCE ONLY** bootstrap (`AGENTS.md`, `SOUL.md`, `USER.md`, `TOOLS.md`) so summaries do not repeat standing instructions. |
-| **Triggers**                                                     | After `no_reply` persist and after normal turn `_state_save`; idle tick in `AgentLoop.run()` for cold singletons.                                                                                                                                                                                                    |
-| **Slack provenance**                                             | `slack_ts`, `slack_thread_ts`, `slack_root_ts`, `slack_reply_kind` on stored user rows; archived lines prefixed e.g. `[slack C123 reply root=…]`.                                                                                                                                                                    |
+| **Triggers**                                                     | After `no_reply` persist and after normal turn `_state_save`; idle tick in `AgentLoop.run()` for cold singletons.                                                                                                                                                                                                                                              |
+| **Slack provenance**                                             | `slack_ts`, `slack_thread_ts`, `slack_root_ts`, `slack_reply_kind` on stored user rows; archived lines prefixed e.g. `[slack C123 reply root=…]`.                                                                                                                                                                                                              |
 
 **Config** (`agents.defaults.eagerKnowledge`):
 
@@ -100,17 +100,17 @@ Customer-support deployments can store **generalized phenomena only** (playbooks
 
 When `agents.defaults.genericMemoryOnly` is **true**, Consolidator and Dream use alternate bundled templates (`*_generic.md`) instead of the upstream `consolidator_archive.md` / `dream_phase1.md` / `dream_phase2.md`. Template selection: [`nanobot/agent/memory_prompts.py`](nanobot/agent/memory_prompts.py).
 
-| Piece | Behavior |
-| ----- | -------- |
-| **`Consolidator.archive()`** | Summarizes only cross-case patterns; forbids customer PII in `history.jsonl` bullets. |
-| **Archive LLM failure** | Appends a short withheld marker — **no** `[RAW]` transcript dump. |
-| **`Dream`** | Phase 1/2 use generic prompts: `USER.md` = operator/team only; `MEMORY.md` = generalized playbooks. |
-| **Mutual exclusion** | Config load **fails** if `genericMemoryOnly` and `eagerKnowledge.enabled` are both true (eager singleton raw flushes would bypass de-identification). |
+| Piece                        | Behavior                                                                                                                                              |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`Consolidator.archive()`** | Summarizes only cross-case patterns; forbids customer PII in `history.jsonl` bullets.                                                                 |
+| **Archive LLM failure**      | Appends a short withheld marker — **no** `[RAW]` transcript dump.                                                                                     |
+| **`Dream`**                  | Phase 1/2 use generic prompts: `USER.md` = operator/team only; `MEMORY.md` = generalized playbooks.                                                   |
+| **Mutual exclusion**         | Config load **fails** if `genericMemoryOnly` and `eagerKnowledge.enabled` are both true (eager singleton raw flushes would bypass de-identification). |
 
 **Config** (`agents.defaults.genericMemoryOnly`):
 
-| Key | Type | Default | Meaning |
-| --- | ---- | ------- | ------- |
+| Key                 | Type | Default | Meaning                                                              |
+| ------------------- | ---- | ------- | -------------------------------------------------------------------- |
 | `genericMemoryOnly` | bool | `false` | Use de-identified memory-gathering prompts for Consolidator + Dream. |
 
 **Config example** (customer support; eager knowledge off):
@@ -135,6 +135,7 @@ See also upstream memory overview: [`docs/memory.md`](memory.md).
 - **Dream** (`memory.py`, `dream_phase*.md`, optional `*_generic.md`): Defer batches stuck on repeated stale `edit_file`; prompts nudge read-after-edit and fewer auto-skills.
 - **`edit_file`** (`filesystem.py`): Stale-read warning included in `old_text` not-found errors when applicable.
 - **Provider retry** (`base.py`): Also retry on truncated/non-JSON bodies (`expecting value`, `jsondecodeerror`).
+- **Empty-response fallback** (`fallback_provider.py`, `runner.py`): When the primary model returns a blank successful reply (after the usual two silent retries on the same model), configured `agents.defaults.fallbackModels` are tried once each before the no-tools finalization prompt — same presets as error failover, skipped when answer text was already streamed. If finalization is still blank, fallbacks are tried once more.
 
 ### Unified session: delivery-target guard (`unified_delivery.py`)
 
@@ -166,15 +167,15 @@ Install from repo root: `pip install -e '.[gmail,instagram]'`
 
 - **Inbound:** IMAP (`imapHost`, etc.). Optional **IMAP IDLE** when `imapIdleEnabled` is true (default); otherwise timer polling at `pollIntervalSeconds` (clamped **5–60** seconds).
 - **Outbound disabled:** `send()` and `send_message()` always raise `NotImplementedError` directing the agent to `create_gmail_draft`. No SMTP `sendmail()` path runs even if SMTP fields are set.
-- **Final reply reporting:** When `outboundSlackChannel` is set and `channels.slack` is enabled, the channel manager posts the agent’s **final** turn text to that Slack target (with From/Subject/Message-ID context). Progress/stream/retry traffic is not rerouted. If `outboundSlackChannel` is missing, the final outbound is dropped with a warning (no email send attempt). Set `sendProgress: false` on email to suppress mid-turn outbound attempts entirely.
+- **Final reply reporting:** When `outboundSlackChannel` is set and `channels.slack` is enabled, the channel manager posts the agent’s **final** turn text to that Slack target (header: `EMAIL DRAFT: From: … · Subject: … · Received at …`; no Message-ID). Progress/stream/retry traffic is not rerouted. If `outboundSlackChannel` is missing, the final outbound is dropped with a warning (no email send attempt). Set `sendProgress: false` on email to suppress mid-turn outbound attempts entirely.
 - **`autoReplyEnabled`:** Present on `EmailConfig` (default `true`) but **not consulted** for delivery; outbound is blocked unconditionally in code.
 
 **Gmail IMAP credentials (`imapPassword`)** — separate from `tools.gmailDraft` OAuth:
 
-| Use for `imapPassword` | Do **not** use |
-| ---------------------- | -------------- |
-| Google **App Password** (16 letters) for the mailbox in `imapUsername` | Normal Google sign-in password |
-| | `tools.gmailDraft` refresh token or OAuth client secret |
+| Use for `imapPassword`                                                 | Do **not** use                                          |
+| ---------------------------------------------------------------------- | ------------------------------------------------------- |
+| Google **App Password** (16 letters) for the mailbox in `imapUsername` | Normal Google sign-in password                          |
+|                                                                        | `tools.gmailDraft` refresh token or OAuth client secret |
 
 1. **2-Step Verification** must be **On** for the mailbox ([Google Account → Security](https://myaccount.google.com/security)). On **Google Workspace**, an admin may need to allow 2SV and app passwords for the user/OU.
 2. **Create an app password:** [App passwords](https://myaccount.google.com/apppasswords) → app **Mail** (or custom name e.g. `nanobot-imap`) → copy the **16-character** password (shown as four groups of four; spaces are optional, hyphens are not part of the secret).
@@ -222,6 +223,7 @@ Full mailbox + OAuth draft setup: [`docs/prospr-customersupport-additions.md`](p
 - **Config-only OAuth** under `tools.gmailDraft` (`clientId`, `clientSecret`, `refreshToken`). Values may use `${ENV_VAR}` interpolation. Access tokens are cached **in memory only** — no `gmail_token.json` or credential files on disk.
 - Calls Gmail API `users.drafts.create` only — never `users.messages.send`.
 - **Reply drafts:** on email sessions, `create_gmail_draft` auto-fills `in_reply_to` from inbound `message_id` (no LLM arg). The tool looks up the Gmail thread, sets `In-Reply-To` / `References`, matches subject (`Re:`), quotes the original below your reply body, and sets `threadId` so the draft appears on the conversation (not only in Drafts). Lookup/fallback failures are logged as warnings.
+- **Tool result to agent:** short success text with Gmail URL only.
 - Registered via tool auto-discovery (`nanobot/agent/tools/loader.py`). Enabled when `[gmail]` packages are importable **and** `tools.gmailDraft` is fully configured.
 
 **Config example** (install `pip install -e '.[gmail]'`, enable email channel for inbound):
@@ -244,19 +246,19 @@ Obtain the refresh token once via `python3 scripts/gmail_draft_oauth_setup.py` (
 
 New channel: Instagram DMs → agent → Slack review → human Send / Edit & Send / Discard → Meta send API.
 
-| Area                       | Behavior                                                                                                                                                                                                                                                                    |
-| -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Agent send**             | `send()` / `send_message()` raise `NotImplementedError`. Agent must use `create_instagram_draft`.                                                                                                                                                                           |
-| **Turn completion**        | On agent turn end, `send()` posts a Slack review card (never calls Instagram).                                                                                                                                                                                              |
-| **Draft tool**             | `create_instagram_draft` stores text in `instagram_review_state`; channel `consume_draft()` on turn end.                                                                                                                                                                    |
-| **No reply suggested**     | If the agent does **not** call `create_instagram_draft`, a Slack card is still posted (“no reply suggested”); **Send** is hidden; **Edit & Send** remains so humans can reply manually.                                                                                     |
-| **Slack approvals**        | Socket Mode (`slackAppToken` + `slackBotToken`). Interactive payloads ACK’d on the socket; send/discard run in background threads.                                                                                                                                          |
-| **Meta inbound — webhook** | When `useWebhook` is true: Flask on `webhookHost`:`webhookPort`. Per account: `GET`/`POST` `/webhook/instagram/{accountKey}` with per-account `verifyToken` / `appSecret` HMAC (`X-Hub-Signature-256`). |
-| **Meta inbound — poll**    | When `useWebhook` is false **or** `pollFallbackEnabled` is true: Graph `GET /v19.0/{pageId}/conversations?platform=INSTAGRAM` on each account on `pollIntervalSeconds` (clamped 5–60). Requires `pageId` + `pageAccessToken` per account.                                   |
-| **Meta outbound**          | `_send_instagram_message()` → `POST /v19.0/me/messages` with that account’s `pageAccessToken`. Only from Slack button/modal handlers.                                                                                                                                       |
-| **Multi-account**          | `accounts[]` with distinct Meta apps recommended. `chatId` = `{accountKey}:{customerSenderId}` via `compose_chat_id()`. Slack cards show account label; send uses matching token.                                                                                           |
-| **Slack threading**        | One Slack thread per `chatId`; map persisted in `~/.nanobot/data/instagram_slack_threads.json` (`instagram_review_state`).                                                                                                                                                  |
-| **Startup**                | Requires `consentGranted`, Slack tokens, and at least one `accounts[]` entry. Webhook mode additionally requires per-account `appSecret` + `verifyToken`. Poll mode requires per-account `pageId` + `pageAccessToken`.                                             |
+| Area                       | Behavior                                                                                                                                                                                                                                  |
+| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Agent send**             | `send()` / `send_message()` raise `NotImplementedError`. Agent must use `create_instagram_draft`.                                                                                                                                         |
+| **Turn completion**        | On agent turn end, `send()` posts a Slack review card (never calls Instagram).                                                                                                                                                            |
+| **Draft tool**             | `create_instagram_draft` stores text in `instagram_review_state`; channel `consume_draft()` on turn end.                                                                                                                                  |
+| **No reply suggested**     | If the agent does **not** call `create_instagram_draft`, a Slack card is still posted (“no reply suggested”); **Send** is hidden; **Edit & Send** remains so humans can reply manually.                                                   |
+| **Slack approvals**        | Socket Mode (`slackAppToken` + `slackBotToken`). Interactive payloads ACK’d on the socket; send/discard run in background threads.                                                                                                        |
+| **Meta inbound — webhook** | When `useWebhook` is true: Flask on `webhookHost`:`webhookPort`. Per account: `GET`/`POST` `/webhook/instagram/{accountKey}` with per-account `verifyToken` / `appSecret` HMAC (`X-Hub-Signature-256`).                                   |
+| **Meta inbound — poll**    | When `useWebhook` is false **or** `pollFallbackEnabled` is true: Graph `GET /v19.0/{pageId}/conversations?platform=INSTAGRAM` on each account on `pollIntervalSeconds` (clamped 5–60). Requires `pageId` + `pageAccessToken` per account. |
+| **Meta outbound**          | `_send_instagram_message()` → `POST /v19.0/me/messages` with that account’s `pageAccessToken`. Only from Slack button/modal handlers.                                                                                                     |
+| **Multi-account**          | `accounts[]` with distinct Meta apps recommended. `chatId` = `{accountKey}:{customerSenderId}` via `compose_chat_id()`. Slack cards show account label; send uses matching token.                                                         |
+| **Slack threading**        | One Slack thread per `chatId`; map persisted in `~/.nanobot/data/instagram_slack_threads.json` (`instagram_review_state`).                                                                                                                |
+| **Startup**                | Requires `consentGranted`, Slack tokens, and at least one `accounts[]` entry. Webhook mode additionally requires per-account `appSecret` + `verifyToken`. Poll mode requires per-account `pageId` + `pageAccessToken`.                    |
 
 **Config example — single account (poll-first with webhooks off):**
 
@@ -334,19 +336,19 @@ Fragments below merge into `~/.nanobot/config.json`. Longer setup runbooks: [`do
 
 ### `agents.defaults` (upstream keys with fork behavior)
 
-| Key | Type | Default | Fork behavior |
-|-----|------|---------|----------------|
-| `unifiedSession` | bool | `false` | When `true`, mid-turn follow-ups only inject if delivery target matches active turn; see [Unified session](#unified-session-delivery-target-guard-unified_deliverypy). |
-| `genericMemoryOnly` | bool | `false` | Alternate Consolidator/Dream prompts for pattern-only memory; **cannot** combine with `eagerKnowledge.enabled`. See [Generic memory prompts](#generic-memory-prompts-genericmemoryonly). |
-| `eagerKnowledge` | object | — | Fork-only; see [Eager knowledge](#eager-knowledge-non-unified-cross-channel-recall). |
-| `eagerKnowledge.enabled` | bool | `false` | Promote session traffic into `memory/history.jsonl` soon after persist. |
-| `eagerKnowledge.minBatch` | int | `3` | LLM archive when pending chunk reaches this size. |
-| `eagerKnowledge.singletonIdleS` | int | `120` | Raw flush for smaller chunks after this idle time (seconds). |
-| `eagerKnowledge.maxBatch` | int | `20` | Max messages per eager flush. |
-| `archiveMediaMaxBytes` | int | `10485760` | Max bytes read per attachment during `Consolidator.archive()` (eager + token consolidation). |
-| `archiveExtractMaxChars` | int | `8000` | Max inlined text per extracted document in archive prompts. |
-| `archiveBootstrapMaxChars` | int | `12000` | Max combined bootstrap reference block in archive system prompt. |
-| `archiveMaxImages` | int | `5` | Max vision image blocks per archive LLM call. |
+| Key                             | Type   | Default    | Fork behavior                                                                                                                                                                            |
+| ------------------------------- | ------ | ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `unifiedSession`                | bool   | `false`    | When `true`, mid-turn follow-ups only inject if delivery target matches active turn; see [Unified session](#unified-session-delivery-target-guard-unified_deliverypy).                   |
+| `genericMemoryOnly`             | bool   | `false`    | Alternate Consolidator/Dream prompts for pattern-only memory; **cannot** combine with `eagerKnowledge.enabled`. See [Generic memory prompts](#generic-memory-prompts-genericmemoryonly). |
+| `eagerKnowledge`                | object | —          | Fork-only; see [Eager knowledge](#eager-knowledge-non-unified-cross-channel-recall).                                                                                                     |
+| `eagerKnowledge.enabled`        | bool   | `false`    | Promote session traffic into `memory/history.jsonl` soon after persist.                                                                                                                  |
+| `eagerKnowledge.minBatch`       | int    | `3`        | LLM archive when pending chunk reaches this size.                                                                                                                                        |
+| `eagerKnowledge.singletonIdleS` | int    | `120`      | Raw flush for smaller chunks after this idle time (seconds).                                                                                                                             |
+| `eagerKnowledge.maxBatch`       | int    | `20`       | Max messages per eager flush.                                                                                                                                                            |
+| `archiveMediaMaxBytes`          | int    | `10485760` | Max bytes read per attachment during `Consolidator.archive()` (eager + token consolidation).                                                                                             |
+| `archiveExtractMaxChars`        | int    | `8000`     | Max inlined text per extracted document in archive prompts.                                                                                                                              |
+| `archiveBootstrapMaxChars`      | int    | `12000`    | Max combined bootstrap reference block in archive system prompt.                                                                                                                         |
+| `archiveMaxImages`              | int    | `5`        | Max vision image blocks per archive LLM call.                                                                                                                                            |
 
 #### Example — `unifiedSession`
 
@@ -444,31 +446,31 @@ Other `channels.slack` keys (`botToken`, `appToken`, `replyInThread`, `groupAllo
 
 ### `channels.email`
 
-| Key                                                                                               | Type     | Default          | Notes                                                  |
-| ------------------------------------------------------------------------------------------------- | -------- | ---------------- | ------------------------------------------------------ |
-| `enabled`                                                                                         | bool     | `false`          |                                                        |
-| `consentGranted`                                                                                  | bool     | `false`          | Channel won’t start without explicit consent.          |
-| `imapHost`                                                                                        | string   | `""`             | Required when enabled.                                 |
-| `imapPort`                                                                                        | int      | `993`            |                                                        |
-| `imapUsername`                                                                                    | string   | `""`             |                                                        |
+| Key                                                                                               | Type     | Default          | Notes                                                                                                                                  |
+| ------------------------------------------------------------------------------------------------- | -------- | ---------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `enabled`                                                                                         | bool     | `false`          |                                                                                                                                        |
+| `consentGranted`                                                                                  | bool     | `false`          | Channel won’t start without explicit consent.                                                                                          |
+| `imapHost`                                                                                        | string   | `""`             | Required when enabled.                                                                                                                 |
+| `imapPort`                                                                                        | int      | `993`            |                                                                                                                                        |
+| `imapUsername`                                                                                    | string   | `""`             |                                                                                                                                        |
 | `imapPassword`                                                                                    | string   | `""`             | Gmail/Workspace: **App Password** only (16 letters after 2SV); not login password or `gmailDraft` OAuth token. `${ENV_VAR}` supported. |
-| `imapMailbox`                                                                                     | string   | `"INBOX"`        |                                                        |
-| `imapUseSsl`                                                                                      | bool     | `true`           |                                                        |
-| `imapIdleEnabled`                                                                                 | bool     | `true`           | **Fork:** IDLE vs poll-only inbound.                   |
-| `pollIntervalSeconds`                                                                             | int      | `60`             | Clamped 5–60; used when IDLE off or as IDLE cycle cap. |
-| `autoReplyEnabled`                                                                                | bool     | `true`           | **Not enforced** for send (outbound always blocked).   |
-| `sendProgress`                                                                                    | bool     | `true` (global)  | Per-channel override; set `false` on email to skip progress outbound. |
-| `outboundSlackChannel`                                                                            | string   | `""`             | **Fork:** Slack target for final agent replies (`#channel`, `C…`, `@user`). Requires `channels.slack.enabled`. |
-| `markSeen`                                                                                        | bool     | `true`           |                                                        |
-| `maxBodyChars`                                                                                    | int      | `12000`          |                                                        |
-| `subjectPrefix`                                                                                   | string   | `"Re: "`         |                                                        |
-| `allowFrom`                                                                                       | string[] | `[]`             |                                                        |
-| `verifyDkim`                                                                                      | bool     | `true`           | Anti-spoofing on inbound.                              |
-| `verifySpf`                                                                                       | bool     | `true`           |                                                        |
-| `allowedAttachmentTypes`                                                                          | string[] | `[]`             | e.g. `["image/*"]` or `["*"]` to allow.                |
-| `maxAttachmentSize`                                                                               | int      | `2000000`        | Bytes per attachment.                                  |
-| `maxAttachmentsPerEmail`                                                                          | int      | `5`              |                                                        |
-| `smtpHost`, `smtpPort`, `smtpUsername`, `smtpPassword`, `smtpUseTls`, `smtpUseSsl`, `fromAddress` | various  | empty / defaults | Legacy schema fields; **outbound SMTP is not used**.   |
+| `imapMailbox`                                                                                     | string   | `"INBOX"`        |                                                                                                                                        |
+| `imapUseSsl`                                                                                      | bool     | `true`           |                                                                                                                                        |
+| `imapIdleEnabled`                                                                                 | bool     | `true`           | **Fork:** IDLE vs poll-only inbound.                                                                                                   |
+| `pollIntervalSeconds`                                                                             | int      | `60`             | Clamped 5–60; used when IDLE off or as IDLE cycle cap.                                                                                 |
+| `autoReplyEnabled`                                                                                | bool     | `true`           | **Not enforced** for send (outbound always blocked).                                                                                   |
+| `sendProgress`                                                                                    | bool     | `true` (global)  | Per-channel override; set `false` on email to skip progress outbound.                                                                  |
+| `outboundSlackChannel`                                                                            | string   | `""`             | **Fork:** Slack target for final agent replies (`#channel`, `C…`, `@user`). Requires `channels.slack.enabled`.                         |
+| `markSeen`                                                                                        | bool     | `true`           |                                                                                                                                        |
+| `maxBodyChars`                                                                                    | int      | `12000`          |                                                                                                                                        |
+| `subjectPrefix`                                                                                   | string   | `"Re: "`         |                                                                                                                                        |
+| `allowFrom`                                                                                       | string[] | `[]`             |                                                                                                                                        |
+| `verifyDkim`                                                                                      | bool     | `true`           | Anti-spoofing on inbound.                                                                                                              |
+| `verifySpf`                                                                                       | bool     | `true`           |                                                                                                                                        |
+| `allowedAttachmentTypes`                                                                          | string[] | `[]`             | e.g. `["image/*"]` or `["*"]` to allow.                                                                                                |
+| `maxAttachmentSize`                                                                               | int      | `2000000`        | Bytes per attachment.                                                                                                                  |
+| `maxAttachmentsPerEmail`                                                                          | int      | `5`              |                                                                                                                                        |
+| `smtpHost`, `smtpPort`, `smtpUsername`, `smtpPassword`, `smtpUseTls`, `smtpUseSsl`, `fromAddress` | various  | empty / defaults | Legacy schema fields; **outbound SMTP is not used**.                                                                                   |
 
 #### Example — Gmail IMAP inbound (draft-only outbound)
 
@@ -499,21 +501,21 @@ On systemd, define `GMAIL_IMAP_APP_PASSWORD` in the unit or an `EnvironmentFile`
 
 ### `channels.instagram` (channel-level)
 
-| Key                   | Type     | Default     | Notes                                                                |
-| --------------------- | -------- | ----------- | -------------------------------------------------------------------- |
-| `enabled`             | bool     | `false`     |                                                                      |
-| `consentGranted`      | bool     | `false`     |                                                                      |
-| `streaming`           | bool     | `false`     |                                                                      |
-| `useWebhook`          | bool     | `true`      | `false` = poll-only inbound (no Meta HTTP callback).                 |
-| `pollFallbackEnabled` | bool     | `true`      | When `useWebhook` is true, also poll Graph on interval.              |
-| `pollIntervalSeconds` | int      | `60`        | Clamped 5–60; must be > 0 for poll to run.                           |
-| `slackBotToken`       | string   | `""`        | `xoxb-…`; scopes: `chat:write`, `chat:update`, `views.open`.         |
-| `slackDraftChannel`   | string   | `""`        | Slack channel ID (`C…`).                                             |
-| `slackAppToken`       | string   | `""`        | `xapp-…`; Socket Mode scope `connections:write`.                     |
-| `webhookHost`         | string   | `"0.0.0.0"` | Meta Flask bind host.                                                |
-| `webhookPort`         | int      | `5005`      | Meta Flask bind port.                                                |
-| `allowFrom`           | string[] | `["*"]`     |                                                                      |
-| `accounts`            | object[] | `[]`        | Required; one entry per Instagram account (see below).               |
+| Key                   | Type     | Default     | Notes                                                        |
+| --------------------- | -------- | ----------- | ------------------------------------------------------------ |
+| `enabled`             | bool     | `false`     |                                                              |
+| `consentGranted`      | bool     | `false`     |                                                              |
+| `streaming`           | bool     | `false`     |                                                              |
+| `useWebhook`          | bool     | `true`      | `false` = poll-only inbound (no Meta HTTP callback).         |
+| `pollFallbackEnabled` | bool     | `true`      | When `useWebhook` is true, also poll Graph on interval.      |
+| `pollIntervalSeconds` | int      | `60`        | Clamped 5–60; must be > 0 for poll to run.                   |
+| `slackBotToken`       | string   | `""`        | `xoxb-…`; scopes: `chat:write`, `chat:update`, `views.open`. |
+| `slackDraftChannel`   | string   | `""`        | Slack channel ID (`C…`).                                     |
+| `slackAppToken`       | string   | `""`        | `xapp-…`; Socket Mode scope `connections:write`.             |
+| `webhookHost`         | string   | `"0.0.0.0"` | Meta Flask bind host.                                        |
+| `webhookPort`         | int      | `5005`      | Meta Flask bind port.                                        |
+| `allowFrom`           | string[] | `["*"]`     |                                                              |
+| `accounts`            | object[] | `[]`        | Required; one entry per Instagram account (see below).       |
 
 #### Example — single account (webhook + poll fallback)
 

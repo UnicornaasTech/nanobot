@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from email.utils import parsedate_to_datetime
 from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
@@ -315,19 +316,31 @@ class ChannelManager:
         return True
 
     @staticmethod
+    def _format_email_received_at(date_raw: str) -> str:
+        """Human-readable received time from RFC 2822 Date header (or raw fallback)."""
+        raw = (date_raw or "").strip()
+        if not raw:
+            return "unknown"
+        try:
+            dt = parsedate_to_datetime(raw)
+            tz = dt.strftime("%Z") or dt.strftime("%z")
+            return f"{dt.strftime('%Y-%m-%d %H:%M')} {tz}".strip()
+        except (TypeError, ValueError, OverflowError):
+            return raw
+
+    @staticmethod
     def _build_email_slack_report_content(msg: OutboundMessage) -> str:
         """Format agent final text with inbound email context for Slack."""
         md = msg.metadata or {}
         sender = str(md.get("sender_email") or msg.chat_id or "").strip()
         subject = str(md.get("subject") or "").strip()
-        message_id = str(md.get("message_id") or "").strip()
+        received_at = ChannelManager._format_email_received_at(str(md.get("date") or ""))
         lines: list[str] = []
         if sender or subject:
-            header = f"*Email session* — From: `{sender or 'unknown'}`"
+            header = f"EMAIL DRAFT: From: {sender or 'unknown'}"
             if subject:
                 header += f" · Subject: {subject}"
-            if message_id:
-                header += f" · Message-ID: `{message_id}`"
+            header += f" · Received at {received_at}"
             lines.extend([header, ""])
         body = (msg.content or "").strip()
         if body:

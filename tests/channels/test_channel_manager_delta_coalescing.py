@@ -500,6 +500,10 @@ class TestEmailFinalOutboundSlackReroute:
         assert ChannelManager._should_reroute_email_final_outbound(delta) is False
         assert ChannelManager._should_reroute_email_final_outbound(streamed_final) is False
 
+    def test_format_email_received_at_fallbacks(self):
+        assert ChannelManager._format_email_received_at("") == "unknown"
+        assert ChannelManager._format_email_received_at("not-a-date") == "not-a-date"
+
     def test_build_report_includes_context(self):
         msg = OutboundMessage(
             channel="email",
@@ -509,12 +513,15 @@ class TestEmailFinalOutboundSlackReroute:
                 "sender_email": "user@example.com",
                 "subject": "Help needed",
                 "message_id": "<abc@mail>",
+                "date": "Sat, 23 May 2026 10:15:00 +0300",
             },
         )
         text = ChannelManager._build_email_slack_report_content(msg)
-        assert "user@example.com" in text
-        assert "Help needed" in text
-        assert "<abc@mail>" in text
+        assert text.startswith("EMAIL DRAFT: From: user@example.com")
+        assert "Subject: Help needed" in text
+        assert "Received at" in text
+        assert "2026-05-23" in text
+        assert "<abc@mail>" not in text
         assert "Agent answer here." in text
 
     @pytest.mark.asyncio
