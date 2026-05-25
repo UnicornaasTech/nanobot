@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +33,14 @@ _AIHUBMIX_ASPECT_RATIO_SIZES = {
 }
 _GEMINI_DEFAULT_TIMEOUT_S = 120.0
 _GEMINI_IMAGEN_ASPECT_RATIOS = {"1:1", "9:16", "16:9", "3:4", "4:3"}
+_OLLAMA_DEFAULT_SIDE = 1024
+_OLLAMA_SIZE_PRESETS = {
+    "1K": 1024,
+    "2K": 2048,
+    "4K": 4096,
+}
+_OLLAMA_EXPLICIT_SIZE_RE = re.compile(r"^\s*(\d+)\s*[xX]\s*(\d+)\s*$")
+_OLLAMA_ASPECT_RATIO_RE = re.compile(r"^\s*(\d+)\s*:\s*(\d+)\s*$")
 
 
 class ImageGenerationError(RuntimeError):
@@ -130,6 +139,11 @@ _IMAGE_GEN_PROVIDERS: dict[str, type[ImageGenerationProvider]] = {}
 
 
 def register_image_gen_provider(cls: type[ImageGenerationProvider]) -> None:
+    """Register an image provider at import time only.
+
+    The registry is populated by module side effects so provider discovery
+    stays lazy and consistent across the process.
+    """
     name = cls.provider_name
     if not name:
         raise ValueError(f"{cls.__name__} must set provider_name")
@@ -220,7 +234,10 @@ class ImageGenerationProvider(ABC):
         *,
         headers: dict[str, str],
         body: dict[str, Any],
+        client: httpx.AsyncClient | None = None,
     ) -> httpx.Response:
+        if client is not None:
+            return await client.post(url, headers=headers, json=body)
         if self._client is not None:
             return await self._client.post(url, headers=headers, json=body)
         async with httpx.AsyncClient(timeout=self.timeout) as c:
@@ -391,10 +408,11 @@ class AIHubMixImageGenerationClient(ImageGenerationProvider):
         model_path = _aihubmix_model_path(model)
         url = f"{self.api_base}/models/{model_path}/predictions"
         try:
-            response = await client.post(
+            response = await self._http_post(
                 url,
                 headers={**headers, "Content-Type": "application/json"},
-                json=body,
+                body=body,
+                client=client,
             )
         except httpx.TimeoutException as exc:
             raise ImageGenerationError("AIHubMix image generation timed out") from exc
@@ -430,6 +448,139 @@ def _http_error_detail(response: httpx.Response) -> str:
     return response.text[:500] or "<empty response body>"
 
 
+def _round_to_multiple(value: float, multiple: int = 8) -> int:
+    rounded = int(round(value / multiple) * multiple)
+    return max(multiple, rounded)
+
+
+def _ollama_dimensions(aspect_ratio: str | None, image_size: str | None) -> tuple[int, int]:
+    if image_size:
+        size = image_size.strip()
+        explicit = _OLLAMA_EXPLICIT_SIZE_RE.fullmatch(size)
+        if explicit:
+            return int(explicit.group(1)), int(explicit.group(2))
+        long_side = _OLLAMA_SIZE_PRESETS.get(size.upper(), _OLLAMA_DEFAULT_SIDE)
+    else:
+        long_side = _OLLAMA_DEFAULT_SIDE
+
+    if not aspect_ratio:
+        return long_side, long_side
+
+    ratio = _OLLAMA_ASPECT_RATIO_RE.fullmatch(aspect_ratio.strip())
+    if ratio is None:
+        return long_side, long_side
+
+    width_ratio = int(ratio.group(1))
+    height_ratio = int(ratio.group(2))
+    if width_ratio <= 0 or height_ratio <= 0:
+        return long_side, long_side
+
+    if width_ratio >= height_ratio:
+        width = long_side
+        height = _round_to_multiple(long_side * height_ratio / width_ratio)
+    else:
+        height = long_side
+        width = _round_to_multiple(long_side * width_ratio / height_ratio)
+    return max(8, width), max(8, height)
+
+
+def _ollama_image_data_url(value: str) -> str:
+    if value.startswith("data:image/"):
+        return value
+    return _b64_image_data_url(value)
+
+
+def _ollama_images_from_payload(payload: dict[str, Any]) -> list[str]:
+    images: list[str] = []
+
+    def collect(value: Any) -> None:
+        if isinstance(value, str) and value:
+            images.append(_ollama_image_data_url(value))
+        elif isinstance(value, list):
+            for item in value:
+                collect(item)
+
+    collect(payload.get("image"))
+    collect(payload.get("images"))
+    return images
+
+
+class OllamaImageGenerationClient(ImageGenerationProvider):
+    """Async client for Ollama native image generation models."""
+
+    provider_name = "ollama"
+    default_timeout = 300.0
+
+    def _default_base_url(self) -> str:
+        return "http://localhost:11434/api"
+
+    def _resolve_base_url(self, api_base: str | None) -> str:
+        if api_base:
+            base = api_base.rstrip("/")
+            if base.endswith("/v1"):
+                return f"{base[:-3]}/api"
+            return base
+        return self._default_base_url()
+
+    async def generate(
+        self,
+        *,
+        prompt: str,
+        model: str,
+        reference_images: list[str] | None = None,
+        aspect_ratio: str | None = None,
+        image_size: str | None = None,
+    ) -> GeneratedImageResponse:
+        if reference_images:
+            raise ImageGenerationError(
+                "Ollama image generation does not support reference images"
+            )
+
+        width, height = _ollama_dimensions(aspect_ratio, image_size)
+        body: dict[str, Any] = {
+            "model": model,
+            "prompt": prompt,
+            "width": width,
+            "height": height,
+            "steps": 0,
+        }
+        body.update(self.extra_body)
+        body["stream"] = False
+
+        headers = {
+            "Content-Type": "application/json",
+            **self.extra_headers,
+        }
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        url = f"{self.api_base}/generate"
+        response = await self._http_post(url, headers=headers, body=body)
+
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            detail = _http_error_detail(response)
+            logger.error(
+                "Ollama image generation failed (HTTP {}): {}",
+                response.status_code,
+                detail,
+            )
+            raise ImageGenerationError(
+                f"Ollama image generation failed (HTTP {response.status_code}): {detail}"
+            ) from exc
+
+        data = response.json()
+        images = _ollama_images_from_payload(data)
+
+        self._require_images(images, data)
+
+        response_text = data.get("response")
+        content = response_text if isinstance(response_text, str) else ""
+
+        return GeneratedImageResponse(images=images, content=content, raw=data)
+
+
 class GeminiImageGenerationClient(ImageGenerationProvider):
     """Async client for Gemini/Imagen image generation via the Generative Language API."""
 
@@ -443,9 +594,9 @@ class GeminiImageGenerationClient(ImageGenerationProvider):
         return "https://generativelanguage.googleapis.com/v1beta"
 
     def _resolve_base_url(self, api_base: str | None) -> str:
-        # The Gemini provider's registry default_api_base is the OpenAI-compat
-        # shim (.../v1beta/openai/), which has no image endpoints.
-        # Skip the registry lookup and use the native API base directly.
+        # Gemini chat completions use the registry's OpenAI-compatible shim.
+        # Image generation must hit the native Generative Language API, so we
+        # intentionally bypass the shared registry lookup here.
         if api_base:
             return api_base.rstrip("/")
         return self._default_base_url()
@@ -707,22 +858,16 @@ class MiniMaxImageGenerationClient(ImageGenerationProvider):
 
         body.update(self.extra_body)
 
-        client = self._client or httpx.AsyncClient(timeout=self.timeout)
-        try:
-            return await self._generate_with_client(client, body, headers)
-        finally:
-            if self._client is None:
-                await client.aclose()
+        return await self._generate_with_client(body, headers)
 
     async def _generate_with_client(
         self,
-        client: httpx.AsyncClient,
         body: dict[str, Any],
         headers: dict[str, str],
     ) -> GeneratedImageResponse:
         url = f"{self.api_base}/image_generation"
         try:
-            response = await client.post(url, headers=headers, json=body)
+            response = await self._http_post(url, headers=headers, body=body)
         except httpx.TimeoutException as exc:
             raise ImageGenerationError("MiniMax image generation timed out") from exc
         except httpx.RequestError as exc:
@@ -1301,13 +1446,158 @@ def _stepfun_images_from_payload(payload: dict[str, Any]) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Zhipu (智谱) image generation
+# ---------------------------------------------------------------------------
+
+_ZHIPU_TIMEOUT_S = 300.0
+
+_ZHIPU_ASPECT_RATIO_SIZES = {
+    "1:1": "1280x1280",
+    "16:9": "1728x960",
+    "9:16": "960x1728",
+    "3:4": "1088x1472",
+    "4:3": "1472x1088",
+}
+
+
+class ZhipuImageGenerationClient(ImageGenerationProvider):
+    """Async client for Zhipu (智谱) image generation API.
+
+    Supports:
+    - Text-to-image via glm-image, cogview-4, cogview-3-flash, etc.
+    - Aspect ratio selection
+    - Watermark control
+    """
+
+    provider_name = "zhipu"
+    missing_key_message = "Zhipu API key is not configured. Set providers.zhipu.apiKey."
+    default_timeout = _ZHIPU_TIMEOUT_S
+
+    def _default_base_url(self) -> str:
+        return "https://open.bigmodel.cn/api/paas/v4"
+
+    async def generate(
+        self,
+        *,
+        prompt: str,
+        model: str,
+        reference_images: list[str] | None = None,
+        aspect_ratio: str | None = None,
+        image_size: str | None = None,
+    ) -> GeneratedImageResponse:
+        if not self.api_key:
+            raise ImageGenerationError(self.missing_key_message)
+
+        if reference_images:
+            raise ImageGenerationError(
+                "Zhipu image generation does not support reference images"
+            )
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            **self.extra_headers,
+        }
+
+        body: dict[str, Any] = {
+            "model": model,
+            "prompt": prompt,
+        }
+
+        size = _zhipu_size(aspect_ratio, image_size)
+        if size:
+            body["size"] = size
+
+        body.update(self.extra_body)
+
+        url = f"{self.api_base}/images/generations"
+
+        client = self._client or httpx.AsyncClient(timeout=self.timeout)
+        try:
+            return await self._generate_with_client(
+                client,
+                headers=headers,
+                body=body,
+                url=url,
+            )
+        finally:
+            if self._client is None:
+                await client.aclose()
+
+    async def _generate_with_client(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        headers: dict[str, str],
+        body: dict[str, Any],
+        url: str,
+    ) -> GeneratedImageResponse:
+        try:
+            response = await self._http_post(url, headers=headers, body=body, client=client)
+        except httpx.TimeoutException as exc:
+            raise ImageGenerationError("Zhipu image generation timed out") from exc
+        except httpx.RequestError as exc:
+            raise ImageGenerationError(f"Zhipu image generation request failed: {exc}") from exc
+
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            detail = response.text[:500]
+            raise ImageGenerationError(f"Zhipu image generation failed: {detail}") from exc
+
+        payload = response.json()
+        images = await _zhipu_images_from_payload(client, payload)
+
+        self._require_images(images, payload)
+
+        return GeneratedImageResponse(images=images, content="", raw=payload)
+
+
+def _zhipu_size(
+    aspect_ratio: str | None,
+    image_size: str | None,
+) -> str:
+    """Resolve aspect ratio / image_size to Zhipu size string.
+
+    Zhipu glm-image model supports: 1280x1280 (default), 1568x1056,
+    1056x1568, 1472x1088, 1088x1472, 1728x960, 960x1728.
+    """
+    if image_size and "x" in image_size.lower():
+        return image_size
+    if aspect_ratio and aspect_ratio in _ZHIPU_ASPECT_RATIO_SIZES:
+        return _ZHIPU_ASPECT_RATIO_SIZES[aspect_ratio]
+    return "1280x1280"
+
+
+async def _zhipu_images_from_payload(
+    client: httpx.AsyncClient,
+    payload: dict[str, Any],
+) -> list[str]:
+    """Extract image data URLs from Zhipu API response.
+
+    Zhipu returns images as temporary URLs that expire after 30 days.
+    We download and re-encode as base64 data URLs.
+    """
+    images: list[str] = []
+    for item in payload.get("data") or []:
+        if not isinstance(item, dict):
+            continue
+        url = item.get("url")
+        if isinstance(url, str) and url:
+            images.append(await _download_image_data_url(client, url))
+    return images
+
+
+# ---------------------------------------------------------------------------
 # Provider registration
 # ---------------------------------------------------------------------------
 
 register_image_gen_provider(AIHubMixImageGenerationClient)
 register_image_gen_provider(CodexImageGenerationClient)
 register_image_gen_provider(GeminiImageGenerationClient)
+register_image_gen_provider(OllamaImageGenerationClient)
 register_image_gen_provider(MiniMaxImageGenerationClient)
 register_image_gen_provider(OpenAIImageGenerationClient)
 register_image_gen_provider(OpenRouterImageGenerationClient)
 register_image_gen_provider(StepFunImageGenerationClient)
+register_image_gen_provider(ZhipuImageGenerationClient)

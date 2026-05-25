@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
+from urllib.parse import unquote, urlparse
 
 from loguru import logger
 
@@ -16,6 +18,61 @@ from nanobot.session.manager import SessionManager
 
 WEBUI_TRANSCRIPT_SCHEMA_VERSION = 3
 _MAX_TRANSCRIPT_FILE_BYTES = 8 * 1024 * 1024
+_MARKDOWN_LOCAL_IMAGE_RE = re.compile(
+    r"!\[([^\]]*)\]\((<[^>]+>|[^)\s]+)(\s+(?:\"[^\"]*\"|'[^']*'))?\)"
+)
+_INLINE_MARKDOWN_IMAGE_EXTS: frozenset[str] = frozenset({
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".gif",
+})
+
+
+def rewrite_local_markdown_images(
+    text: str,
+    *,
+    workspace_path: Path,
+    sign_path: Callable[[Path], Mapping[str, Any] | None],
+) -> str:
+    """Rewrite markdown image paths inside the workspace to signed WebUI media URLs."""
+    if "![" not in text:
+        return text
+
+    def resolve_url(raw_url: str) -> str | None:
+        url = raw_url.strip()
+        if url.startswith("<") and url.endswith(">"):
+            url = url[1:-1].strip()
+        if not url or url.startswith(("/api/media/", "#")):
+            return None
+        parsed = urlparse(url)
+        if parsed.scheme or parsed.netloc or parsed.query or parsed.fragment:
+            return None
+        path_text = unquote(url)
+        if Path(path_text).suffix.lower() not in _INLINE_MARKDOWN_IMAGE_EXTS:
+            return None
+        candidate = Path(path_text).expanduser()
+        if not candidate.is_absolute():
+            candidate = workspace_path / candidate
+        try:
+            resolved = candidate.resolve(strict=False)
+            resolved.relative_to(workspace_path)
+        except (OSError, ValueError):
+            return None
+        if not resolved.is_file():
+            return None
+        signed = sign_path(resolved)
+        return str(signed.get("url")) if signed and signed.get("url") else None
+
+    def replace(match: re.Match[str]) -> str:
+        signed_url = resolve_url(match.group(2))
+        if not signed_url:
+            return match.group(0)
+        title = match.group(3) or ""
+        return f"![{match.group(1)}]({signed_url}{title})"
+
+    return _MARKDOWN_LOCAL_IMAGE_RE.sub(replace, text)
 
 
 def webui_transcript_path(session_key: str) -> Path:
@@ -116,6 +173,55 @@ def tool_trace_lines_from_events(events: Any) -> list[str]:
     return lines
 
 
+_PHASE_RANK = {"start": 1, "end": 2, "error": 3}
+
+
+def _normalize_tool_events(events: Any) -> list[dict[str, Any]]:
+    if not isinstance(events, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for event in events:
+        if not event or not isinstance(event, dict):
+            continue
+        if event.get("phase") not in {"start", "end", "error"}:
+            continue
+        if not isinstance(event.get("name"), str):
+            fn = event.get("function")
+            if not (isinstance(fn, dict) and isinstance(fn.get("name"), str)):
+                continue
+        out.append(dict(event))
+    return out
+
+
+def _tool_event_key(event: dict[str, Any]) -> str:
+    call_id = event.get("call_id")
+    if isinstance(call_id, str) and call_id:
+        return f"call:{call_id}"
+    return _format_tool_call_trace(event) or json.dumps(event, sort_keys=True, ensure_ascii=False)
+
+
+def _merge_tool_events(previous: Any, incoming: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not isinstance(previous, list) or not previous:
+        return incoming
+    if not incoming:
+        return [dict(event) for event in previous if isinstance(event, dict)]
+    merged = [dict(event) for event in previous if isinstance(event, dict)]
+    index_by_key = {_tool_event_key(event): idx for idx, event in enumerate(merged)}
+    for event in incoming:
+        key = _tool_event_key(event)
+        existing_index = index_by_key.get(key)
+        if existing_index is None:
+            index_by_key[key] = len(merged)
+            merged.append(event)
+            continue
+        existing = merged[existing_index]
+        incoming_rank = _PHASE_RANK.get(str(event.get("phase")), 0)
+        existing_rank = _PHASE_RANK.get(str(existing.get("phase")), 0)
+        if incoming_rank >= existing_rank:
+            merged[existing_index] = {**existing, **event}
+    return merged
+
+
 def _merge_unique_tool_trace_lines(
     previous_traces: list[str],
     lines: list[str],
@@ -136,6 +242,7 @@ def replay_transcript_to_ui_messages(
     lines: list[dict[str, Any]],
     *,
     augment_user_media: Callable[[list[str]], list[dict[str, Any]]] | None = None,
+    augment_assistant_text: Callable[[str], str] | None = None,
 ) -> list[dict[str, Any]]:
     """Fold JSONL records into ``UIMessage``-shaped dicts for the WebUI.
 
@@ -405,6 +512,14 @@ def replay_transcript_to_ui_messages(
                 row["media"] = media_att
                 if all(m.get("kind") == "image" for m in media_att):
                     row["images"] = [{"url": m.get("url"), "name": m.get("name")} for m in media_att]
+            cli_apps = rec.get("cli_apps")
+            if isinstance(cli_apps, list) and cli_apps:
+                row["cliApps"] = [dict(app) for app in cli_apps if isinstance(app, dict)]
+            mcp_presets = rec.get("mcp_presets")
+            if isinstance(mcp_presets, list) and mcp_presets:
+                row["mcpPresets"] = [
+                    dict(preset) for preset in mcp_presets if isinstance(preset, dict)
+                ]
             messages.append(row)
             continue
 
@@ -449,6 +564,24 @@ def replay_transcript_to_ui_messages(
                 buffer_message_id = None
                 buffer_parts = []
                 continue
+            final_text = rec.get("text")
+            if isinstance(final_text, str):
+                if buffer_message_id is None:
+                    buffer_message_id = _new_id("buf", idx)
+                    messages.append(
+                        {
+                            "id": buffer_message_id,
+                            "role": "assistant",
+                            "content": final_text,
+                            "isStreaming": True,
+                            "createdAt": _ts_base + idx,
+                        },
+                    )
+                else:
+                    for i, m in enumerate(messages):
+                        if m.get("id") == buffer_message_id:
+                            messages[i] = {**m, "content": final_text, "isStreaming": True}
+                            break
             buffer_message_id = None
             buffer_parts = []
             continue
@@ -486,6 +619,7 @@ def replay_transcript_to_ui_messages(
                 close_reasoning(messages)
                 continue
             if kind in ("tool_hint", "progress"):
+                structured_events = _normalize_tool_events(rec.get("tool_events"))
                 structured = tool_trace_lines_from_events(rec.get("tool_events"))
                 text = rec.get("text")
                 trace_lines = structured if structured else ([text] if isinstance(text, str) and text else [])
@@ -502,7 +636,7 @@ def replay_transcript_to_ui_messages(
                     prev_traces = list(last.get("traces") or [last.get("content")])
                     if structured:
                         merged_traces, added = _merge_unique_tool_trace_lines(prev_traces, structured)
-                        if not added:
+                        if not added and not structured_events:
                             continue
                     else:
                         merged_traces = prev_traces + trace_lines
@@ -510,6 +644,9 @@ def replay_transcript_to_ui_messages(
                         **last,
                         "traces": merged_traces,
                         "content": merged_traces[-1],
+                        "toolEvents": _merge_tool_events(last.get("toolEvents"), structured_events)
+                        if structured_events
+                        else last.get("toolEvents"),
                         "activitySegmentId": last.get("activitySegmentId") or segment,
                     }
                     messages[-1] = merged
@@ -521,6 +658,7 @@ def replay_transcript_to_ui_messages(
                             "kind": "trace",
                             "content": trace_lines[-1],
                             "traces": trace_lines,
+                            **({"toolEvents": structured_events} if structured_events else {}),
                             "activitySegmentId": segment,
                             "createdAt": _ts_base + idx,
                         },
@@ -569,7 +707,14 @@ def replay_transcript_to_ui_messages(
             buffer_parts = []
             continue
 
-    for m in messages:
+    for i, m in enumerate(messages):
+        if (
+            augment_assistant_text is not None
+            and m.get("role") == "assistant"
+            and m.get("kind") != "trace"
+            and isinstance(m.get("content"), str)
+        ):
+            messages[i] = {**m, "content": augment_assistant_text(m["content"])}
         m.pop("isStreaming", None)
         m.pop("reasoningStreaming", None)
     return messages
@@ -579,12 +724,17 @@ def build_webui_thread_response(
     session_key: str,
     *,
     augment_user_media: Callable[[list[str]], list[dict[str, Any]]] | None = None,
+    augment_assistant_text: Callable[[str], str] | None = None,
 ) -> dict[str, Any] | None:
     """Return a payload compatible with ``WebuiThreadPersistedPayload``."""
     lines = read_transcript_lines(session_key)
     if not lines:
         return None
-    msgs = replay_transcript_to_ui_messages(lines, augment_user_media=augment_user_media)
+    msgs = replay_transcript_to_ui_messages(
+        lines,
+        augment_user_media=augment_user_media,
+        augment_assistant_text=augment_assistant_text,
+    )
     return {
         "schemaVersion": WEBUI_TRANSCRIPT_SCHEMA_VERSION,
         "sessionKey": session_key,

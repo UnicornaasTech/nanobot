@@ -2,11 +2,18 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { useClient } from "@/providers/ClientProvider";
 import { toMediaAttachment } from "@/lib/media";
-import { mergeUniqueToolTraceLines, toolTraceLinesFromEvents } from "@/lib/tool-traces";
+import {
+  mergeToolProgressEvents,
+  mergeUniqueToolTraceLines,
+  normalizeToolProgressEvents,
+  toolTraceLinesFromEvents,
+} from "@/lib/tool-traces";
 import type { StreamError } from "@/lib/nanobot-client";
 import type {
   InboundEvent,
+  OutboundCliAppMention,
   OutboundImageGeneration,
+  OutboundMcpPresetMention,
   OutboundMedia,
   GoalStateWsPayload,
   UIImage,
@@ -187,6 +194,15 @@ function stampLastAssistantLatency(prev: UIMessage[], latencyMs: number): UIMess
   return prev;
 }
 
+function findLatestAssistantAnswerIndex(prev: UIMessage[]): number | null {
+  for (let i = prev.length - 1; i >= 0; i -= 1) {
+    const m = prev[i];
+    if (m.role === "assistant" && m.kind !== "trace") return i;
+    if (m.role === "user") break;
+  }
+  return null;
+}
+
 function absorbCompleteAssistantMessage(
   prev: UIMessage[],
   message: Omit<UIMessage, "id" | "role" | "createdAt">,
@@ -297,6 +313,8 @@ export interface SendImage {
 
 export interface SendOptions {
   imageGeneration?: OutboundImageGeneration;
+  cliApps?: OutboundCliAppMention[];
+  mcpPresets?: OutboundMcpPresetMention[];
 }
 
 export function useNanobotStream(
@@ -482,23 +500,54 @@ export function useNanobotStream(
     [appendAnswerChunk, ensureActivitySegmentId],
   );
 
-  const flushPendingStreamEvents = useCallback((options?: { closeAnswerSegment?: boolean }) => {
+  const flushPendingStreamEvents = useCallback((options?: {
+    closeAnswerSegment?: boolean;
+    finalAnswerText?: string;
+  }) => {
     if (streamFrameRef.current !== null) {
       window.cancelAnimationFrame(streamFrameRef.current);
       streamFrameRef.current = null;
     }
     const events = pendingStreamEventsRef.current;
-    if (events.length === 0) {
+    const finalAnswerText = options?.finalAnswerText;
+    if (events.length === 0 && finalAnswerText === undefined) {
       if (options?.closeAnswerSegment) closeActiveAssistantStream();
       return;
     }
     pendingStreamEventsRef.current = [];
     setMessages((prev) => {
-      const next = applyPendingStreamEvents(prev, events);
+      let next = events.length > 0 ? applyPendingStreamEvents(prev, events) : prev;
+      if (finalAnswerText !== undefined) {
+        const targetIndex =
+          resolveActiveAssistantIndex(next)
+          ?? findStreamingAssistantIndex(next, closedAssistantStreamIdsRef.current)
+          ?? findLatestAssistantAnswerIndex(next);
+          if (targetIndex !== null) {
+            const target = next[targetIndex];
+            next = replaceMessageAt(next, targetIndex, {
+              ...target,
+              content: finalAnswerText,
+              isStreaming: true,
+            });
+          } else {
+            const id = crypto.randomUUID();
+            closedAssistantStreamIdsRef.current.add(id);
+            next = [
+              ...next,
+              {
+                id,
+                role: "assistant",
+                content: finalAnswerText,
+                isStreaming: true,
+                createdAt: Date.now(),
+              },
+            ];
+          }
+        }
       if (options?.closeAnswerSegment) closeActiveAssistantStream();
       return next;
     });
-  }, [applyPendingStreamEvents, closeActiveAssistantStream]);
+  }, [applyPendingStreamEvents, closeActiveAssistantStream, resolveActiveAssistantIndex]);
 
   const schedulePendingStreamFlush = useCallback(() => {
     if (streamFrameRef.current !== null) return;
@@ -576,7 +625,10 @@ export function useNanobotStream(
       }
 
       if (ev.event === "stream_end") {
-        flushPendingStreamEvents({ closeAnswerSegment: true });
+        flushPendingStreamEvents({
+          closeAnswerSegment: true,
+          ...(typeof ev.text === "string" ? { finalAnswerText: ev.text } : {}),
+        });
         if (suppressStreamUntilTurnEndRef.current) return;
         // stream_end only means the text segment finished — the model may
         // still be executing tools.  Do NOT reset isStreaming here; the
@@ -657,6 +709,7 @@ export function useNanobotStream(
         // Attach them to the last trace row if it was the last emitted item
         // so a sequence of calls collapses into one compact trace group.
         if (ev.kind === "tool_hint" || ev.kind === "progress") {
+          const structuredEvents = normalizeToolProgressEvents(ev.tool_events);
           const structuredLines = toolTraceLinesFromEvents(ev.tool_events);
           const lines = structuredLines.length > 0
             ? structuredLines
@@ -681,13 +734,15 @@ export function useNanobotStream(
               const mergedLines = structuredLines.length > 0
                 ? mergeUniqueToolTraceLines(previousTraces, structuredLines)
                 : null;
-              if (mergedLines && !mergedLines.added) return prev;
               const merged: UIMessage = {
                 ...last,
                 traces: mergedLines ? mergedLines.traces : [...previousTraces, ...lines],
                 content: mergedLines
                   ? mergedLines.traces[mergedLines.traces.length - 1]
                   : lines[lines.length - 1],
+                toolEvents: structuredEvents.length
+                  ? mergeToolProgressEvents(last.toolEvents, structuredEvents)
+                  : last.toolEvents,
                 activitySegmentId: last.activitySegmentId ?? segmentId,
               };
               return [...prev.slice(0, -1), merged];
@@ -700,6 +755,7 @@ export function useNanobotStream(
                 kind: "trace",
                 content: lines[lines.length - 1],
                 traces: lines,
+                ...(structuredEvents.length ? { toolEvents: structuredEvents } : {}),
                 activitySegmentId: segmentId,
                 createdAt: Date.now(),
               },
@@ -836,6 +892,8 @@ export function useNanobotStream(
             content,
             createdAt: Date.now(),
             ...(previews ? { images: previews } : {}),
+            ...(options?.cliApps?.length ? { cliApps: options.cliApps } : {}),
+            ...(options?.mcpPresets?.length ? { mcpPresets: options.mcpPresets } : {}),
           },
         ];
       });

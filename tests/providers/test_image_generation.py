@@ -14,9 +14,11 @@ from nanobot.providers.image_generation import (
     GeneratedImageResponse,
     ImageGenerationError,
     MiniMaxImageGenerationClient,
+    OllamaImageGenerationClient,
     OpenAIImageGenerationClient,
     OpenRouterImageGenerationClient,
     StepFunImageGenerationClient,
+    ZhipuImageGenerationClient,
 )
 
 PNG_BYTES = (
@@ -144,6 +146,54 @@ async def test_openrouter_image_generation_requires_api_key() -> None:
 
     with pytest.raises(ImageGenerationError, match="API key"):
         await client.generate(prompt="draw", model="model")
+
+
+@pytest.mark.asyncio
+async def test_ollama_image_generation_payload_and_response() -> None:
+    raw_b64 = PNG_DATA_URL.removeprefix("data:image/png;base64,")
+    fake = FakeClient(FakeResponse({"image": raw_b64}))
+    client = OllamaImageGenerationClient(
+        api_key="ollama-test",
+        api_base="http://localhost:11434/v1/",
+        extra_headers={"X-Test": "1"},
+        extra_body={"seed": 123},
+        client=fake,  # type: ignore[arg-type]
+    )
+
+    response = await client.generate(
+        prompt="a sunset",
+        model="x/z-image-turbo",
+        aspect_ratio="16:9",
+        image_size="1K",
+    )
+
+    assert response.images == [PNG_DATA_URL]
+    assert response.content == ""
+
+    call = fake.calls[0]
+    assert call["url"] == "http://localhost:11434/api/generate"
+    assert call["headers"]["Authorization"] == "Bearer ollama-test"
+    assert call["headers"]["X-Test"] == "1"
+    body = call["json"]
+    assert body["model"] == "x/z-image-turbo"
+    assert body["prompt"] == "a sunset"
+    assert body["width"] == 1024
+    assert body["height"] == 576
+    assert body["steps"] == 0
+    assert body["stream"] is False
+    assert body["seed"] == 123
+
+
+@pytest.mark.asyncio
+async def test_ollama_image_generation_rejects_reference_images() -> None:
+    client = OllamaImageGenerationClient(api_key=None)
+
+    with pytest.raises(ImageGenerationError, match="reference images"):
+        await client.generate(
+            prompt="edit this",
+            model="x/z-image-turbo",
+            reference_images=["ref.png"],
+        )
 
 
 @pytest.mark.asyncio
@@ -361,6 +411,11 @@ async def test_gemini_requires_api_key() -> None:
         await client.generate(prompt="draw", model="imagen-4.0-generate-001")
 
 
+def test_gemini_image_client_uses_native_api_base_by_default() -> None:
+    client = GeminiImageGenerationClient(api_key="AIza-test")
+    assert client.api_base == "https://generativelanguage.googleapis.com/v1beta"
+
+
 @pytest.mark.asyncio
 async def test_gemini_no_images_raises() -> None:
     fake = FakeClient(FakeResponse({"candidates": [{"content": {"parts": [{"text": "sorry"}]}}]}))
@@ -401,6 +456,17 @@ async def test_minimax_payload_and_response_with_reference_image(tmp_path: Path)
     assert body["aspect_ratio"] == "21:9"
     assert body["subject_reference"][0]["type"] == "character"
     assert body["subject_reference"][0]["image_file"].startswith("data:image/png;base64,")
+
+
+@pytest.mark.asyncio
+async def test_minimax_base64_response_uses_detected_mime() -> None:
+    raw_b64 = base64.b64encode(JPEG_BYTES).decode("ascii")
+    fake = FakeClient(FakeResponse({"data": {"image_base64": [raw_b64]}}))
+    client = MiniMaxImageGenerationClient(api_key="sk-mm-test", client=fake)  # type: ignore[arg-type]
+
+    response = await client.generate(prompt="draw", model="image-01")
+
+    assert response.images == [f"data:image/jpeg;base64,{raw_b64}"]
 
 
 # ---------------------------------------------------------------------------
@@ -962,3 +1028,102 @@ async def test_openai_no_images_raises() -> None:
 
     with pytest.raises(ImageGenerationError, match="returned no images"):
         await client.generate(prompt="draw", model="dall-e-3")
+
+
+# ---------------------------------------------------------------------------
+# Zhipu
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_zhipu_image_generation_payload_and_response() -> None:
+    fake = FakeClient(FakeResponse({"data": [{"url": "https://cdn.example/image.png"}]}))
+    fake.get_response = FakeResponse({}, content=PNG_BYTES)
+    client = ZhipuImageGenerationClient(
+        api_key="sk-zhipu-test",
+        api_base="https://open.bigmodel.cn/api/paas/v4",
+        extra_headers={"X-Test": "1"},
+        extra_body={"watermark_enabled": False},
+        client=fake,  # type: ignore[arg-type]
+    )
+
+    response = await client.generate(
+        prompt="a sunset over the ocean",
+        model="glm-image",
+        aspect_ratio="16:9",
+        image_size="2K",
+    )
+
+    assert response.images[0].startswith("data:image/png;base64,")
+    call = fake.calls[0]
+    assert call["url"] == "https://open.bigmodel.cn/api/paas/v4/images/generations"
+    assert call["headers"]["Authorization"] == "Bearer sk-zhipu-test"
+    assert call["headers"]["X-Test"] == "1"
+    body = call["json"]
+    assert body["model"] == "glm-image"
+    assert body["prompt"] == "a sunset over the ocean"
+    assert body["size"] == "1728x960"
+    assert body["watermark_enabled"] is False
+
+
+@pytest.mark.asyncio
+async def test_zhipu_image_generation_with_explicit_size() -> None:
+    fake = FakeClient(FakeResponse({"data": [{"url": "https://cdn.example/image.png"}]}))
+    fake.get_response = FakeResponse({}, content=PNG_BYTES)
+    client = ZhipuImageGenerationClient(
+        api_key="sk-zhipu-test",
+        client=fake,  # type: ignore[arg-type]
+    )
+
+    await client.generate(
+        prompt="a cat",
+        model="cogview-4",
+        image_size="1024x1024",
+    )
+
+    body = fake.calls[0]["json"]
+    assert body["size"] == "1024x1024"
+
+
+@pytest.mark.asyncio
+async def test_zhipu_image_generation_downloads_url_response() -> None:
+    fake = FakeClient(FakeResponse({"data": [{"url": "https://cdn.example/image.png"}]}))
+    fake.get_response = FakeResponse({}, content=PNG_BYTES)
+    client = ZhipuImageGenerationClient(
+        api_key="sk-zhipu-test",
+        client=fake,  # type: ignore[arg-type]
+    )
+
+    response = await client.generate(prompt="draw", model="glm-image")
+
+    assert response.images[0].startswith("data:image/png;base64,")
+    assert fake.get_calls[0]["url"] == "https://cdn.example/image.png"
+
+
+@pytest.mark.asyncio
+async def test_zhipu_image_generation_requires_api_key() -> None:
+    client = ZhipuImageGenerationClient(api_key=None)
+
+    with pytest.raises(ImageGenerationError, match="API key"):
+        await client.generate(prompt="draw", model="glm-image")
+
+
+@pytest.mark.asyncio
+async def test_zhipu_image_generation_no_images_raises() -> None:
+    fake = FakeClient(FakeResponse({"data": [{"text": "sorry"}]}))
+    client = ZhipuImageGenerationClient(api_key="sk-zhipu-test", client=fake)  # type: ignore[arg-type]
+
+    with pytest.raises(ImageGenerationError, match="returned no images"):
+        await client.generate(prompt="draw", model="glm-image")
+
+
+@pytest.mark.asyncio
+async def test_zhipu_image_generation_rejects_reference_images() -> None:
+    client = ZhipuImageGenerationClient(api_key="sk-zhipu-test")
+
+    with pytest.raises(ImageGenerationError, match="reference images"):
+        await client.generate(
+            prompt="edit this",
+            model="glm-image",
+            reference_images=["ref.png"],
+        )

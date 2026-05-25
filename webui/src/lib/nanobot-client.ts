@@ -2,7 +2,9 @@ import type {
   ConnectionStatus,
   InboundEvent,
   Outbound,
+  OutboundCliAppMention,
   OutboundImageGeneration,
+  OutboundMcpPresetMention,
   OutboundMedia,
   GoalStateWsPayload,
 } from "./types";
@@ -304,7 +306,11 @@ export class NanobotClient {
     chatId: string,
     content: string,
     media?: OutboundMedia[],
-    options?: { imageGeneration?: OutboundImageGeneration },
+    options?: {
+      imageGeneration?: OutboundImageGeneration;
+      cliApps?: OutboundCliAppMention[];
+      mcpPresets?: OutboundMcpPresetMention[];
+    },
   ): void {
     this.knownChats.add(chatId);
     const frame: Outbound = {
@@ -313,6 +319,8 @@ export class NanobotClient {
       content,
       ...(media && media.length > 0 ? { media } : {}),
       ...(options?.imageGeneration ? { image_generation: options.imageGeneration } : {}),
+      ...(options?.cliApps?.length ? { cli_apps: options.cliApps } : {}),
+      ...(options?.mcpPresets?.length ? { mcp_presets: options.mcpPresets } : {}),
       webui: true,
     };
     this.queueSend(frame);

@@ -42,6 +42,30 @@ def test_replay_delta_and_turn_end(tmp_path, monkeypatch) -> None:
     assert msgs[1]["latencyMs"] == 42
 
 
+def test_replay_augments_assistant_text() -> None:
+    msgs = replay_transcript_to_ui_messages(
+        [
+            {"event": "user", "chat_id": "t-img", "text": "draw"},
+            {"event": "delta", "chat_id": "t-img", "text": "![Diagram](diagram.png)"},
+            {"event": "stream_end", "chat_id": "t-img"},
+        ],
+        augment_assistant_text=lambda text: text.replace("diagram.png", "/api/media/sig/payload"),
+    )
+
+    assert msgs[1]["content"] == "![Diagram](/api/media/sig/payload)"
+
+
+def test_replay_uses_stream_end_final_text() -> None:
+    msgs = replay_transcript_to_ui_messages(
+        [
+            {"event": "user", "chat_id": "t-img", "text": "draw"},
+            {"event": "stream_end", "chat_id": "t-img", "text": "![Diagram](/api/media/sig/payload)"},
+        ],
+    )
+
+    assert msgs[1]["content"] == "![Diagram](/api/media/sig/payload)"
+
+
 def test_replay_file_edit_event_creates_file_activity(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr("nanobot.config.paths.get_data_dir", lambda: tmp_path)
     key = "websocket:t-file"
@@ -143,6 +167,50 @@ def test_replay_tool_events_dedupes_finish_after_start() -> None:
         'exec({"cmd": "ls"})',
         'read_file({"path": "notes.md"})',
     ]
+    assert msgs[0]["toolEvents"][0]["phase"] == "end"
+    assert msgs[0]["toolEvents"][0]["call_id"] == "call-exec"
+
+
+def test_replay_tool_events_keeps_phase_update_when_trace_is_deduped() -> None:
+    args = {"name": "github", "args": ["repo", "view"], "json": "true"}
+    msgs = replay_transcript_to_ui_messages([
+        {
+            "event": "message",
+            "chat_id": "t-tool",
+            "text": "",
+            "kind": "tool_hint",
+            "tool_events": [
+                {
+                    "phase": "start",
+                    "call_id": "call-cli",
+                    "name": "run_cli_app",
+                    "arguments": args,
+                },
+            ],
+        },
+        {
+            "event": "message",
+            "chat_id": "t-tool",
+            "text": "",
+            "kind": "progress",
+            "tool_events": [
+                {
+                    "phase": "error",
+                    "call_id": "call-cli",
+                    "name": "run_cli_app",
+                    "arguments": args,
+                    "error": "Error: CLI app 'github' not found",
+                },
+            ],
+        },
+    ])
+
+    assert len(msgs) == 1
+    assert msgs[0]["traces"] == [
+        'run_cli_app({"name": "github", "args": ["repo", "view"], "json": "true"})',
+    ]
+    assert msgs[0]["toolEvents"][0]["phase"] == "error"
+    assert msgs[0]["toolEvents"][0]["error"] == "Error: CLI app 'github' not found"
 
 
 def test_replay_file_edit_progress_merges_after_interleaved_activity(tmp_path, monkeypatch) -> None:
