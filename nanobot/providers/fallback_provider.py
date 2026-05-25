@@ -242,15 +242,8 @@ class FallbackProvider(LLMProvider):
         request_fn: Callable[[LLMProvider, Any], Awaitable[LLMResponse]],
         *,
         skip_if_streamed: bool = False,
-        accept_tool_calls: bool = True,
     ) -> LLMResponse | None:
-        """Try fallback models when the primary returned a blank successful reply.
-
-        A fallback response counts as "successful" when it has non-blank text
-        content **or** at least one tool call (when *accept_tool_calls* is True).
-        Set *accept_tool_calls* to False on the finalization-recovery path where
-        we explicitly need a textual answer rather than another tool invocation.
-        """
+        """Try fallback models when the primary returned a blank successful reply."""
         if skip_if_streamed or not self._has_fallbacks:
             return None
 
@@ -295,30 +288,17 @@ class FallbackProvider(LLMProvider):
                 )
                 continue
 
-            has_text = not is_blank_text(fallback_response.content)
-            has_tool_calls = bool(fallback_response.tool_calls)
-            if has_text or (accept_tool_calls and has_tool_calls):
+            if not is_blank_text(fallback_response.content):
                 logger.info(
-                    "Fallback '{}' succeeded after primary empty response "
-                    "(content={}, tool_calls={})",
+                    "Fallback '{}' succeeded after primary empty response",
                     fallback_model,
-                    has_text,
-                    len(fallback_response.tool_calls),
                 )
                 return fallback_response
 
-            if has_tool_calls and not accept_tool_calls:
-                logger.warning(
-                    "Fallback '{}' produced tool_calls but text answer was required "
-                    "(content empty, tool_calls={}); discarding",
-                    fallback_model,
-                    len(fallback_response.tool_calls),
-                )
-            else:
-                logger.warning(
-                    "Fallback '{}' returned empty response after primary empty response",
-                    fallback_model,
-                )
+            logger.warning(
+                "Fallback '{}' returned empty response after primary empty response",
+                fallback_model,
+            )
 
         logger.warning(
             "All {} fallback model(s) returned empty after primary empty response",
