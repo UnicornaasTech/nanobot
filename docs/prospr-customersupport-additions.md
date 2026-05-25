@@ -57,6 +57,8 @@ Inbound mail is **always pulled** over IMAP (nanobot connects to Gmail). There i
 
 - Set **`useWebhook`** to **`false`**. Meta will not call your server for new DMs; nanobot uses the **Graph API** (`GET /{page-id}/conversations?platform=INSTAGRAM`, …) on **`pollIntervalSeconds`** instead.
 - Each **`accounts[]`** entry still needs **`pageId`**, **`pageAccessToken`**, and channel-level **`pollIntervalSeconds`** set to a positive value (default **60**).
+- **`appSecret`** and **`verifyToken`** are **not** required in nanobot config until you turn webhooks on (see [Setup: Instagram](#setup-instagram-dm--slack-human-approved-send) §3).
+- On the **Meta** side you still create a Developer app and obtain a Page token — you just **skip webhook URL registration** for now. See [Meta app — polling only](#3-meta-app--polling-only-usewebhook-false) in the setup section below.
 - Later, when you have a public URL, set **`useWebhook`** to **`true`**, add per-account **`appSecret`** / **`verifyToken`**, configure Meta’s webhook for that account, and optionally keep **`pollFallbackEnabled`** **`true`** for redundancy.
 
 ### Slack (human Send / Edit / Discard)
@@ -214,26 +216,75 @@ Install the **`[instagram]`** extra ([Python dependencies](#python-dependencies)
 ### 2. Prerequisites (Meta)
 
 - **Instagram Professional** (Business or Creator) linked to a **Facebook Page**.
-- **Meta Developer** app ([developers.facebook.com](https://developers.facebook.com/)) with the products / permissions Meta currently requires for [Instagram messaging](https://developers.facebook.com/docs/messenger-platform/instagram/get-started/) (e.g. `instagram_manage_messages` and related Page permissions — check the latest “Get started” and **App Review** docs).
-- **Public HTTPS URL** for **Meta** webhooks when `useWebhook` is `true` (for local dev, use **ngrok** or similar in front of `webhookPort`). If you start with **[polling only](#starting-without-public-meta-webhooks-polling-only)** (`useWebhook: false`), you do not register a Meta callback yet; **Slack** approvals still work over **Socket Mode** (outbound connection from nanobot — no public Slack URL).
+- **Meta Developer** app ([developers.facebook.com](https://developers.facebook.com/)) per Instagram account (internal-use apps are fine — see [multi-account runbook](instagram_multi_account_meta_setup.md)).
+- **Public HTTPS URL** for **Meta** webhooks only when `useWebhook` is `true` (for local dev, use **ngrok** or similar in front of `webhookPort`). If you start with **[polling only](#starting-without-public-meta-webhooks-polling-only)** (`useWebhook: false`), you do **not** register a Meta callback URL; **Slack** approvals still work over **Socket Mode** (outbound connection from nanobot — no public Slack URL).
 
-### 3. Meta app: secrets, webhook, Page token, Page ID
+### 3. Meta app — polling only (`useWebhook: false`)
 
-**If you use [polling only](#starting-without-public-meta-webhooks-polling-only) first (`useWebhook: false`):** skip Meta webhook URL setup below; you only need **Page access token** and **Page ID** for the Graph poll. Add **`appSecret`** / **`verifyToken`** and subscribe webhooks when you turn **`useWebhook`** on.
+Use this path when you cannot expose a public HTTPS endpoint yet. Nanobot pulls new DMs via Graph on a timer; human-approved replies still go out with **`POST /me/messages`** using the same Page token.
 
-**If you use Meta webhooks (`useWebhook: true`):**
+**Configure on Meta (repeat per Instagram account):**
 
-1. **App Dashboard** → note **App secret** → maps to that account’s `appSecret` in `accounts[]`.
+1. **Instagram + Page**
+   - Confirm the account is **Professional** (Business or Creator) and linked to the correct **Facebook Page**.
+   - Your Meta Developer login must have at least **Moderate** task access on that Page ([Page tasks](https://developers.facebook.com/docs/pages-api/overview#tasks)).
+
+2. **Create a Meta app** ([developers.facebook.com/apps](https://developers.facebook.com/apps/))
+   - One app **per** Instagram account (recommended for multi-brand routing).
+   - Add the products Meta’s current [Instagram Messaging get started](https://developers.facebook.com/docs/messenger-platform/instagram/get-started/) guide requires (typically **Messenger** / Instagram messaging on the app).
+   - For **your own** business assets, follow [Apps for your own business](https://developers.facebook.com/docs/messenger-platform/instagram/app-review/apps-for-your-own-business) — you usually do **not** need full App Review before testing on Pages you control.
+
+3. **Grant messaging permissions and get a Page access token**
+   - Via [Graph API Explorer](https://developers.facebook.com/tools/explorer/) or Facebook Login: request scopes Meta lists for Instagram messaging — at minimum **`instagram_manage_messages`**, plus **`instagram_basic`** and **`pages_manage_metadata`** (names can change; use Meta’s get-started doc as source of truth).
+   - Call **`GET /me/accounts`** with the User token → note the **`id`** of the Page linked to Instagram → **`pageId`** in nanobot config.
+   - Exchange for a **long-lived Page access token** ([long-lived Page token guide](https://developers.facebook.com/docs/facebook-login/guides/access-tokens/get-long-lived#get-a-long-lived-page-access-token)) → **`pageAccessToken`** in nanobot config.
+   - Optional shortcut: **App Dashboard → Messenger → Instagram Settings** can generate Page tokens when Meta shows that tool for your app.
+
+4. **Connect the Page to your app**
+   - In the app dashboard, under **Messenger → Instagram** (or **Add products → Instagram**), add / connect the Facebook Page tied to the Instagram account so the app can call messaging APIs for that Page.
+
+5. **Enable Instagram “Connected tools” (required for API access)**
+   - On the Instagram account: **Settings → Messages and story replies → Message controls → Connected tools → Allow access to messages** ([Meta get started §4](https://developers.facebook.com/docs/messenger-platform/instagram/get-started/)).
+   - Without this toggle, Graph poll and send calls may succeed for token setup but return empty or fail on live DMs.
+
+6. **Validate before starting nanobot**
+
+   ```http
+   GET https://graph.facebook.com/v19.0/{page-id}/conversations?platform=INSTAGRAM&access_token={pageAccessToken}
+   ```
+
+   Expect **HTTP 200** and a `data` array (empty is OK if no DMs yet). A permission error here means fix token scopes or Page/app linkage before relying on poll mode.
+
+7. **Optional: `igUserId`**
+   - If you know the Instagram professional account’s Graph user id, set **`igUserId`** on the account entry so poll mode can skip messages “from” your own account when Meta returns them in the thread list.
+
+**Do not configure yet (polling only):**
+
+| Meta dashboard item | Polling-only? |
+|---------------------|---------------|
+| Webhooks → Callback URL | **Skip** |
+| Webhooks → Verify token | **Skip** (no nanobot `verifyToken` until webhooks) |
+| App secret in nanobot config | **Skip** (only needed for webhook HMAC when `useWebhook: true`) |
+| Public HTTPS / `webhookPort` | **Skip** |
+| Subscribe webhook fields (`messages`, …) | **Skip** |
+
+You **do** still need the Meta app, Page connection, long-lived **`pageAccessToken`**, and **`pageId`** — polling and Slack-approved send both use Graph with that token.
+
+### 4. Meta app — webhooks (`useWebhook: true`)
+
+When you have a public URL, add webhook setup **on top of** the polling prerequisites above:
+
+1. **App Dashboard** → note **App secret** → that account’s **`appSecret`** in `accounts[]`.
 2. **Webhooks** ([Instagram / Messenger webhook docs](https://developers.facebook.com/docs/messenger-platform/instagram/features/webhook/)):
    - Callback URL: `https://YOUR_PUBLIC_HOST/webhook/instagram/{accountKey}` (must match the account’s `accountKey` in config).
-   - **Verify token**: any long random string you choose → that account’s `verifyToken` (must match exactly).
+   - **Verify token**: any long random string you choose → that account’s **`verifyToken`** (must match exactly).
    - Subscribe to **messages** (and any other fields Meta lists for Instagram messaging).
-3. **Page access token** with permissions for Instagram messaging (long-lived token recommended for servers). Typical flow: User token with needed scopes → [Page access token](https://developers.facebook.com/docs/pages/access-tokens) → `pageAccessToken` on the account entry.
-4. **Page ID** (numeric string for the Facebook Page linked to Instagram) → `pageId` on the account entry. Required for **poll fallback** (`GET /{page-id}/conversations?platform=INSTAGRAM`). Optional for webhook-only if you disable polling and accept no Graph backfill.
+   - Subscribe the **Page** to this app’s webhook (same Page as `pageId`).
+3. Keep **`pageId`** + **`pageAccessToken`** — still required if **`pollFallbackEnabled`** is `true` (default), or for thread history on Slack review cards.
 
 Use [Graph API Explorer](https://developers.facebook.com/tools/explorer/) to confirm `/{page-id}/conversations?platform=INSTAGRAM` works with your token.
 
-### 4. Slack app (draft review & Socket Mode)
+### 5. Slack app (draft review & Socket Mode)
 
 1. Create a Slack app → **OAuth scopes** for the bot (minimum): `chat:write`, `chat:update`, `views.open` (for Edit & Send modal).
 2. Install to workspace; copy **Bot User OAuth Token** → `slackBotToken` (`xoxb-...`).
@@ -241,11 +292,13 @@ Use [Graph API Explorer](https://developers.facebook.com/tools/explorer/) to con
 4. **Socket Mode** → enable it. **Basic Information** → **App-Level Tokens** → **Generate token** with scope **`connections:write`** → `slackAppToken` (`xapp-...`).
 5. You do **not** need **Interactivity** “Request URL” for Instagram (no `/slack/actions` in nanobot). Interactivity still works when delivered over Socket Mode.
 
-### 5. Networking / ports
+### 6. Networking / ports
 
-Default bind: **`webhookHost`** `0.0.0.0`, **`webhookPort`** `5005`. When **`useWebhook`** is **`true`**, put TLS termination (or ngrok) in front so **Meta** can reach `https://.../webhook/instagram/{accountKey}`. Slack does not call this URL for Instagram button actions (Socket Mode).
+Default bind: **`webhookHost`** `0.0.0.0`, **`webhookPort`** `5005`. When **`useWebhook`** is **`true`**, put TLS termination (or ngrok) in front so **Meta** can reach `https://.../webhook/instagram/{accountKey}`. When **`useWebhook`** is **`false`**, nanobot does **not** start the Meta webhook HTTP server — no inbound port needs to be exposed for Instagram. Slack does not call this URL for Instagram button actions (Socket Mode).
 
-### 6. `~/.nanobot/config.json` — `channels.instagram`
+### 7. `~/.nanobot/config.json` — `channels.instagram`
+
+**Webhook mode** (after Meta callback is registered — [§4](#4-meta-app--webhooks-usewebhook-true)):
 
 ```json
 {
@@ -278,19 +331,47 @@ Default bind: **`webhookHost`** `0.0.0.0`, **`webhookPort`** `5005`. When **`use
 }
 ```
 
-- **`useWebhook`:** `true` = Meta pushes DMs immediately. `false` = poll-only (needs per-account `pageId` + token); use if you cannot expose webhooks yet.
+**Polling-only mode** (no Meta webhook — [§3](#3-meta-app--polling-only-usewebhook-false)):
+
+```json
+{
+  "channels": {
+    "instagram": {
+      "enabled": true,
+      "consentGranted": true,
+      "useWebhook": false,
+      "pollIntervalSeconds": 60,
+      "slackBotToken": "xoxb-...",
+      "slackDraftChannel": "C0XXXXXXXXX",
+      "slackAppToken": "xapp-...",
+      "allowFrom": ["*"],
+      "accounts": [
+        {
+          "accountKey": "brand_main",
+          "label": "Brand Main",
+          "pageId": "your-facebook-page-id",
+          "pageAccessToken": "your-long-lived-page-access-token",
+          "igUserId": ""
+        }
+      ]
+    }
+  }
+}
+```
+
+- **`useWebhook`:** `true` = Meta pushes DMs immediately. `false` = poll-only (needs per-account `pageId` + `pageAccessToken` only — no `appSecret` / `verifyToken`); use if you cannot expose webhooks yet.
 - **`pollFallbackEnabled`:** when `true` with webhooks, still polls the Conversations API on an interval (≤60s) to catch missed deliveries.
 - **`igUserId`:** optional; when set with **poll** mode, messages “from” that ID can be skipped to avoid treating your bot as the customer (if Meta returns your IGSID there).
 
-### 7. Multiple Instagram accounts (internal app per account)
+### 8. Multiple Instagram accounts (internal app per account)
 
-Use one **`accounts`** array entry per Instagram account. Each account should have its **own internal-use Meta app** (`appSecret`, `verifyToken`, `pageAccessToken`, `pageId`). Nanobot routes inbound DMs and approved sends by `accountKey`.
+Use one **`accounts`** array entry per Instagram account. Each account should have its **own internal-use Meta app** with its own **`pageAccessToken`** and **`pageId`** (add **`appSecret`** / **`verifyToken`** when you enable webhooks). Nanobot routes inbound DMs and approved sends by `accountKey`.
 
-**Poll-first (recommended to start):** set `useWebhook: false`. Only `pageId` + `pageAccessToken` are required per account.
+**Poll-first (recommended to start):** set `useWebhook: false`. Only `pageId` + `pageAccessToken` are required per account in nanobot config (Meta app + Page token setup still required — see [§3](#3-meta-app--polling-only-usewebhook-false)).
 
 **Webhooks later:** register each Meta app to  
 `https://YOUR_PUBLIC_HOST/webhook/instagram/{accountKey}`  
-(with matching per-account `verifyToken` / `appSecret`).
+(with matching per-account `verifyToken` / `appSecret` in config — see [§4](#4-meta-app--webhooks-usewebhook-true)).
 
 Full Meta setup steps: [`docs/instagram_multi_account_meta_setup.md`](instagram_multi_account_meta_setup.md).
 
@@ -312,17 +393,14 @@ Full Meta setup steps: [`docs/instagram_multi_account_meta_setup.md`](instagram_
           "label": "Brand Main",
           "pageId": "111111111111111",
           "pageAccessToken": "EAAB...",
-          "igUserId": "",
-          "appSecret": "secret-for-brand-main-app",
-          "verifyToken": "verify-token-brand-main"
+          "igUserId": ""
         },
         {
           "accountKey": "brand_outlet",
           "label": "Brand Outlet",
           "pageId": "222222222222222",
           "pageAccessToken": "EAAB...",
-          "appSecret": "secret-for-brand-outlet-app",
-          "verifyToken": "verify-token-brand-outlet"
+          "igUserId": ""
         }
       ]
     }
@@ -360,9 +438,10 @@ Install **`[gmail]`** as in [Python dependencies](#python-dependencies) (`pip in
 - **Mechanism:** Meta **POST** to your HTTPS URL with JSON body. **`X-Hub-Signature-256`**: `sha256=` + HMAC-SHA256 of **raw POST body** using the app secret ([Instagram Messaging webhooks](https://developers.facebook.com/docs/messenger-platform/instagram/features/webhook/)).
 - **Verification GET:** Echo **`hub.challenge`** as **200** plain text after validating **`hub.verify_token`**.
 
-### Inbound — poll fallback (≤ 1 minute)
+### Inbound — poll (primary when `useWebhook: false`, or fallback when `pollFallbackEnabled: true`)
 
 - **Mechanism:** `GET .../{page-id}/conversations?platform=INSTAGRAM&...` ([Page conversations](https://developers.facebook.com/docs/graph-api/reference/page/conversations/)).
+- **Meta prerequisites:** long-lived Page access token with `instagram_manage_messages` (and related scopes), Page linked to app, Instagram **Connected tools → Allow access to messages** enabled. No webhook URL on Meta.
 
 ### Outbound — send (human only, Slack)
 
