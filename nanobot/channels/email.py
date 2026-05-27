@@ -58,6 +58,8 @@ class EmailConfig(Base):
     max_body_chars: int = 12000
     subject_prefix: str = "Re: "
     allow_from: list[str] = Field(default_factory=list)
+    # Glob patterns (fnmatch); matching subjects are dropped before agent processing (not marked \\Seen).
+    drop_subject_patterns: list[str] = Field(default_factory=list)
 
     # Email authentication verification (anti-spoofing)
     verify_dkim: bool = True   # Require Authentication-Results with dkim=pass
@@ -419,6 +421,17 @@ class EmailChannel(BaseChannel):
                         client.store(imap_id, "+FLAGS", "\\Seen")
                     continue
 
+                subject = self._decode_header_value(parsed.get("Subject", ""))
+                drop_pattern = self._matching_drop_subject_pattern(subject)
+                if drop_pattern is not None:
+                    self.logger.info(
+                        "Subject {!r} dropped: matches dropSubjectPatterns {!r}",
+                        subject,
+                        drop_pattern,
+                    )
+                    self._remember_processed_uid(uid, dedupe, cycle_uids)
+                    continue
+
                 # --- Anti-spoofing: verify Authentication-Results ---
                 spf_pass, dkim_pass = self._check_authentication_results(parsed)
                 if self.config.verify_spf and not spf_pass:
@@ -444,7 +457,6 @@ class EmailChannel(BaseChannel):
                         client.store(imap_id, "+FLAGS", "\\Seen")
                     continue
 
-                subject = self._decode_header_value(parsed.get("Subject", ""))
                 date_value = parsed.get("Date", "")
                 message_id = parsed.get("Message-ID", "").strip()
                 body = self._extract_text_body(parsed)
@@ -533,6 +545,29 @@ class EmailChannel(BaseChannel):
         """Return True when an inbound sender belongs to the bot itself."""
         normalized_sender = self._normalize_address(sender)
         return bool(normalized_sender) and normalized_sender in self._self_addresses
+
+    def _matching_drop_subject_pattern(self, subject: str) -> str | None:
+        """Return the first matching dropSubjectPatterns entry, or None."""
+        if not self.config.drop_subject_patterns:
+            return None
+        subj = (subject or "").casefold()
+        for pat in self.config.drop_subject_patterns:
+            p = (pat or "").strip()
+            if not p:
+                continue
+            folded = p.casefold()
+            try:
+                matched = fnmatch(subj, folded)
+            except Exception as exc:
+                self.logger.warning(
+                    "Invalid dropSubjectPatterns entry {!r} ignored: {}",
+                    p,
+                    exc,
+                )
+                continue
+            if matched:
+                return p
+        return None
 
     def _remember_processed_uid(self, uid: str, dedupe: bool, cycle_uids: set[str]) -> None:
         """Track a fetched UID so skipped messages are not reprocessed forever."""

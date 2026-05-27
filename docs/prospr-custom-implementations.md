@@ -170,6 +170,7 @@ Install from repo root: `pip install -e '.[gmail,instagram]'`
 - **Final reply reporting:** When `outboundSlackChannel` is set and `channels.slack` is enabled, the channel manager posts a short **heads-up** to that Slack target (header: `EMAIL DRAFT: From: … · Subject: … · Received at …`; no Message-ID), then a **thread reply** with truncated customer email body (`metadata.email_body`, max ~1 page) and the agent’s final reply inline. Progress/stream/retry traffic is not rerouted. Human replies in that thread follow normal Slack channel rules (`groupPolicy`, mentions). If `outboundSlackChannel` is missing, the final outbound is dropped with a warning (no email send attempt). Set `sendProgress: false` on email to suppress mid-turn outbound attempts entirely.
 - **`message()` suppressed in email sessions:** [`MessageTool`](../nanobot/agent/tools/message.py) returns a `Message suppressed` notice for any `message()` call when the active session channel is `email`. This avoids duplicate heads-up posts. Errors and status notes should go in the final reply text — they appear in the threaded `Agent reply` section of the deterministic heads-up automatically.
 - **`autoReplyEnabled`:** Present on `EmailConfig` (default `true`) but **not consulted** for delivery; outbound is blocked unconditionally in code.
+- **`dropSubjectPatterns`:** List of glob patterns (`fnmatch`, case-insensitive) matched against the decoded inbound **Subject** immediately after self-sent filtering and **before** SPF/DKIM/`allowFrom` checks — so auto-replies and bounces that would fail auth still get dropped. When any pattern matches, the message is dropped before agent processing (no Slack heads-up, no session). The message is **not** marked `\\Seen` on IMAP (stays unread in the mailbox). In-process UID dedupe avoids re-delivering the same message on later polls in one gateway run; after a restart, the same UNSEEN message is fetched and dropped again. Brackets in patterns are **character classes** (same as shell globs), not literal text — use `*auto-reply*` rather than `*[Auto-Reply]*` unless you intend a class. Avoid a lone `*` pattern unless you intend to drop every message.
 
 **Gmail IMAP credentials (`imapPassword`)** — separate from `tools.gmailDraft` OAuth:
 
@@ -204,7 +205,8 @@ Full mailbox + OAuth draft setup: [`docs/prospr-customersupport-additions.md`](p
       "pollIntervalSeconds": 60,
       "sendProgress": false,
       "outboundSlackChannel": "#customer-support-ai",
-      "allowFrom": ["*"]
+      "allowFrom": ["*"],
+      "dropSubjectPatterns": ["*auto-reply*", "Out of office*"]
     },
     "slack": {
       "enabled": true,
