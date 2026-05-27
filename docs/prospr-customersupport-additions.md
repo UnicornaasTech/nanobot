@@ -8,11 +8,11 @@ This fork wires **Gmail (IMAP + drafts)** and **Instagram DMs (Meta + Slack)** i
 
 Optional extras are defined in **`pyproject.toml`** at the repo root:
 
-| Extra | Purpose |
-|--------|--------|
-| **`gmail`** | Google OAuth + Gmail API client libraries for `create_gmail_draft` |
+| Extra           | Purpose                                                                                                                                                               |
+| --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`gmail`**     | Google OAuth + Gmail API client libraries for `create_gmail_draft`                                                                                                    |
 | **`instagram`** | Flask + werkzeug (Meta **`/webhook/instagram/{accountKey}`** when `useWebhook` is `true`); Slack draft approvals use **Socket Mode** (no Slack HTTP route in nanobot) |
-| **`dev`** | pytest, ruff, Flask for tests, etc. |
+| **`dev`**       | pytest, ruff, Flask for tests, etc.                                                                                                                                   |
 
 ### Checked-out source (recommended for this fork)
 
@@ -64,6 +64,8 @@ Inbound mail is **always pulled** over IMAP (nanobot connects to Gmail). There i
 ### Slack (human Send / Edit / Discard)
 
 Instagram draft approvals use **Slack Socket Mode** only: button clicks and modal submissions arrive over the app’s WebSocket connection. **No** public **Request URL** / **`/slack/actions`** endpoint is required for Instagram. Draft messages are still posted **outbound** via `chat.postMessage` using the bot token.
+
+You may set **`slackDraftChannel`** to the same channel `channels.slack` uses for other support traffic (including with **`groupPolicy: "open"`**). Review cards from the bot are not treated as customer input; **Send / Edit & Send / Discard** (`ig_*` action IDs) do not trigger the main Slack agent when both channels share one Slack app (see [`docs/prospr-custom-implementations.md`](prospr-custom-implementations.md)).
 
 **Example — polling-first `channels.email` snippet**
 
@@ -124,7 +126,7 @@ Follow the official flow (adapted for our config keys and scope):
 3. **OAuth consent screen** ([Branding / Audience / scopes](https://developers.google.com/workspace/guides/configure-oauth-consent)):
    - Configure app name, support email, etc.
    - Add **Data access** scopes: `gmail.compose` and `gmail.readonly` (see [Gmail API scopes](https://developers.google.com/workspace/gmail/api/auth/scopes)).
-   - *External* user type is required if the mailbox owner is outside your Workspace org; you may need verification for wide production use. *Internal* works for Workspace-only testing.
+   - _External_ user type is required if the mailbox owner is outside your Workspace org; you may need verification for wide production use. _Internal_ works for Workspace-only testing.
 4. **Create OAuth client**: [Clients](https://console.developers.google.com/auth/clients) → type **Desktop app** (same pattern as the [Python quickstart](https://developers.google.com/workspace/gmail/api/quickstart/python)).
 5. Note the **client ID** and **client secret** from the downloaded JSON (`installed.client_id`, `installed.client_secret`).
 
@@ -235,7 +237,7 @@ Use this path when you cannot expose a public HTTPS endpoint yet. Nanobot pulls 
    - For **your own** business assets, follow [Apps for your own business](https://developers.facebook.com/docs/messenger-platform/instagram/app-review/apps-for-your-own-business) — you usually do **not** need full App Review before testing on Pages you control.
 
 3. **Grant messaging permissions and get a Page access token**
-   - Via [Graph API Explorer](https://developers.facebook.com/tools/explorer/) or Facebook Login: request scopes Meta lists for Instagram messaging — at minimum **`instagram_manage_messages`**, plus **`instagram_basic`** and **`pages_manage_metadata`** (names can change; use Meta’s get-started doc as source of truth).
+   - Via [Graph API Explorer](https://developers.facebook.com/tools/explorer/) or Facebook Login: request scopes Meta lists for Instagram messaging — at minimum **`instagram_manage_messages`**, plus **`instagram_basic`** and **`pages_manage_metadata`**, and if it's a business portfolio page, **`business_management`** (names can change; use Meta’s get-started doc as source of truth).
    - Call **`GET /me/accounts`** with the User token → note the **`id`** of the Page linked to Instagram → **`pageId`** in nanobot config.
    - Exchange for a **long-lived Page access token** ([long-lived Page token guide](https://developers.facebook.com/docs/facebook-login/guides/access-tokens/get-long-lived#get-a-long-lived-page-access-token)) → **`pageAccessToken`** in nanobot config.
    - Optional shortcut: **App Dashboard → Messenger → Instagram Settings** can generate Page tokens when Meta shows that tool for your app.
@@ -260,13 +262,13 @@ Use this path when you cannot expose a public HTTPS endpoint yet. Nanobot pulls 
 
 **Do not configure yet (polling only):**
 
-| Meta dashboard item | Polling-only? |
-|---------------------|---------------|
-| Webhooks → Callback URL | **Skip** |
-| Webhooks → Verify token | **Skip** (no nanobot `verifyToken` until webhooks) |
-| App secret in nanobot config | **Skip** (only needed for webhook HMAC when `useWebhook: true`) |
-| Public HTTPS / `webhookPort` | **Skip** |
-| Subscribe webhook fields (`messages`, …) | **Skip** |
+| Meta dashboard item                      | Polling-only?                                                   |
+| ---------------------------------------- | --------------------------------------------------------------- |
+| Webhooks → Callback URL                  | **Skip**                                                        |
+| Webhooks → Verify token                  | **Skip** (no nanobot `verifyToken` until webhooks)              |
+| App secret in nanobot config             | **Skip** (only needed for webhook HMAC when `useWebhook: true`) |
+| Public HTTPS / `webhookPort`             | **Skip**                                                        |
+| Subscribe webhook fields (`messages`, …) | **Skip**                                                        |
 
 You **do** still need the Meta app, Page connection, long-lived **`pageAccessToken`**, and **`pageId`** — polling and Slack-approved send both use Graph with that token.
 
@@ -291,6 +293,7 @@ Use [Graph API Explorer](https://developers.facebook.com/tools/explorer/) to con
 3. Create or pick a channel for drafts; copy its **channel ID** (starts with `C`) → `slackDraftChannel`.
 4. **Socket Mode** → enable it. **Basic Information** → **App-Level Tokens** → **Generate token** with scope **`connections:write`** → `slackAppToken` (`xapp-...`).
 5. You do **not** need **Interactivity** “Request URL” for Instagram (no `/slack/actions` in nanobot). Interactivity still works when delivered over Socket Mode.
+6. If **`slackDraftChannel`** is your shared support channel and you reuse the same bot tokens under `channels.slack`, Instagram approval buttons will not start an agent turn (`groupPolicy: "open"` is fine for normal staff messages).
 
 ### 6. Networking / ports
 

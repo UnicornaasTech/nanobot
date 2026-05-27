@@ -57,6 +57,8 @@ SLACK_DOWNLOAD_TIMEOUT = 30.0
 # to websockets.connect — see slack_sdk.socket_mode.websockets.SocketModeClient.connect.
 SLACK_SOCKET_CONNECT_TIMEOUT_S = 45.0
 _HTML_DOWNLOAD_PREFIXES = (b"<!doctype html", b"<html")
+# Instagram draft-review buttons (channels/instagram.py); ignore when both channels share one Slack app.
+_INSTAGRAM_ACTION_ID_PREFIX = "ig_"
 
 
 class SlackChannel(BaseChannel):
@@ -507,6 +509,13 @@ class SlackChannel(BaseChannel):
         payload = req.payload or {}
         actions = payload.get("actions") or []
         if not actions:
+            return
+        if payload.get("type") == "block_actions" and any(
+            str(action.get("action_id") or "").startswith(_INSTAGRAM_ACTION_ID_PREFIX)
+            for action in actions
+            if isinstance(action, dict)
+        ):
+            self.logger.debug("Ignoring Instagram draft-review block action")
             return
         value = str(actions[0].get("value") or "")
         user_info = payload.get("user") or {}

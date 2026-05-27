@@ -35,6 +35,12 @@ When `channels.slack.groupPolicy` is **`mention`** (default), messages in channe
 
 **Trigger:** `channels.slack.groupPolicy: "mention"` + message in a channel/group without `@bot` mention. DMs (`im`) always get full replies.
 
+### Slack: ignore Instagram draft-review button clicks
+
+When `channels.instagram` and `channels.slack` share the **same** Slack app (`botToken` / `appToken` duplicated as `slackBotToken` / `slackAppToken`), Slack delivers interactive payloads to **both** Socket Mode clients. **`SlackChannel._on_block_action`** ignores `block_actions` whose `action_id` starts with **`ig_`** (Instagram Send / Edit & Send / Discard) so they are not forwarded to the agent. Review cards posted by the bot are already ignored as `subtype: bot_message`. Normal Slack UI buttons (`btn_*`) are unchanged.
+
+**Typical setup:** `slackDraftChannel` is the same support channel as other traffic, with `channels.slack.groupPolicy: "open"` — human messages still get full agent replies; Instagram approval clicks do not.
+
 **Config example** (`~/.nanobot/config.json` fragment — merge with your existing file):
 
 ```json
@@ -256,6 +262,7 @@ New channel: Instagram DMs → agent → Slack review → human Send / Edit & Se
 | **Draft tool**             | `create_instagram_draft` stores text in `instagram_review_state`; channel `consume_draft()` on turn end.                                                                                                                                  |
 | **No reply suggested**     | If the agent does **not** call `create_instagram_draft`, a Slack card is still posted (“no reply suggested”); **Send** is hidden; **Edit & Send** remains so humans can reply manually.                                                   |
 | **Slack approvals**        | Socket Mode (`slackAppToken` + `slackBotToken`). Interactive payloads ACK’d on the socket; send/discard run in background threads.                                                                                                        |
+| **Shared Slack app**       | If the same `xoxb` / `xapp` is used for `channels.slack`, the Slack channel ignores `ig_*` block actions (see [Slack: ignore Instagram draft-review button clicks](#slack-ignore-instagram-draft-review-button-clicks)).                                                                                  |
 | **Meta inbound — webhook** | When `useWebhook` is true: Flask on `webhookHost`:`webhookPort`. Per account: `GET`/`POST` `/webhook/instagram/{accountKey}` with per-account `verifyToken` / `appSecret` HMAC (`X-Hub-Signature-256`).                                   |
 | **Meta inbound — poll**    | When `useWebhook` is false **or** `pollFallbackEnabled` is true: Graph `GET /v19.0/{pageId}/conversations?platform=INSTAGRAM` on each account on `pollIntervalSeconds` (clamped 5–60). Requires `pageId` + `pageAccessToken` per account. |
 | **Meta outbound**          | `_send_instagram_message()` → `POST /v19.0/me/messages` with that account’s `pageAccessToken`. Only from Slack button/modal handlers.                                                                                                     |
