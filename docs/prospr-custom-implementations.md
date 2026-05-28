@@ -142,6 +142,9 @@ See also upstream memory overview: [`docs/memory.md`](memory.md).
 - **`edit_file`** (`filesystem.py`): Stale-read warning included in `old_text` not-found errors when applicable.
 - **Provider retry** (`base.py`): Also retry on truncated/non-JSON bodies (`expecting value`, `jsondecodeerror`).
 - **Empty-response fallback** (`fallback_provider.py`, `runner.py`): When the primary model returns a blank successful reply (after the usual two silent retries on the same model), configured `agents.defaults.fallbackModels` are tried once each before the no-tools finalization prompt — same presets as error failover, skipped when answer text was already streamed. If finalization is still blank, fallbacks are tried once more.
+- **MCP endpoint loop protection** (`nanobot/utils/runtime.py`, `nanobot/agent/runner.py`): Per-turn throttle for repeated identical failing `mcp_*` tool calls (same tool name, normalized arguments, and error signature; third attempt blocked). Non-retryable MCP `400`/`404` responses with `validation_error` or `object_not_found` return an explicit “stop retrying this endpoint” payload instead of the generic “try a different approach” hint — reduces runaway Notion-style retry loops and downstream LLM 300s timeouts.
+
+**Tests:** `tests/utils/test_mcp_endpoint_throttle.py`, `tests/agent/test_runner_tool_execution.py`, `tests/agent/test_runner_safety.py`
 
 ### Unified session: delivery-target guard (`unified_delivery.py`)
 

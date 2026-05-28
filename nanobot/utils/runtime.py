@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from pathlib import Path
 from typing import Any
@@ -12,8 +14,17 @@ from nanobot.utils.helpers import stringify_text_blocks
 
 _MAX_REPEAT_EXTERNAL_LOOKUPS = 2
 
+# Third identical failing MCP endpoint call in a turn is blocked.
+_MAX_REPEAT_MCP_ENDPOINT_ATTEMPTS = 2
+
 # Third same-target workspace violation in a turn escalates to "stop retrying".
 _MAX_REPEAT_WORKSPACE_VIOLATIONS = 2
+
+_NON_RETRYABLE_MCP_STATUS_CODES = frozenset({400, 404})
+_NON_RETRYABLE_MCP_ERROR_CODES = frozenset({
+    "validation_error",
+    "object_not_found",
+})
 
 EMPTY_FINAL_RESPONSE_MESSAGE = (
     "I completed the tool steps but couldn't produce a final answer. "
@@ -167,4 +178,203 @@ def repeated_workspace_violation_error(
         "If the user genuinely needs this resource, tell them you cannot "
         "access it and ask how they want to proceed (e.g. copy the file "
         "into the workspace, or disable restrict_to_workspace for this run)."
+    )
+
+
+def _is_mcp_tool(tool_name: str) -> bool:
+    return tool_name.startswith("mcp_")
+
+
+def _normalize_mcp_arguments(arguments: dict[str, Any]) -> str:
+    try:
+        return json.dumps(arguments, sort_keys=True, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return repr(arguments)
+
+
+def _hash_mcp_arguments(arguments: dict[str, Any]) -> str:
+    normalized = _normalize_mcp_arguments(arguments)
+    return hashlib.sha256(normalized.encode()).hexdigest()[:16]
+
+
+def parse_mcp_error_payload(result_text: str) -> dict[str, Any] | None:
+    """Try to parse structured MCP/HTTP error JSON from tool result text."""
+    text = (result_text or "").strip()
+    if not text.startswith("{") or "}" not in text:
+        return None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def extract_mcp_error_signature(result_text: str) -> str:
+    """Extract a stable error signature from MCP tool result text."""
+    text = (result_text or "").strip()
+    if not text:
+        return "empty"
+
+    data = parse_mcp_error_payload(text)
+    if data is not None:
+        parts: list[str] = []
+        status = data.get("status")
+        if status is not None:
+            parts.append(f"status:{status}")
+        code = data.get("code")
+        if isinstance(code, str) and code.strip():
+            parts.append(f"code:{code.strip().lower()}")
+        message = data.get("message")
+        if isinstance(message, str) and message.strip():
+            parts.append(f"msg:{message.strip().lower()[:120]}")
+        if parts:
+            return "|".join(parts)
+
+    lowered = text.lower().replace("\n", " ")
+    return lowered[:200]
+
+
+def mcp_attempt_signature(tool_name: str, arguments: dict[str, Any]) -> str | None:
+    """Stable signature for MCP tool + arguments (without error text)."""
+    if not _is_mcp_tool(tool_name):
+        return None
+    return f"mcp_attempt:{tool_name}:{_hash_mcp_arguments(arguments)}"
+
+
+def mcp_endpoint_signature(
+    tool_name: str,
+    arguments: dict[str, Any],
+    result_text: str,
+) -> str | None:
+    """Stable signature for repeated failing MCP endpoint calls (includes error)."""
+    attempt = mcp_attempt_signature(tool_name, arguments)
+    if attempt is None:
+        return None
+    error_sig = extract_mcp_error_signature(result_text)
+    return f"{attempt}:{error_sig}"
+
+
+def is_non_retryable_mcp_4xx(result_text: str) -> bool:
+    """True when *result_text* looks like a non-retryable MCP 4xx client error."""
+    data = parse_mcp_error_payload(result_text)
+    if data is not None:
+        try:
+            status = int(data.get("status", 0))
+        except (TypeError, ValueError):
+            status = 0
+        code = str(data.get("code") or "").strip().lower()
+        if status in _NON_RETRYABLE_MCP_STATUS_CODES and code in _NON_RETRYABLE_MCP_ERROR_CODES:
+            return True
+
+    lowered = (result_text or "").lower()
+    if not any(str(code) in lowered for code in _NON_RETRYABLE_MCP_ERROR_CODES):
+        return False
+    return any(
+        f'"status":{status}' in lowered.replace(" ", "")
+        or f'"status": {status}' in lowered
+        for status in _NON_RETRYABLE_MCP_STATUS_CODES
+    )
+
+
+def is_mcp_tool_failure_result(tool_name: str, result: Any) -> bool:
+    """True when an MCP tool returned a failure payload (not a successful body)."""
+    if not _is_mcp_tool(tool_name) or not isinstance(result, str):
+        return False
+    text = result.strip()
+    if not text:
+        return False
+    if text.startswith("Error"):
+        return True
+    if text.startswith("(") and "mcp" in text.lower():
+        return True
+
+    data = parse_mcp_error_payload(text)
+    if data is None:
+        return False
+    if data.get("object") == "error":
+        return True
+    try:
+        status = int(data.get("status", 0))
+    except (TypeError, ValueError):
+        return False
+    return status >= 400
+
+
+def non_retryable_mcp_error(tool_name: str, result_text: str) -> str | None:
+    """Return a stop-retrying payload for non-retryable MCP 4xx failures."""
+    if not _is_mcp_tool(tool_name) or not is_non_retryable_mcp_4xx(result_text):
+        return None
+
+    data = parse_mcp_error_payload(result_text) or {}
+    message = str(data.get("message") or "").strip()
+    code = str(data.get("code") or "").strip()
+    status = str(data.get("status") or "").strip()
+    detail = message or result_text.strip()[:500]
+
+    return (
+        f"Error: MCP endpoint {tool_name} returned a non-retryable "
+        f"{status or '4xx'} error ({code or 'client_error'}).\n"
+        f"{detail}\n\n"
+        "This is a hard policy boundary for this endpoint in this turn. "
+        "Do NOT call this same MCP tool with the same intent again. "
+        "Use a different supported MCP tool or endpoint, ask the user to fix "
+        "permissions or sharing (for 404/object_not_found), or explain the "
+        "API/schema mismatch (for 400/validation_error) and propose a manual workaround."
+    )
+
+
+def repeated_mcp_endpoint_error(
+    tool_name: str,
+    arguments: dict[str, Any],
+    result_text: str,
+    seen_counts: dict[str, int],
+) -> str | None:
+    """Block repeated identical failing MCP endpoint calls after a small retry budget."""
+    signature = mcp_endpoint_signature(tool_name, arguments, result_text)
+    if signature is None:
+        return None
+    count = seen_counts.get(signature, 0) + 1
+    seen_counts[signature] = count
+    if count <= _MAX_REPEAT_MCP_ENDPOINT_ATTEMPTS:
+        return None
+    logger.warning(
+        "Blocking repeated MCP endpoint {} on attempt {}",
+        signature[:160],
+        count,
+    )
+    return (
+        f"Error: repeated MCP endpoint call blocked for {tool_name} "
+        f"(same arguments and error seen {count} times this turn).\n"
+        "Stop retrying this endpoint. Use results you already have, try a "
+        "different MCP tool or approach, or ask the user for missing access "
+        "or configuration."
+    )
+
+
+def mark_non_retryable_mcp_attempt(
+    tool_name: str,
+    arguments: dict[str, Any],
+    non_retryable_attempts: set[str],
+) -> None:
+    """Remember tool+args that hit a non-retryable MCP 4xx this turn."""
+    signature = mcp_attempt_signature(tool_name, arguments)
+    if signature is not None:
+        non_retryable_attempts.add(signature)
+
+
+def non_retryable_mcp_preblock(
+    tool_name: str,
+    arguments: dict[str, Any],
+    non_retryable_attempts: set[str],
+) -> str | None:
+    """Block before execute when this MCP endpoint already returned non-retryable 4xx."""
+    signature = mcp_attempt_signature(tool_name, arguments)
+    if signature is None or signature not in non_retryable_attempts:
+        return None
+    return (
+        f"Error: MCP endpoint {tool_name} already returned a non-retryable client error "
+        "for these arguments this turn.\n"
+        "Do NOT call this same MCP tool with the same intent again. "
+        "Use a different supported MCP tool or endpoint, or explain the blocker "
+        "to the user and propose a manual workaround."
     )
