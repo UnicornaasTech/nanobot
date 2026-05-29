@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import os
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
@@ -53,6 +54,7 @@ from nanobot.utils.runtime import (
     mcp_attempt_signature,
     non_retryable_mcp_error,
     non_retryable_mcp_preblock,
+    repeated_consecutive_tool_call_error,
     repeated_external_lookup_error,
     repeated_mcp_endpoint_error,
     repeated_workspace_violation_error,
@@ -282,11 +284,13 @@ class AgentRunner:
         stop_reason = "completed"
         tool_events: list[dict[str, str]] = []
         external_lookup_counts: dict[str, int] = {}
+        consecutive_tool_call_state: dict[str, Any] = {}
         # Per-turn throttle for repeated attempts against the same outside target.
         workspace_violation_counts: dict[str, int] = {}
         mcp_endpoint_counts: dict[str, int] = {}
         mcp_non_retryable_attempts: set[str] = set()
         mcp_repeat_blocked_attempts: set[str] = set()
+        mcp_repeat_blocked_details: dict[str, str] = {}
         empty_content_retries = 0
         length_recovery_count = 0
         had_injections = False
@@ -345,10 +349,12 @@ class AgentRunner:
                     tools_used=tools_used,
                     tool_events=tool_events,
                     external_lookup_counts=external_lookup_counts,
+                    consecutive_tool_call_state=consecutive_tool_call_state,
                     workspace_violation_counts=workspace_violation_counts,
                     mcp_endpoint_counts=mcp_endpoint_counts,
                     mcp_non_retryable_attempts=mcp_non_retryable_attempts,
                     mcp_repeat_blocked_attempts=mcp_repeat_blocked_attempts,
+                    mcp_repeat_blocked_details=mcp_repeat_blocked_details,
                     injection_cycles=injection_cycles,
                     iteration=iteration,
                     context=context,
@@ -415,10 +421,12 @@ class AgentRunner:
                             tools_used=tools_used,
                             tool_events=tool_events,
                             external_lookup_counts=external_lookup_counts,
+                            consecutive_tool_call_state=consecutive_tool_call_state,
                             workspace_violation_counts=workspace_violation_counts,
                             mcp_endpoint_counts=mcp_endpoint_counts,
                             mcp_non_retryable_attempts=mcp_non_retryable_attempts,
                             mcp_repeat_blocked_attempts=mcp_repeat_blocked_attempts,
+                            mcp_repeat_blocked_details=mcp_repeat_blocked_details,
                             injection_cycles=injection_cycles,
                             iteration=iteration,
                             context=context,
@@ -871,10 +879,12 @@ class AgentRunner:
         tools_used: list[str],
         tool_events: list[dict[str, str]],
         external_lookup_counts: dict[str, int],
+        consecutive_tool_call_state: dict[str, Any],
         workspace_violation_counts: dict[str, int],
         mcp_endpoint_counts: dict[str, int],
         mcp_non_retryable_attempts: set[str],
         mcp_repeat_blocked_attempts: set[str],
+        mcp_repeat_blocked_details: dict[str, str],
         injection_cycles: int,
         iteration: int,
         context: AgentHookContext,
@@ -917,10 +927,12 @@ class AgentRunner:
             spec,
             response.tool_calls,
             external_lookup_counts,
+            consecutive_tool_call_state,
             workspace_violation_counts,
             mcp_endpoint_counts,
             mcp_non_retryable_attempts,
             mcp_repeat_blocked_attempts,
+            mcp_repeat_blocked_details,
         )
         tool_events.extend(new_events)
         context.tool_results = list(results)
@@ -991,10 +1003,12 @@ class AgentRunner:
         spec: AgentRunSpec,
         tool_calls: list[ToolCallRequest],
         external_lookup_counts: dict[str, int],
+        consecutive_tool_call_state: dict[str, Any],
         workspace_violation_counts: dict[str, int],
         mcp_endpoint_counts: dict[str, int],
         mcp_non_retryable_attempts: set[str],
         mcp_repeat_blocked_attempts: set[str],
+        mcp_repeat_blocked_details: dict[str, str],
     ) -> tuple[list[Any], list[dict[str, str]], BaseException | None]:
         batches = self._partition_tool_batches(spec, tool_calls)
         tool_results: list[tuple[Any, dict[str, str], BaseException | None]] = []
@@ -1005,10 +1019,12 @@ class AgentRunner:
                         spec,
                         tool_call,
                         external_lookup_counts,
+                        consecutive_tool_call_state,
                         workspace_violation_counts,
                         mcp_endpoint_counts,
                         mcp_non_retryable_attempts,
                         mcp_repeat_blocked_attempts,
+                        mcp_repeat_blocked_details,
                     )
                     for tool_call in batch
                 ))
@@ -1020,10 +1036,12 @@ class AgentRunner:
                         spec,
                         tool_call,
                         external_lookup_counts,
+                        consecutive_tool_call_state,
                         workspace_violation_counts,
                         mcp_endpoint_counts,
                         mcp_non_retryable_attempts,
                         mcp_repeat_blocked_attempts,
+                        mcp_repeat_blocked_details,
                     )
                     tool_results.append(result)
                     batch_results.append(result)
@@ -1043,10 +1061,12 @@ class AgentRunner:
         spec: AgentRunSpec,
         tool_call: ToolCallRequest,
         external_lookup_counts: dict[str, int],
+        consecutive_tool_call_state: dict[str, Any],
         workspace_violation_counts: dict[str, int],
         mcp_endpoint_counts: dict[str, int],
         mcp_non_retryable_attempts: set[str],
         mcp_repeat_blocked_attempts: set[str],
+        mcp_repeat_blocked_details: dict[str, str],
     ) -> tuple[Any, dict[str, str], BaseException | None]:
         hint = "\n\n[Analyze the error above and try a different approach.]"
         mcp_args = (
@@ -1065,9 +1085,10 @@ class AgentRunner:
                 "status": "error",
                 "detail": "repeated external lookup blocked",
             }
-            if spec.fail_on_tool_error:
-                return lookup_error + hint, event, RuntimeError(lookup_error)
-            return lookup_error + hint, event, None
+            payload = lookup_error + hint
+            # Hard-stop once a repeated-call block is hit to prevent long
+            # no-progress loops inside a single turn.
+            return payload, event, RuntimeError(lookup_error)
         prepare_call = getattr(spec.tools, "prepare_call", None)
         tool, params, prep_error = None, tool_call.arguments, None
         if callable(prepare_call):
@@ -1093,15 +1114,40 @@ class AgentRunner:
             return prep_error + hint, event, (
                 RuntimeError(prep_error) if spec.fail_on_tool_error else None
             )
+        generic_repeat_error = repeated_consecutive_tool_call_error(
+            tool_call.name,
+            params if isinstance(params, dict) else {},
+            consecutive_tool_call_state,
+        )
+        if generic_repeat_error is not None:
+            event = {
+                "name": tool_call.name,
+                "status": "error",
+                "detail": self._event_detail("repeated_tool_call_blocked: ", generic_repeat_error),
+            }
+            return generic_repeat_error, event, RuntimeError(generic_repeat_error)
+        current_mcp_attempt = mcp_attempt_signature(tool_call.name, mcp_args)
+        # If another tool (or different MCP attempt) runs in between, the MCP
+        # repeat preblock should not remain latched.
+        if current_mcp_attempt is None:
+            mcp_endpoint_counts.clear()
+        if mcp_repeat_blocked_attempts and current_mcp_attempt not in mcp_repeat_blocked_attempts:
+            mcp_repeat_blocked_attempts.clear()
+            mcp_repeat_blocked_details.clear()
         mcp_preblocked = self._mcp_preblock_tool_call(
             tool_call=tool_call,
             arguments=mcp_args,
             mcp_endpoint_counts=mcp_endpoint_counts,
             mcp_non_retryable_attempts=mcp_non_retryable_attempts,
             mcp_repeat_blocked_attempts=mcp_repeat_blocked_attempts,
+            mcp_repeat_blocked_details=mcp_repeat_blocked_details,
         )
         if mcp_preblocked is not None:
             payload, event = mcp_preblocked
+            if event.get("detail", "").startswith("mcp_repeat_blocked:"):
+                # Hard-stop repeated MCP loop once the repeated endpoint is
+                # being preblocked in this turn.
+                return payload, event, RuntimeError(payload)
             if spec.fail_on_tool_error:
                 return payload, event, RuntimeError(payload)
             return payload, event, None
@@ -1130,6 +1176,8 @@ class AgentRunner:
                 ) for file_edit_tracker in file_edit_trackers],
             )
         try:
+            exec_args = json.dumps(params, ensure_ascii=False, default=str)
+            logger.info("Tool call: {}({})", tool_call.name, exec_args[:200])
             if tool is not None:
                 result = await tool.execute(**params)
             else:
@@ -1170,6 +1218,7 @@ class AgentRunner:
                 mcp_endpoint_counts=mcp_endpoint_counts,
                 mcp_non_retryable_attempts=mcp_non_retryable_attempts,
                 mcp_repeat_blocked_attempts=mcp_repeat_blocked_attempts,
+                mcp_repeat_blocked_details=mcp_repeat_blocked_details,
             )
             if mcp_handled is not None:
                 return mcp_handled
@@ -1192,6 +1241,7 @@ class AgentRunner:
                 mcp_endpoint_counts=mcp_endpoint_counts,
                 mcp_non_retryable_attempts=mcp_non_retryable_attempts,
                 mcp_repeat_blocked_attempts=mcp_repeat_blocked_attempts,
+                mcp_repeat_blocked_details=mcp_repeat_blocked_details,
             )
             if mcp_handled is not None:
                 return mcp_handled
@@ -1231,6 +1281,7 @@ class AgentRunner:
                 mcp_endpoint_counts=mcp_endpoint_counts,
                 mcp_non_retryable_attempts=mcp_non_retryable_attempts,
                 mcp_repeat_blocked_attempts=mcp_repeat_blocked_attempts,
+                mcp_repeat_blocked_details=mcp_repeat_blocked_details,
             )
             if mcp_handled is not None:
                 return mcp_handled
@@ -1346,6 +1397,7 @@ class AgentRunner:
         mcp_endpoint_counts: dict[str, int],
         mcp_non_retryable_attempts: set[str],
         mcp_repeat_blocked_attempts: set[str],
+        mcp_repeat_blocked_details: dict[str, str],
     ) -> tuple[str, dict[str, str]] | None:
         """Block MCP tool execution before calling the server when budget is exhausted."""
         non_retry_block = non_retryable_mcp_preblock(
@@ -1367,12 +1419,18 @@ class AgentRunner:
 
         attempt_sig = mcp_attempt_signature(tool_call.name, arguments)
         if attempt_sig is not None and attempt_sig in mcp_repeat_blocked_attempts:
+            prior_error = mcp_repeat_blocked_details.get(attempt_sig, "").strip()
             repeat_block = (
                 f"Error: repeated MCP endpoint call blocked for {tool_call.name} "
                 "(same arguments and error already exceeded retry budget this turn).\n"
+                f"Last endpoint error: {prior_error[:500] or 'unknown'}\n"
                 "Stop retrying this endpoint. Use results you already have, try a "
                 "different MCP tool or approach, or ask the user for missing access "
                 "or configuration."
+            )
+            logger.warning(
+                "Tool {} preblocked by MCP repeat guard before execute",
+                tool_call.name,
             )
             event = {
                 "name": tool_call.name,
@@ -1394,6 +1452,7 @@ class AgentRunner:
         mcp_endpoint_counts: dict[str, int],
         mcp_non_retryable_attempts: set[str],
         mcp_repeat_blocked_attempts: set[str],
+        mcp_repeat_blocked_details: dict[str, str],
     ) -> tuple[Any, dict[str, str], BaseException | None] | None:
         """Apply MCP repeat guard + non-retryable 4xx handling, or pass through."""
         if not is_mcp_tool_failure_result(tool_call.name, raw_text):
@@ -1409,6 +1468,7 @@ class AgentRunner:
             attempt_sig = mcp_attempt_signature(tool_call.name, arguments)
             if attempt_sig is not None:
                 mcp_repeat_blocked_attempts.add(attempt_sig)
+                mcp_repeat_blocked_details[attempt_sig] = raw_text.strip()[:500]
             logger.warning(
                 "Tool {} blocked by MCP repeat guard; returning non-retryable tool error",
                 tool_call.name,

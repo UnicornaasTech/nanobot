@@ -26,6 +26,10 @@ _NON_RETRYABLE_MCP_ERROR_CODES = frozenset({
     "object_not_found",
 })
 
+
+_REPEAT_STATE_LAST_KEY = "__last_signature"
+_REPEAT_STATE_STREAK_KEY = "__streak"
+
 EMPTY_FINAL_RESPONSE_MESSAGE = (
     "I completed the tool steps but couldn't produce a final answer. "
     "Please try again or narrow the task."
@@ -86,24 +90,38 @@ def external_lookup_signature(tool_name: str, arguments: dict[str, Any]) -> str 
         query = str(arguments.get("query") or arguments.get("search_term") or "").strip()
         if query:
             return f"web_search:{query.lower()}"
+    if tool_name == "grep":
+        # Treat repeated identical grep payloads as the same lookup target.
+        try:
+            normalized = json.dumps(arguments, sort_keys=True, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            normalized = repr(arguments)
+        digest = hashlib.sha256(normalized.encode()).hexdigest()[:16]
+        return f"grep:{digest}"
     return None
 
 
 def repeated_external_lookup_error(
     tool_name: str,
     arguments: dict[str, Any],
-    seen_counts: dict[str, int],
+    state: dict[str, Any],
 ) -> str | None:
-    """Block repeated external lookups after a small retry budget."""
+    """Block repeated consecutive external lookups after a small retry budget."""
     signature = external_lookup_signature(tool_name, arguments)
     if signature is None:
+        state[_REPEAT_STATE_LAST_KEY] = None
+        state[_REPEAT_STATE_STREAK_KEY] = 0
         return None
-    count = seen_counts.get(signature, 0) + 1
-    seen_counts[signature] = count
+    if state.get(_REPEAT_STATE_LAST_KEY) == signature:
+        count = int(state.get(_REPEAT_STATE_STREAK_KEY, 0)) + 1
+    else:
+        count = 1
+    state[_REPEAT_STATE_LAST_KEY] = signature
+    state[_REPEAT_STATE_STREAK_KEY] = count
     if count <= _MAX_REPEAT_EXTERNAL_LOOKUPS:
         return None
     logger.warning(
-        "Blocking repeated external lookup {} on attempt {}",
+        "Blocking repeated consecutive external lookup {} on attempt {}",
         signature[:160],
         count,
     )
@@ -327,18 +345,24 @@ def repeated_mcp_endpoint_error(
     tool_name: str,
     arguments: dict[str, Any],
     result_text: str,
-    seen_counts: dict[str, int],
+    state: dict[str, Any],
 ) -> str | None:
-    """Block repeated identical failing MCP endpoint calls after a small retry budget."""
+    """Block repeated consecutive identical failing MCP endpoint calls."""
     signature = mcp_endpoint_signature(tool_name, arguments, result_text)
     if signature is None:
+        state[_REPEAT_STATE_LAST_KEY] = None
+        state[_REPEAT_STATE_STREAK_KEY] = 0
         return None
-    count = seen_counts.get(signature, 0) + 1
-    seen_counts[signature] = count
+    if state.get(_REPEAT_STATE_LAST_KEY) == signature:
+        count = int(state.get(_REPEAT_STATE_STREAK_KEY, 0)) + 1
+    else:
+        count = 1
+    state[_REPEAT_STATE_LAST_KEY] = signature
+    state[_REPEAT_STATE_STREAK_KEY] = count
     if count <= _MAX_REPEAT_MCP_ENDPOINT_ATTEMPTS:
         return None
     logger.warning(
-        "Blocking repeated MCP endpoint {} on attempt {}",
+        "Blocking repeated consecutive MCP endpoint {} on attempt {}",
         signature[:160],
         count,
     )
@@ -377,4 +401,39 @@ def non_retryable_mcp_preblock(
         "Do NOT call this same MCP tool with the same intent again. "
         "Use a different supported MCP tool or endpoint, or explain the blocker "
         "to the user and propose a manual workaround."
+    )
+
+
+def repeated_tool_call_signature(tool_name: str, arguments: dict[str, Any]) -> str:
+    """Return a stable signature for tool name + normalized arguments."""
+    try:
+        normalized = json.dumps(arguments, sort_keys=True, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        normalized = repr(arguments)
+    digest = hashlib.sha256(normalized.encode()).hexdigest()[:16]
+    return f"{tool_name}:{digest}"
+
+
+def repeated_consecutive_tool_call_error(
+    tool_name: str,
+    arguments: dict[str, Any],
+    state: dict[str, Any],
+    *,
+    max_attempts: int = 2,
+) -> str | None:
+    """Block consecutive identical tool calls after a small retry budget."""
+    signature = repeated_tool_call_signature(tool_name, arguments)
+    if state.get(_REPEAT_STATE_LAST_KEY) == signature:
+        count = int(state.get(_REPEAT_STATE_STREAK_KEY, 0)) + 1
+    else:
+        count = 1
+    state[_REPEAT_STATE_LAST_KEY] = signature
+    state[_REPEAT_STATE_STREAK_KEY] = count
+    if count <= max_attempts:
+        return None
+    return (
+        f"Error: repeated identical tool call blocked for {tool_name} "
+        f"(same arguments repeated {count} times in a row).\n"
+        "Stop repeating this exact call. Use previous results, refine arguments, "
+        "or switch to a different tool."
     )
