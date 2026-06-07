@@ -17,6 +17,7 @@ from nanobot.session.webui_turns import (
     WEBUI_SESSION_METADATA_KEY,
     WEBUI_TITLE_METADATA_KEY,
     WebuiTurnCoordinator,
+    clean_generated_title,
     maybe_generate_webui_title,
 )
 from nanobot.utils.llm_runtime import LLMRuntime
@@ -51,6 +52,11 @@ def test_agent_loop_llm_runtime_reflects_current_provider_and_model(tmp_path: Pa
 
     assert runtime.provider is next_provider
     assert runtime.model == "next-model"
+
+
+def test_clean_generated_title_strips_reasoning_tags() -> None:
+    assert clean_generated_title("<think>reasoning</think> WebUI polish") == "WebUI polish"
+    assert clean_generated_title("Title: <think> The user said hello") == ""
 
 
 @pytest.mark.asyncio
@@ -602,17 +608,17 @@ async def test_process_message_uses_explicit_session_metadata_for_goal_context(
     chat_session = loop.sessions.get_or_create("websocket:chat-with-goal")
     chat_session.metadata[GOAL_STATE_KEY] = {
         "status": "active",
-        "objective": "This chat goal must not leak into heartbeat.",
+        "objective": "This chat goal must not leak into system.",
     }
     loop.sessions.save(chat_session)
-    system_session = loop.sessions.get_or_create("heartbeat")
+    system_session = loop.sessions.get_or_create("system")
     system_session.metadata = {}
     loop.sessions.save(system_session)
 
     loop.context.build_messages = MagicMock(  # type: ignore[method-assign]
         return_value=[
             {"role": "system", "content": "system"},
-            {"role": "user", "content": "runtime + heartbeat"},
+            {"role": "user", "content": "runtime + system"},
         ]
     )
     loop._run_agent_loop = AsyncMock(return_value=(  # type: ignore[method-assign]
@@ -620,7 +626,7 @@ async def test_process_message_uses_explicit_session_metadata_for_goal_context(
         [],
         [
             {"role": "system", "content": "system"},
-            {"role": "user", "content": "runtime + heartbeat"},
+            {"role": "user", "content": "runtime + system"},
             {"role": "assistant", "content": "ok"},
         ],
         "stop",
@@ -630,11 +636,11 @@ async def test_process_message_uses_explicit_session_metadata_for_goal_context(
     result = await loop._process_message(
         InboundMessage(
             channel="websocket",
-            sender_id="heartbeat",
+            sender_id="system",
             chat_id="chat-with-goal",
-            content="heartbeat work",
+            content="system work",
         ),
-        session_key="heartbeat",
+        session_key="system",
     )
 
     assert result is not None

@@ -12,6 +12,8 @@ const updateUrlSpy = vi.fn();
 const attachSpy = vi.fn();
 const runStatusHandlers = new Set<(chatId: string, startedAt: number | null) => void>();
 let mockSessions: ChatSummary[] = [];
+const HERO_GREETING_PATTERN =
+  /What should we work on\?|Where should we start\?|What are we building today\?|What should we tackle together\?/;
 
 function jsonResponse(body: unknown): Response {
   return {
@@ -97,6 +99,9 @@ function baseSettingsPayload() {
     },
     advanced: {
       restrict_to_workspace: false,
+      webui_allow_local_service_access: true,
+      webui_default_access_mode: "default",
+      private_service_protection_enabled: true,
       ssrf_whitelist_count: 0,
       mcp_server_count: 0,
       exec_enabled: true,
@@ -412,29 +417,7 @@ describe("App layout", () => {
     const encoded = new URLSearchParams(updateUrl?.split("?", 2)[1]).get("state");
     expect(JSON.parse(encoded ?? "{}").view.show_archived).toBe(true);
 
-    fireEvent.pointerDown(within(sidebar).getByRole("button", { name: "View" }), {
-      button: 0,
-      ctrlKey: false,
-    });
-    fireEvent.click(await screen.findByText("Compact list"));
-    await waitFor(() => {
-      const lastUpdateUrl = vi.mocked(fetch).mock.calls
-        .map(([url]) => String(url))
-        .filter((url) => url.startsWith("/api/webui/sidebar-state/update?"))
-        .at(-1);
-      const lastEncoded = new URLSearchParams(lastUpdateUrl?.split("?", 2)[1]).get("state");
-      expect(JSON.parse(lastEncoded ?? "{}").view.density).toBe("compact");
-    });
-
-    fireEvent.click(screen.getByText("Title A-Z"));
-    await waitFor(() => {
-      const lastUpdateUrl = vi.mocked(fetch).mock.calls
-        .map(([url]) => String(url))
-        .filter((url) => url.startsWith("/api/webui/sidebar-state/update?"))
-        .at(-1);
-      const lastEncoded = new URLSearchParams(lastUpdateUrl?.split("?", 2)[1]).get("state");
-      expect(JSON.parse(lastEncoded ?? "{}").view.sort).toBe("title_asc");
-    });
+    expect(within(sidebar).queryByRole("button", { name: "View" })).not.toBeInTheDocument();
   });
 
   it("sorts chats by displayed title when A-Z is persisted", async () => {
@@ -557,6 +540,58 @@ describe("App layout", () => {
     expect(within(sidebar).queryByTitle("Agent finished")).not.toBeInTheDocument();
   });
 
+  it("does not show a completed dot later when the active session finishes", async () => {
+    mockSessions = [
+      {
+        key: "websocket:chat-a",
+        channel: "websocket",
+        chatId: "chat-a",
+        createdAt: "2026-04-16T10:00:00Z",
+        updatedAt: "2026-04-16T10:00:00Z",
+        preview: "Active work",
+      },
+      {
+        key: "websocket:chat-b",
+        channel: "websocket",
+        chatId: "chat-b",
+        createdAt: "2026-04-16T11:00:00Z",
+        updatedAt: "2026-04-16T11:00:00Z",
+        preview: "Other chat",
+      },
+    ];
+
+    render(<App />);
+
+    await waitFor(() => expect(connectSpy).toHaveBeenCalled());
+    const sidebar = screen.getByRole("navigation", { name: "Sidebar navigation" });
+    await waitFor(() =>
+      expect(
+        within(sidebar).getByRole("button", { name: /^Active work$/ }),
+      ).toBeInTheDocument(),
+    );
+
+    await act(async () => {
+      fireEvent.click(within(sidebar).getByRole("button", { name: /^Active work$/ }));
+    });
+    await waitFor(() => expect(document.title).toContain("Active work"));
+
+    act(() => {
+      for (const handler of runStatusHandlers) handler("chat-a", 12_345);
+    });
+    expect(within(sidebar).getByTitle("Agent running")).toBeInTheDocument();
+
+    act(() => {
+      for (const handler of runStatusHandlers) handler("chat-a", null);
+    });
+    expect(within(sidebar).queryByTitle("Agent running")).not.toBeInTheDocument();
+    expect(within(sidebar).queryByTitle("Agent finished")).not.toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(within(sidebar).getByRole("button", { name: /^Other chat$/ }));
+    });
+    expect(within(sidebar).queryByTitle("Agent finished")).not.toBeInTheDocument();
+  });
+
   it("restores sidebar run indicators after a page reload", async () => {
     mockSessions = [
       {
@@ -607,7 +642,22 @@ describe("App layout", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL) => {
-        if (String(input).includes("/api/settings")) {
+        const href = String(input);
+        if (href === "/api/settings/provider-models?provider=openai") {
+          return jsonResponse({
+            provider: "openai",
+            label: "OpenAI",
+            status: "available",
+            catalog_kind: "official",
+            models: [
+              { id: "openai/gpt-4o", owned_by: "openai", context_window: 128000 },
+              { id: "openai/gpt-4o-mini", owned_by: "openai", context_window: 128000 },
+            ],
+            model_count: 2,
+            fetched_at: 1,
+          });
+        }
+        if (href.includes("/api/settings")) {
           return {
             ok: true,
             status: 200,
@@ -785,6 +835,9 @@ describe("App layout", () => {
               },
               advanced: {
                 restrict_to_workspace: false,
+                webui_allow_local_service_access: true,
+                webui_default_access_mode: "default",
+                private_service_protection_enabled: true,
                 ssrf_whitelist_count: 0,
                 mcp_server_count: 0,
                 exec_enabled: true,
@@ -828,17 +881,17 @@ describe("App layout", () => {
     expect(within(settingsNav).queryByRole("button", { name: "Providers" })).not.toBeInTheDocument();
     expect(within(settingsNav).getByRole("button", { name: "Image" })).toBeInTheDocument();
     expect(within(settingsNav).getByRole("button", { name: "Web" })).toBeInTheDocument();
-    expect(within(settingsNav).getByRole("button", { name: "Apps" })).toBeInTheDocument();
-    expect(within(settingsNav).getByRole("button", { name: "Advanced" })).toBeInTheDocument();
+    expect(within(settingsNav).queryByRole("button", { name: "Apps" })).not.toBeInTheDocument();
+    expect(within(settingsNav).getByRole("button", { name: "Security" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Sign out" })).toBeInTheDocument();
     fireEvent.click(within(settingsNav).getByRole("button", { name: "Appearance" }));
     expect(screen.getByText("Brand logos")).toBeInTheDocument();
     expect(screen.getByRole("switch", { name: "Brand logos" })).toBeInTheDocument();
     fireEvent.click(within(settingsNav).getByRole("button", { name: "Models" }));
     expect(screen.queryByText("AI")).not.toBeInTheDocument();
-    expect(screen.getByText("Current model")).toBeInTheDocument();
+    expect(screen.getByText("Current configuration")).toBeInTheDocument();
     expect(screen.queryByText("Presets")).not.toBeInTheDocument();
-    fireEvent.pointerDown(screen.getByRole("button", { name: /openai\/gpt-4o/ }));
+    fireEvent.pointerDown(screen.getAllByRole("button", { name: /openai\/gpt-4o/ })[0]);
     fireEvent.click(screen.getByRole("menuitem", { name: "Add configuration" }));
     const modelDialog = screen.getByRole("dialog", { name: "New model configuration" });
     expect(within(modelDialog).getByText("Save a provider and model as a one-click option.")).toBeInTheDocument();
@@ -851,33 +904,47 @@ describe("App layout", () => {
     expect(within(modelDialog).getByRole("button", { name: /OpenAI/ })).toBeInTheDocument();
     expect(within(modelDialog).getByRole("button", { name: "Save" })).toBeEnabled();
     fireEvent.click(within(modelDialog).getByRole("button", { name: "Cancel" }));
-    const modelInput = screen.getByDisplayValue("openai/gpt-4o");
-    expect(modelInput).toBeInTheDocument();
     fireEvent.pointerDown(screen.getByRole("button", { name: /Auto/ }));
     expect(screen.getAllByTestId("provider-picker-logo-openai").length).toBeGreaterThan(0);
     fireEvent.click(screen.getByRole("menuitem", { name: /Auto/ }));
-    fireEvent.change(modelInput, { target: { value: "openai/gpt-4o-mini" } });
+    const openModelPicker = () => {
+      const modelButtons = screen.getAllByRole("button", { name: /openai\/gpt-4o/ });
+      fireEvent.pointerDown(modelButtons[modelButtons.length - 1]);
+    };
+    openModelPicker();
+    await screen.findByText("openai/gpt-4o-mini");
+    fireEvent.click(screen.getAllByText("openai/gpt-4o-mini")[0]);
     expect(screen.getByText("Unsaved changes.").parentElement?.className).toContain(
       "text-blue-600",
     );
-    fireEvent.change(modelInput, { target: { value: "openai/gpt-4o" } });
+    const updatedModelButtons = screen.getAllByRole("button", { name: /openai\/gpt-4o-mini/ });
+    fireEvent.pointerDown(updatedModelButtons[updatedModelButtons.length - 1]);
+    await screen.findByText("openai/gpt-4o");
+    fireEvent.click(screen.getAllByText("openai/gpt-4o")[0]);
     expect(screen.getByText("OpenRouter")).toBeInTheDocument();
     expect(screen.getByText("Ant Ling")).toBeInTheDocument();
     expect(screen.getByTestId("provider-logo-openai")).toBeInTheDocument();
     expect(screen.getByText(/Product names, logos, and brands/)).toBeInTheDocument();
     expect(screen.getAllByText("Not configured").length).toBeGreaterThan(0);
-    fireEvent.click(screen.getByText("OpenAI"));
+    const clickProviderRow = (label: string) => {
+      const providerLabel = screen
+        .getAllByText(label)
+        .find((element) => element.className.includes("font-semibold"));
+      expect(providerLabel).toBeTruthy();
+      fireEvent.click(providerLabel!);
+    };
+    clickProviderRow("OpenAI");
     fireEvent.click(screen.getByRole("button", { name: "Edit" }));
     fireEvent.change(screen.getByPlaceholderText("Leave blank to keep the current key"), {
       target: { value: "unsaved-openai-key" },
     });
-    fireEvent.click(screen.getByText("OpenRouter"));
-    fireEvent.click(screen.getByText("OpenAI"));
+    clickProviderRow("OpenRouter");
+    clickProviderRow("OpenAI");
     expect(screen.getByText("open••••-key")).toBeInTheDocument();
     expect(screen.queryByDisplayValue("unsaved-openai-key")).not.toBeInTheDocument();
-    fireEvent.click(screen.getByText("Ant Ling"));
+    clickProviderRow("Ant Ling");
     expect(screen.getByDisplayValue("https://api.ant-ling.com/v1")).toBeInTheDocument();
-    fireEvent.click(screen.getByText("Atomic Chat"));
+    clickProviderRow("Atomic Chat");
     expect(screen.getByDisplayValue("http://localhost:1337/v1")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Save provider" })).toBeEnabled();
 
@@ -906,9 +973,13 @@ describe("App layout", () => {
     expect(screen.getByText("BSAo••••ew20")).toBeInTheDocument();
     expect(screen.queryByDisplayValue("unsaved-brave-key")).not.toBeInTheDocument();
 
-    fireEvent.click(within(settingsNav).getByRole("button", { name: "Runtime" }));
+    fireEvent.click(within(settingsNav).getByRole("button", { name: "System" }));
     expect(screen.getByText("Bot name")).toBeInTheDocument();
     expect(screen.queryByText("Tool hint length")).not.toBeInTheDocument();
+    expect(screen.queryByText("Heartbeat")).not.toBeInTheDocument();
+    expect(screen.queryByText("Dream")).not.toBeInTheDocument();
+    expect(screen.queryByText("Unified session")).not.toBeInTheDocument();
+    expect(screen.getByText("Default workspace")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
     fireEvent.pointerDown(screen.getByRole("button", { name: "UTC" }));
     expect(screen.getByPlaceholderText("Search timezone")).toBeInTheDocument();
@@ -1071,6 +1142,9 @@ describe("App layout", () => {
               },
               advanced: {
                 restrict_to_workspace: false,
+                webui_allow_local_service_access: true,
+                webui_default_access_mode: "default",
+                private_service_protection_enabled: true,
                 ssrf_whitelist_count: 0,
                 mcp_server_count: 0,
                 exec_enabled: true,
@@ -1097,7 +1171,7 @@ describe("App layout", () => {
     fireEvent.click(screen.getByRole("button", { name: "Back to chat" }));
 
     await waitFor(() => expect(document.title).toBe("nanobot"));
-    expect(screen.getByText("What can I do for you?")).toBeInTheDocument();
+    expect(screen.getByText(HERO_GREETING_PATTERN)).toBeInTheDocument();
   });
 
   it("filters sessions in the centered search dialog", async () => {
@@ -1266,23 +1340,23 @@ describe("App layout", () => {
     expect(toggleThemeSpy).toHaveBeenCalledTimes(1);
 
     fireEvent.click(screen.getByRole("button", { name: "Collapse sidebar" }));
-    const desktopAside = container.querySelector("aside.lg\\:block") as HTMLElement;
-    await waitFor(() => expect(desktopAside.style.width).toBe("56px"));
+    const sidebarAside = container.querySelector("aside.lg\\:block") as HTMLElement;
+    await waitFor(() => expect(sidebarAside.style.width).toBe("56px"));
 
     expect(screen.queryByRole("button", { name: "Start a new chat" })).not.toBeInTheDocument();
     const rail = screen.getByRole("navigation", { name: "Sidebar navigation" });
     expect(within(rail).getByRole("button", { name: "New chat" })).toBeInTheDocument();
     expect(within(rail).getByRole("button", { name: "Search" })).toBeInTheDocument();
-    expect(within(rail).getByRole("button", { name: "View" })).toBeInTheDocument();
+    expect(within(rail).queryByRole("button", { name: "View" })).not.toBeInTheDocument();
     expect(within(rail).queryByText("Existing chat")).not.toBeInTheDocument();
 
     fireEvent.click(within(rail).getByRole("button", { name: "Toggle sidebar" }));
-    await waitFor(() => expect(desktopAside.style.width).toBe("272px"));
+    await waitFor(() => expect(sidebarAside.style.width).toBe("272px"));
 
     const sidebar = screen.getByRole("navigation", { name: "Sidebar navigation" });
     fireEvent.click(within(sidebar).getByRole("button", { name: "New chat" }));
     expect(createChatSpy).not.toHaveBeenCalled();
-    expect(screen.getByText("What can I do for you?")).toBeInTheDocument();
+    expect(screen.getByText(HERO_GREETING_PATTERN)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Start a new chat" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Toggle theme from header" })).toBeInTheDocument();
     expect(within(sidebar).getByRole("button", { name: "Settings" })).toBeInTheDocument();

@@ -14,6 +14,10 @@ from nanobot.providers.base import LLMResponse, ToolCallRequest
 
 _MAX_TOOL_RESULT_CHARS = AgentDefaults().max_tool_result_chars
 
+
+def _empty_tool_tracking() -> tuple[dict, dict, dict, dict, set, set, dict]:
+    return {}, {}, {}, {}, set(), set(), {}
+
 class _DelayTool(Tool):
     def __init__(
         self,
@@ -85,8 +89,7 @@ async def test_runner_batches_read_only_tools_before_exclusive_work():
             ToolCallRequest(id="ro2", name="read_b", arguments={}),
             ToolCallRequest(id="rw1", name="write_a", arguments={}),
         ],
-        {},
-        {},
+        *_empty_tool_tracking(),
     )
 
     assert shared_events[0:2] == ["start:read_a", "start:read_b"]
@@ -130,8 +133,7 @@ async def test_runner_does_not_batch_exclusive_read_only_tools():
             ToolCallRequest(id="ddg1", name="ddg_like", arguments={}),
             ToolCallRequest(id="ro2", name="read_b", arguments={}),
         ],
-        {},
-        {},
+        *_empty_tool_tracking(),
     )
 
     assert shared_events[0] == "start:read_a"
@@ -172,10 +174,6 @@ async def test_runner_blocks_repeated_external_fetches():
         max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
     ))
 
-    assert result.final_content == "done"
+    assert result.final_content is not None
+    assert "repeated external lookup blocked" in result.final_content
     assert tools.execute.await_count == 2
-    blocked_tool_message = [
-        msg for msg in captured_final_call
-        if msg.get("role") == "tool" and msg.get("tool_call_id") == "call_3"
-    ][0]
-    assert "repeated external lookup blocked" in blocked_tool_message["content"]

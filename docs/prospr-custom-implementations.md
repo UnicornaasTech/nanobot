@@ -6,7 +6,9 @@ Operational setup (Google Cloud, Meta dashboards, ngrok, etc.) stays in vendor d
 
 **Private repo:** `prospr-app/nanobot-prospr` — fork-only commits on top of upstream `HKUDS/nanobot` `main`.
 
-**Upstream baseline:** merged `public/main` @ `8c0b2c1a` (2026-05-22); prior common ancestor `26665823`.
+**Upstream baseline:** merged `public/main` @ `15c6abc9` (2026-05-31, 48 aged commits); prior common ancestor `418cb23d`.
+
+**Merge integration (2026-06-07):** fork hooks re-grafted in [`nanobot/agent/loop.py`](../nanobot/agent/loop.py) (`no_reply`, eager knowledge, unified-session delivery origins), [`nanobot/channels/manager.py`](../nanobot/channels/manager.py) (Instagram `session_manager`), [`nanobot/config/schema.py`](../nanobot/config/schema.py) (`gmail_draft` + upstream `webui_allow_local_service_access`).
 
 | Commit     | Summary                                                                                          |
 | ---------- | ------------------------------------------------------------------------------------------------ |

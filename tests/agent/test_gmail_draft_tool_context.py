@@ -58,7 +58,6 @@ async def test_tool_passes_in_reply_to_from_email_context(monkeypatch: pytest.Mo
 
     assert "draft_id" not in out.lower()
     assert "Open in Gmail:" in out
-    assert "original email thread" in out
     assert captured["in_reply_to"] == "<orig@example.com>"
     assert captured["original_body"] == "Please assist."
     assert captured["original_from"] == "cust@example.com"

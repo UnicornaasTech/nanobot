@@ -766,8 +766,7 @@ async def reload_servers(state: Any, registry: ToolRegistry) -> dict[str, Any]:
     """Reconcile live MCP connections with the current config file."""
     async with _reload_lock(state):
         try:
-            from nanobot.config.loader import (load_config,
-                                               resolve_config_env_vars)
+            from nanobot.config.loader import load_config, resolve_config_env_vars
 
             config = resolve_config_env_vars(load_config())
             next_servers = dict(config.tools.mcp_servers)

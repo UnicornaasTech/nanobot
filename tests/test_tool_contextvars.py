@@ -31,16 +31,16 @@ async def test_message_tool_keeps_task_local_context() -> None:
 
     async def task_two() -> str:
         await entered.wait()
-        tool.set_context(RequestContext(channel="email", chat_id="chat-b"))
+        tool.set_context(RequestContext(channel="telegram", chat_id="chat-b"))
         release.set()
         return await tool.execute(content="two")
 
     result_one, result_two = await asyncio.gather(task_one(), task_two())
 
     assert result_one == "Message sent to feishu:chat-a"
-    assert result_two == "Message sent to email:chat-b"
+    assert result_two == "Message sent to telegram:chat-b"
     assert ("feishu", "chat-a", "one") in seen
-    assert ("email", "chat-b", "two") in seen
+    assert ("telegram", "chat-b", "two") in seen
 
 
 @pytest.mark.asyncio
@@ -65,6 +65,7 @@ async def test_spawn_tool_keeps_task_local_context() -> None:
             session_key: str,
             origin_message_id: str | None = None,
             temperature: float | None = None,
+            workspace_scope=None,
         ) -> str:
             seen.append((origin_channel, origin_chat_id, session_key))
             return f"{origin_channel}:{origin_chat_id}:{task}"
@@ -178,6 +179,7 @@ async def test_spawn_tool_basic_set_context_and_execute() -> None:
             session_key,
             origin_message_id=None,
             temperature=None,
+            workspace_scope=None,
         ):
             seen.append((origin_channel, origin_chat_id, session_key))
             return f"ok: {task}"
@@ -211,6 +213,7 @@ async def test_spawn_tool_default_values_without_set_context() -> None:
             session_key,
             origin_message_id=None,
             temperature=None,
+            workspace_scope=None,
         ):
             seen.append((origin_channel, origin_chat_id, session_key))
             return "ok"
