@@ -48,6 +48,7 @@ from nanobot.utils.runtime import (
     build_finalization_retry_message,
     build_goal_continue_message,
     build_length_recovery_message,
+    build_repeated_tool_batch_message,
     ensure_nonempty_tool_result,
     is_blank_text,
     is_mcp_tool_failure_result,
@@ -58,6 +59,7 @@ from nanobot.utils.runtime import (
     repeated_consecutive_tool_call_error,
     repeated_external_lookup_error,
     repeated_mcp_endpoint_error,
+    repeated_tool_batch_should_inject,
     repeated_workspace_violation_error,
 )
 
@@ -309,6 +311,7 @@ class AgentRunner:
         mcp_non_retryable_attempts: set[str] = set()
         mcp_repeat_blocked_attempts: set[str] = set()
         mcp_repeat_blocked_details: dict[str, str] = {}
+        batch_repeat_state: dict[str, Any] = {}
         empty_content_retries = 0
         length_recovery_count = 0
         had_injections = False
@@ -360,6 +363,15 @@ class AgentRunner:
                 context.streamed_reasoning = True
 
             if response.should_execute_tools:
+                if await self._handle_repeated_tool_batch(
+                    response,
+                    batch_repeat_state,
+                    messages,
+                    hook,
+                    context,
+                ):
+                    had_injections = True
+                    continue
                 phase_result = await self._dispatch_tool_calls_phase(
                     spec=spec,
                     response=response,
@@ -432,6 +444,15 @@ class AgentRunner:
                     # in this same iteration instead of falling through to the
                     # empty-final-response path (which would silently drop them).
                     if response.should_execute_tools:
+                        if await self._handle_repeated_tool_batch(
+                            response,
+                            batch_repeat_state,
+                            messages,
+                            hook,
+                            context,
+                        ):
+                            had_injections = True
+                            continue
                         phase_result = await self._dispatch_tool_calls_phase(
                             spec=spec,
                             response=response,
@@ -891,6 +912,38 @@ class AgentRunner:
         for key, value in right.items():
             merged[key] = merged.get(key, 0) + value
         return merged
+
+    async def _handle_repeated_tool_batch(
+        self,
+        response: LLMResponse,
+        batch_repeat_state: dict[str, Any],
+        messages: list[dict[str, Any]],
+        hook: AgentHook,
+        context: AgentHookContext,
+    ) -> bool:
+        """Inject a forcing message when the model repeats an identical tool batch.
+
+        Appends the blocked assistant message so the conversation record shows why
+        the forcing message was sent; _backfill_missing_tool_results will synthesise
+        placeholder tool results for the unfulfilled calls on the next iteration.
+        """
+        if not repeated_tool_batch_should_inject(response.tool_calls, batch_repeat_state):
+            return False
+        if hook.wants_streaming():
+            await hook.on_stream_end(context, resuming=True)
+        # Record the assistant's (blocked) intent so the forcing message is coherent.
+        messages.append(build_assistant_message(
+            response.content or "",
+            tool_calls=[tc.to_openai_tool_call() for tc in response.tool_calls],
+            reasoning_content=response.reasoning_content,
+            thinking_blocks=response.thinking_blocks,
+        ))
+        self._append_injected_messages(
+            messages,
+            [build_repeated_tool_batch_message()],
+        )
+        await hook.after_iteration(context)
+        return True
 
     async def _dispatch_tool_calls_phase(
         self,

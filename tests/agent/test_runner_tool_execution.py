@@ -174,6 +174,64 @@ async def test_runner_blocks_repeated_external_fetches():
         max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
     ))
 
+    # The batch guard fires on the 3rd identical single-tool batch, injecting a
+    # forcing message before the per-tool external-lookup guard can turn it into
+    # a fatal error.  The model then produces a final answer ("done").
     assert result.final_content is not None
-    assert "repeated external lookup blocked" in result.final_content
     assert tools.execute.await_count == 2
+    assert result.had_injections
+
+
+@pytest.mark.asyncio
+async def test_runner_injects_on_repeated_tool_batch():
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+    from nanobot.utils.runtime import REPEATED_TOOL_BATCH_PROMPT
+
+    same_batch = [
+        ToolCallRequest(id="s1", name="web_search", arguments={"query": "tallinn events"}),
+        ToolCallRequest(id="s2", name="web_search", arguments={"query": "tartu events"}),
+    ]
+    provider = MagicMock()
+    call_count = {"n": 0}
+    captured_messages: list[list[dict]] = []
+
+    async def chat_with_retry(*, messages, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] <= 3:
+            return LLMResponse(content="", tool_calls=list(same_batch), usage={})
+        captured_messages.append(messages)
+        return LLMResponse(content="here is the answer", tool_calls=[], usage={})
+
+    provider.chat_with_retry = chat_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = AsyncMock(return_value="search results")
+
+    runner = AgentRunner(provider)
+    result = await runner.run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "find events"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=6,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    ))
+
+    assert result.final_content == "here is the answer"
+    assert tools.execute.await_count == 4  # two real batches × two tools; third blocked
+    final_msgs = captured_messages[-1]
+    roles = [m["role"] for m in final_msgs]
+    # Forcing message must appear in history.
+    assert any(
+        m.get("role") == "user" and REPEATED_TOOL_BATCH_PROMPT in m.get("content", "")
+        for m in final_msgs
+    )
+    # The blocked assistant turn (tool_calls) must precede the forcing message so it
+    # is contextually coherent for the model.
+    forcing_idx = next(
+        i for i, m in enumerate(final_msgs)
+        if m.get("role") == "user" and REPEATED_TOOL_BATCH_PROMPT in m.get("content", "")
+    )
+    assert any(
+        final_msgs[i].get("role") == "assistant" and final_msgs[i].get("tool_calls")
+        for i in range(forcing_idx)
+    )

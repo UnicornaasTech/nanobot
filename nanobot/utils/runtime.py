@@ -30,6 +30,10 @@ _NON_RETRYABLE_MCP_ERROR_CODES = frozenset({
 _REPEAT_STATE_LAST_KEY = "__last_signature"
 _REPEAT_STATE_STREAK_KEY = "__streak"
 
+_BATCH_REPEAT_LAST_KEY = "__batch_last_fingerprint"
+_BATCH_REPEAT_STREAK_KEY = "__batch_streak"
+_MAX_REPEAT_TOOL_BATCH_STREAK = 3
+
 EMPTY_FINAL_RESPONSE_MESSAGE = (
     "I completed the tool steps but couldn't produce a final answer. "
     "Please try again or narrow the task."
@@ -47,6 +51,12 @@ LENGTH_RECOVERY_PROMPT = (
 SUSTAINED_GOAL_CONTINUE_PROMPT = (
     "You have an active sustained goal. Please continue working toward the "
     "objective using your tools, or call complete_goal if the work is truly finished."
+)
+
+REPEATED_TOOL_BATCH_PROMPT = (
+    "You have already run these exact tool calls with the same arguments and received results. "
+    "Do not call these tool calls with the same arguments any more. Either change your strategy "
+    "or answer the user with what you have."
 )
 
 
@@ -88,6 +98,11 @@ def build_length_recovery_message() -> dict[str, str]:
 def build_goal_continue_message(custom: str | None = None) -> dict[str, str]:
     """Prompt the model to continue when a sustained goal is still active."""
     return {"role": "user", "content": custom or SUSTAINED_GOAL_CONTINUE_PROMPT}
+
+
+def build_repeated_tool_batch_message() -> dict[str, str]:
+    """Prompt the model to stop re-issuing an identical tool-call batch."""
+    return {"role": "user", "content": REPEATED_TOOL_BATCH_PROMPT}
 
 
 def external_lookup_signature(tool_name: str, arguments: dict[str, Any]) -> str | None:
@@ -422,6 +437,48 @@ def repeated_tool_call_signature(tool_name: str, arguments: dict[str, Any]) -> s
         normalized = repr(arguments)
     digest = hashlib.sha256(normalized.encode()).hexdigest()[:16]
     return f"{tool_name}:{digest}"
+
+
+def tool_call_batch_fingerprint(tool_calls: list[Any]) -> str:
+    """Stable fingerprint for a batch of tool calls (order-independent)."""
+    if not tool_calls:
+        return ""
+    parts: list[str] = []
+    for tool_call in tool_calls:
+        name = getattr(tool_call, "name", None) or ""
+        raw_args = getattr(tool_call, "arguments", None)
+        arguments = raw_args if isinstance(raw_args, dict) else {}
+        parts.append(repeated_tool_call_signature(name, arguments))
+    parts.sort()
+    digest = hashlib.sha256("\n".join(parts).encode()).hexdigest()[:32]
+    return digest
+
+
+def repeated_tool_batch_should_inject(
+    tool_calls: list[Any],
+    state: dict[str, Any],
+    *,
+    max_streak: int = _MAX_REPEAT_TOOL_BATCH_STREAK,
+) -> bool:
+    """Return True when the same tool-call batch repeats *max_streak* times in a row."""
+    fingerprint = tool_call_batch_fingerprint(tool_calls)
+    if not fingerprint:
+        return False
+    if state.get(_BATCH_REPEAT_LAST_KEY) == fingerprint:
+        streak = int(state.get(_BATCH_REPEAT_STREAK_KEY, 0)) + 1
+    else:
+        streak = 1
+    state[_BATCH_REPEAT_LAST_KEY] = fingerprint
+    state[_BATCH_REPEAT_STREAK_KEY] = streak
+    if streak >= max_streak:
+        logger.warning(
+            "Blocking repeated tool batch (streak={}/{}): {}",
+            streak,
+            max_streak,
+            fingerprint,
+        )
+        return True
+    return False
 
 
 def repeated_consecutive_tool_call_error(
