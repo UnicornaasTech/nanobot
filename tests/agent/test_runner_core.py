@@ -77,11 +77,18 @@ async def test_runner_preserves_reasoning_fields_and_tool_results():
 async def test_runner_returns_max_iterations_fallback():
     from nanobot.agent.runner import AgentRunSpec, AgentRunner
 
-    provider = MagicMock(spec=LLMProvider)
-    provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
+    tool_response = LLMResponse(
         content="still working",
         tool_calls=[ToolCallRequest(id="call_1", name="list_dir", arguments={"path": "."})],
-    ))
+    )
+
+    async def chat_with_retry(**kwargs):
+        if kwargs.get("tools") is None:
+            return LLMResponse(content="", tool_calls=[])
+        return tool_response
+
+    provider = MagicMock(spec=LLMProvider)
+    provider.chat_with_retry = chat_with_retry
     tools = MagicMock()
     tools.get_definitions.return_value = []
     tools.execute = AsyncMock(return_value="tool result")
@@ -102,6 +109,153 @@ async def test_runner_returns_max_iterations_fallback():
     )
     assert result.messages[-1]["role"] == "assistant"
     assert result.messages[-1]["content"] == result.final_content
+
+
+@pytest.mark.asyncio
+async def test_runner_max_iterations_model_finalizes():
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+    from nanobot.utils.runtime import MAX_ITERATIONS_FINALIZATION_PROMPT
+
+    tool_response = LLMResponse(
+        content="still working",
+        tool_calls=[ToolCallRequest(id="call_1", name="list_dir", arguments={"path": "."})],
+    )
+    summary = "Here's what I found so far: the directory has three files."
+    finalization_calls: list[dict] = []
+
+    async def chat_with_retry(**kwargs):
+        if kwargs.get("tools") is None:
+            finalization_calls.append(kwargs)
+            return LLMResponse(content=summary, tool_calls=[])
+        return tool_response
+
+    provider = MagicMock(spec=LLMProvider)
+    provider.chat_with_retry = chat_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = AsyncMock(return_value="tool result")
+
+    runner = AgentRunner(provider)
+    result = await runner.run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "list files"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=2,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    ))
+
+    assert result.stop_reason == "max_iterations"
+    assert result.final_content == summary
+    assert len(finalization_calls) == 1
+    assert finalization_calls[0]["tools"] is None
+    assert finalization_calls[0]["messages"][-1]["content"] == (
+        MAX_ITERATIONS_FINALIZATION_PROMPT.format(max_iterations=2)
+    )
+
+
+@pytest.mark.asyncio
+async def test_runner_max_iterations_finalization_error_falls_back():
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    tool_response = LLMResponse(
+        content="still working",
+        tool_calls=[ToolCallRequest(id="call_1", name="list_dir", arguments={"path": "."})],
+    )
+    call_count = {"n": 0}
+
+    async def chat_with_retry(**kwargs):
+        call_count["n"] += 1
+        if kwargs.get("tools") is None:
+            raise RuntimeError("finalization failed")
+        return tool_response
+
+    provider = MagicMock(spec=LLMProvider)
+    provider.chat_with_retry = chat_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = AsyncMock(return_value="tool result")
+
+    runner = AgentRunner(provider)
+    result = await runner.run(AgentRunSpec(
+        initial_messages=[],
+        tools=tools,
+        model="test-model",
+        max_iterations=2,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    ))
+
+    assert result.stop_reason == "max_iterations"
+    assert result.final_content == (
+        "I reached the maximum number of tool call iterations (2) "
+        "without completing the task. You can try breaking the task into smaller steps."
+    )
+    assert call_count["n"] == 3
+
+
+@pytest.mark.asyncio
+async def test_runner_max_iterations_finalization_uses_fallback_provider() -> None:
+    """Fallback after blank max-iterations finalization should reuse retry shape."""
+    from typing import Any
+
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+    from nanobot.providers.base import LLMProvider
+    from nanobot.providers.fallback_provider import FallbackProvider
+    from nanobot.utils.runtime import MAX_ITERATIONS_FINALIZATION_PROMPT
+    from tests.agent.test_runner_fallback import _FakeProvider, _fallback, _make_response
+
+    tool_response = LLMResponse(
+        content="still working",
+        tool_calls=[ToolCallRequest(id="call_1", name="list_dir", arguments={"path": "."})],
+    )
+
+    class _StatefulProvider(LLMProvider):
+        def __init__(self, responses: list[LLMResponse]):
+            super().__init__()
+            self._responses = list(responses)
+            self.chat_calls: list[dict[str, Any]] = []
+
+        def get_default_model(self) -> str:
+            return "stateful/model"
+
+        async def chat(self, **kwargs: Any) -> LLMResponse:
+            self.chat_calls.append(dict(kwargs))
+            if self._responses:
+                return self._responses.pop(0)
+            return _make_response("")
+
+        async def chat_stream(self, **kwargs: Any) -> LLMResponse:
+            return await self.chat(**kwargs)
+
+    primary = _StatefulProvider([tool_response, _make_response("")])
+    fallback = _FakeProvider("fallback", _make_response("summary from fallback"))
+    provider = FallbackProvider(
+        primary=primary,
+        fallback_presets=[_fallback("fallback-a")],
+        provider_factory=MagicMock(return_value=fallback),
+    )
+
+    tools = MagicMock()
+    tools.get_definitions.return_value = [{"type": "function", "function": {"name": "list_dir"}}]
+    tools.execute = AsyncMock(return_value="tool result")
+
+    runner = AgentRunner(provider)
+    result = await runner.run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "do task"}],
+        tools=tools,
+        model="primary-model",
+        max_iterations=1,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    ))
+
+    assert result.stop_reason == "max_iterations"
+    assert result.final_content == "summary from fallback"
+    assert len(primary.chat_calls) == 2
+    assert primary.chat_calls[1].get("tools") is None
+    assert primary.chat_calls[1]["messages"][-1]["content"] == (
+        MAX_ITERATIONS_FINALIZATION_PROMPT.format(max_iterations=1)
+    )
+    assert len(fallback.chat_calls) == 1
+    assert fallback.chat_calls[0].get("tools") is None
 
 
 @pytest.mark.asyncio

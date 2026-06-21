@@ -153,7 +153,7 @@ async def test_runner_goal_continue_not_limited_by_injection_cycle_cap():
     ))
 
     assert result.stop_reason == "max_iterations"
-    assert provider.chat_with_retry.await_count == max_iterations
+    assert provider.chat_with_retry.await_count == max_iterations + 1
 
 
 @pytest.mark.asyncio

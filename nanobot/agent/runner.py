@@ -48,6 +48,7 @@ from nanobot.utils.runtime import (
     build_finalization_retry_message,
     build_goal_continue_message,
     build_length_recovery_message,
+    build_max_iterations_finalization_message,
     build_repeated_tool_batch_message,
     ensure_nonempty_tool_result,
     is_blank_text,
@@ -635,16 +636,14 @@ class AgentRunner:
             break
         else:
             stop_reason = "max_iterations"
-            if spec.max_iterations_message:
-                final_content = spec.max_iterations_message.format(
-                    max_iterations=spec.max_iterations,
+            if spec.max_iterations > 0:
+                final_content = await self._try_max_iterations_finalization(
+                    spec, messages, hook, context, usage,
                 )
             else:
-                final_content = render_template(
-                    "agent/max_iterations_message.md",
-                    strip=True,
-                    max_iterations=spec.max_iterations,
-                )
+                final_content = None
+            if is_blank_text(final_content):
+                final_content = self._max_iterations_fallback_message(spec)
             self._append_final_message(messages, final_content)
             # Drain any remaining injections so they are appended to the
             # conversation history instead of being re-published as
@@ -848,6 +847,93 @@ class AgentRunner:
         kwargs = self._build_request_kwargs(spec, retry_messages, tools=None)
         response = await self.provider.chat_with_retry(**kwargs)
         return response, retry_messages
+
+    async def _request_max_iterations_finalization(
+        self,
+        spec: AgentRunSpec,
+        messages: list[dict[str, Any]],
+    ) -> tuple[LLMResponse, list[dict[str, Any]]]:
+        """Issue a no-tools finalization request after max_iterations is hit."""
+        retry_messages = list(messages)
+        retry_messages.append(build_max_iterations_finalization_message(spec.max_iterations))
+        kwargs = self._build_request_kwargs(spec, retry_messages, tools=None)
+        response = await self.provider.chat_with_retry(**kwargs)
+        return response, retry_messages
+
+    async def _try_max_iterations_finalization(
+        self,
+        spec: AgentRunSpec,
+        messages: list[dict[str, Any]],
+        hook: AgentHook,
+        context: AgentHookContext,
+        usage: dict[str, int],
+    ) -> str | None:
+        """Ask the model to summarize progress before the deterministic fallback."""
+        try:
+            messages_for_model = self._drop_orphan_tool_results(messages)
+            messages_for_model = self._backfill_missing_tool_results(messages_for_model)
+            messages_for_model = self._microcompact(messages_for_model)
+            messages_for_model = self._apply_tool_result_budget(spec, messages_for_model)
+            messages_for_model = self._snip_history(spec, messages_for_model)
+            messages_for_model = self._drop_orphan_tool_results(messages_for_model)
+            messages_for_model = self._backfill_missing_tool_results(messages_for_model)
+        except Exception:
+            logger.exception(
+                "Context governance failed during max_iterations finalization for {}; "
+                "applying minimal repair",
+                spec.session_key or "default",
+            )
+            try:
+                messages_for_model = self._drop_orphan_tool_results(messages)
+                messages_for_model = self._backfill_missing_tool_results(messages_for_model)
+            except Exception:
+                messages_for_model = messages
+
+        messages.append(build_max_iterations_finalization_message(spec.max_iterations))
+        try:
+            response, retry_messages = await self._request_max_iterations_finalization(
+                spec, messages_for_model,
+            )
+        except Exception:
+            logger.exception(
+                "Max-iterations finalization request failed for {}",
+                spec.session_key or "default",
+            )
+            return None
+        retry_usage = self._usage_dict(response.usage)
+        self._accumulate_usage(usage, retry_usage)
+        context.response = response
+        context.usage = dict(self._merge_usage(context.usage or {}, retry_usage))
+        context.tool_calls = list(response.tool_calls)
+        clean = hook.finalize_content(context, response.content)
+        if response.finish_reason != "error" and not is_blank_text(clean):
+            return clean
+
+        fb_after = await self._try_empty_response_fallback(
+            spec, retry_messages, hook, context,
+            disable_tools=True,
+            accept_tool_calls=False,
+        )
+        if fb_after is not None:
+            retry_usage = self._usage_dict(fb_after.usage)
+            self._accumulate_usage(usage, retry_usage)
+            context.response = fb_after
+            context.usage = dict(self._merge_usage(context.usage or {}, retry_usage))
+            context.tool_calls = list(fb_after.tool_calls)
+            clean = hook.finalize_content(context, fb_after.content)
+            if fb_after.finish_reason != "error" and not is_blank_text(clean):
+                return clean
+        return None
+
+    @staticmethod
+    def _max_iterations_fallback_message(spec: AgentRunSpec) -> str:
+        if spec.max_iterations_message:
+            return spec.max_iterations_message.format(max_iterations=spec.max_iterations)
+        return render_template(
+            "agent/max_iterations_message.md",
+            strip=True,
+            max_iterations=spec.max_iterations,
+        )
 
     async def _try_empty_response_fallback(
         self,

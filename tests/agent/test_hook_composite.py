@@ -386,10 +386,17 @@ async def test_agent_loop_no_hooks_backward_compat(tmp_path):
     from nanobot.providers.base import LLMResponse, ToolCallRequest
 
     loop = _make_loop(tmp_path)
-    loop.provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
+    tool_response = LLMResponse(
         content="working",
         tool_calls=[ToolCallRequest(id="c1", name="list_dir", arguments={"path": "."})],
-    ))
+    )
+
+    async def chat_with_retry(**kwargs):
+        if kwargs.get("tools") is None:
+            return LLMResponse(content="", tool_calls=[])
+        return tool_response
+
+    loop.provider.chat_with_retry = AsyncMock(side_effect=chat_with_retry)
     loop.tools.get_definitions = MagicMock(return_value=[])
     loop.tools.execute = AsyncMock(return_value="ok")
     loop.max_iterations = 2

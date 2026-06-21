@@ -43,6 +43,13 @@ FINALIZATION_RETRY_PROMPT = (
     "Please provide your response to the user based on the conversation above."
 )
 
+MAX_ITERATIONS_FINALIZATION_PROMPT = (
+    "Maximum tool call iterations ({max_iterations}) has been reached. "
+    "Do not call any more tools. Provide your final response to the user "
+    "summarizing what you've learned and accomplished so far, and what "
+    "remains unfinished if applicable."
+)
+
 LENGTH_RECOVERY_PROMPT = (
     "Output limit reached. Continue exactly where you left off "
     "— no recap, no apology. Break remaining work into smaller steps if needed."
@@ -88,6 +95,14 @@ def is_blank_text(content: str | None) -> bool:
 def build_finalization_retry_message() -> dict[str, str]:
     """A short no-tools-allowed prompt for final answer recovery."""
     return {"role": "user", "content": FINALIZATION_RETRY_PROMPT}
+
+
+def build_max_iterations_finalization_message(max_iterations: int) -> dict[str, str]:
+    """Prompt the model to summarize progress after the iteration budget is exhausted."""
+    return {
+        "role": "user",
+        "content": MAX_ITERATIONS_FINALIZATION_PROMPT.format(max_iterations=max_iterations),
+    }
 
 
 def build_length_recovery_message() -> dict[str, str]:
