@@ -246,7 +246,7 @@ class EagerKnowledgeManager:
 
         bootstrap = self.consolidator._load_bootstrap_context()
         system_text = render_template(
-            "agent/consolidator_archive.md",
+            self.consolidator._consolidator_archive_template(),
             strip=True,
             bootstrap_context=bootstrap,
         )

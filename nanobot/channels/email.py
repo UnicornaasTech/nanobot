@@ -1,9 +1,11 @@
-"""Email channel implementation using IMAP polling (outbound send disabled)."""
+"""Email channel implementation using IMAP IDLE/polling (outbound send disabled)."""
 
 import asyncio
 import html
 import imaplib
 import re
+import select
+import time
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import date
@@ -27,7 +29,7 @@ from nanobot.utils.helpers import safe_filename
 
 
 class EmailConfig(Base):
-    """Email channel configuration (IMAP inbound + SMTP outbound)."""
+    """Email channel configuration (IMAP inbound; outbound send disabled by policy)."""
 
     enabled: bool = False
     consent_granted: bool = False
@@ -83,7 +85,7 @@ class EmailChannel(BaseChannel):
     Email channel.
 
     Inbound:
-    - Poll IMAP mailbox for unread messages.
+    - IMAP IDLE (when enabled) or polling for unread messages.
     - Convert each message into an inbound event.
 
     Outbound:
@@ -144,7 +146,7 @@ class EmailChannel(BaseChannel):
         return max(cls._POLL_INTERVAL_MIN, min(cls._POLL_INTERVAL_MAX, int(seconds)))
 
     async def start(self) -> None:
-        """Start polling IMAP for inbound emails."""
+        """Start IMAP IDLE (when enabled) or polling for inbound emails."""
         if not self.config.consent_granted:
             self.logger.warning(
                 "Email channel disabled: consent_granted is false. "
@@ -162,11 +164,31 @@ class EmailChannel(BaseChannel):
                 "Emails with spoofed From headers will be accepted. "
                 "Set verify_dkim=true and verify_spf=true for anti-spoofing protection."
             )
-        self.logger.info("Starting Email channel (IMAP polling mode)...")
 
         poll_seconds = self._clamp_poll_interval(self.config.poll_interval_seconds)
+        use_idle = self.config.imap_idle_enabled
+        idle_failed = False
+        if use_idle:
+            self.logger.info(
+                "Starting Email channel (IMAP IDLE, {}s max wait between checks)...",
+                poll_seconds,
+            )
+        else:
+            self.logger.info("Starting Email channel (IMAP poll every {}s)...", poll_seconds)
+
         while self._running:
             try:
+                if use_idle and not idle_failed:
+                    try:
+                        await asyncio.to_thread(self._imap_idle_wait, poll_seconds)
+                    except Exception as exc:
+                        self.logger.warning(
+                            "IMAP IDLE unavailable ({}), falling back to {}s polling",
+                            exc,
+                            poll_seconds,
+                        )
+                        idle_failed = True
+
                 inbound_items, skipped_uids = await asyncio.to_thread(self._fetch_new_messages)
                 should_apply_post_action = self._should_apply_post_action()
                 post_actions_uids: set[str] = set()
@@ -204,7 +226,8 @@ class EmailChannel(BaseChannel):
             except Exception:
                 self.logger.exception("Polling error")
 
-            await asyncio.sleep(poll_seconds)
+            if not use_idle or idle_failed:
+                await asyncio.sleep(poll_seconds)
 
     async def stop(self) -> None:
         """Stop polling loop."""
@@ -232,6 +255,61 @@ class EmailChannel(BaseChannel):
             self.logger.error("Channel not configured, missing: {}", ', '.join(missing))
             return False
         return True
+
+    def _imap_idle_wait(self, timeout_seconds: float) -> None:
+        """Block on IMAP IDLE until mail may have arrived or *timeout_seconds* elapses."""
+        mailbox = self.config.imap_mailbox or "INBOX"
+        if self.config.imap_use_ssl:
+            client = imaplib.IMAP4_SSL(self.config.imap_host, self.config.imap_port)
+        else:
+            client = imaplib.IMAP4(self.config.imap_host, self.config.imap_port)
+
+        try:
+            client.login(self.config.imap_username, self.config.imap_password)
+            status, _ = client.select(mailbox)
+            if status != "OK":
+                raise RuntimeError(f"IMAP select failed: {status}")
+
+            tag = client._new_tag()
+            client.send(tag + b" IDLE\r\n")
+
+            while True:
+                line = client.readline()
+                if not line:
+                    raise ConnectionError("IMAP IDLE: connection closed during handshake")
+                if line.startswith(b"+"):
+                    break
+                if line.startswith(tag):
+                    raise RuntimeError(f"IMAP IDLE rejected: {line!r}")
+
+            sock = client.socket()
+            if sock is None:
+                raise RuntimeError("IMAP IDLE: socket unavailable")
+
+            deadline = time.monotonic() + float(timeout_seconds)
+            while time.monotonic() < deadline:
+                wait = min(30.0, deadline - time.monotonic())
+                if wait <= 0:
+                    break
+                readable, _, _ = select.select([sock], [], [], wait)
+                if not readable:
+                    continue
+                line = client.readline()
+                if line.startswith(b"*") and (
+                    b"EXISTS" in line or b"RECENT" in line or b"EXPUNGE" in line
+                ):
+                    break
+
+            client.send(b"DONE\r\n")
+            while True:
+                line = client.readline()
+                if not line:
+                    break
+                if line.startswith(tag):
+                    break
+        finally:
+            with suppress(Exception):
+                client.logout()
 
     def _matching_drop_subject_pattern(self, subject: str) -> str | None:
         """Return the first matching dropSubjectPatterns entry, or None."""
