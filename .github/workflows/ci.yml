@@ -2,9 +2,13 @@ name: Test Suite
 
 on:
   push:
-    branches: [main, nightly]
+    branches: [main]
+    paths-ignore:
+      - docs/**
   pull_request:
-    branches: [main, nightly]
+    branches: [main]
+    paths-ignore:
+      - docs/**
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

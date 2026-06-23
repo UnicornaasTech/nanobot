@@ -65,6 +65,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  Reflect.deleteProperty(window, "nanobotHost");
   vi.useRealTimers();
 });
 
@@ -87,6 +88,61 @@ describe("NanobotClient", () => {
       chat_id: "chat-a",
       text: "hi",
     });
+  });
+
+  it("can swap the socket factory when the runtime URL changes", () => {
+    const browserFactory = vi.fn(
+      (url: string) => new FakeSocket(`browser:${url}`) as unknown as WebSocket,
+    );
+    const hostFactory = vi.fn(
+      (url: string) => new FakeSocket(`host:${url}`) as unknown as WebSocket,
+    );
+    const client = new NanobotClient({
+      url: "ws://test",
+      reconnect: false,
+      socketFactory: browserFactory,
+    });
+
+    client.connect();
+    expect(lastSocket().url).toBe("browser:ws://test");
+    client.close();
+    client.updateUrl("nanobot-host://engine/", hostFactory);
+    client.connect();
+
+    expect(hostFactory).toHaveBeenCalledWith("nanobot-host://engine/");
+    expect(lastSocket().url).toBe("host:nanobot-host://engine/");
+  });
+
+  it("uses the host socket bridge for native host URLs", async () => {
+    let socketEventHandler:
+      | ((event: { id: string; type: "open" | "close" | "error"; message?: string }) => void)
+      | null = null;
+    const openSocket = vi.fn(async () => "host-socket-1");
+    Object.defineProperty(window, "nanobotHost", {
+      configurable: true,
+      value: {
+        openSocket,
+        sendSocket: vi.fn(async () => undefined),
+        closeSocket: vi.fn(async () => undefined),
+        onSocketEvent: vi.fn((handler) => {
+          socketEventHandler = handler;
+          return vi.fn();
+        }),
+      },
+    });
+    const client = new NanobotClient({
+      url: "nanobot-host://engine/",
+      reconnect: false,
+    });
+    const status = vi.fn();
+    client.onStatus(status);
+
+    client.connect();
+    await Promise.resolve();
+    socketEventHandler?.({ id: "host-socket-1", type: "open" });
+
+    expect(openSocket).toHaveBeenCalledWith("nanobot-host://engine/");
+    expect(status).toHaveBeenLastCalledWith("open");
   });
 
   it("buffers chat events while no chat handler is registered and replays on subscribe", () => {
@@ -356,6 +412,61 @@ describe("NanobotClient", () => {
     );
   });
 
+  it("sends transcription requests and resolves transcription results outside chat dispatch", async () => {
+    const client = new NanobotClient({
+      url: "ws://test",
+      reconnect: false,
+      socketFactory: (url) => new FakeSocket(url) as unknown as WebSocket,
+    });
+    const handler = vi.fn();
+    client.onChat("chat-a", handler);
+    client.connect();
+    lastSocket().fakeOpen();
+
+    const promise = client.transcribeAudio("data:audio/webm;base64,AAAA", {
+      durationMs: 1234,
+      timeoutMs: 1_000,
+    });
+    const frame = JSON.parse(lastSocket().sent.at(-1) as string);
+    expect(frame).toMatchObject({
+      type: "transcribe_audio",
+      data_url: "data:audio/webm;base64,AAAA",
+      duration_ms: 1234,
+    });
+    expect(typeof frame.request_id).toBe("string");
+
+    lastSocket().fakeMessage({
+      event: "transcription_result",
+      request_id: frame.request_id,
+      text: "hello from voice",
+    });
+    await expect(promise).resolves.toBe("hello from voice");
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("rejects pending transcription requests on server errors and socket close", async () => {
+    const client = new NanobotClient({
+      url: "ws://test",
+      reconnect: false,
+      socketFactory: (url) => new FakeSocket(url) as unknown as WebSocket,
+    });
+    client.connect();
+    lastSocket().fakeOpen();
+
+    const errored = client.transcribeAudio("data:audio/webm;base64,AAAA", { timeoutMs: 1_000 });
+    const errorFrame = JSON.parse(lastSocket().sent.at(-1) as string);
+    lastSocket().fakeMessage({
+      event: "transcription_error",
+      request_id: errorFrame.request_id,
+      detail: "not_configured",
+    });
+    await expect(errored).rejects.toThrow("not_configured");
+
+    const dropped = client.transcribeAudio("data:audio/webm;base64,BBBB", { timeoutMs: 1_000 });
+    lastSocket().close();
+    await expect(dropped).rejects.toThrow("socket closed");
+  });
+
   it("queues sends while connecting and flushes on open", () => {
     const client = new NanobotClient({
       url: "ws://test",
@@ -371,6 +482,24 @@ describe("NanobotClient", () => {
     expect(lastSocket().sent).toContain(
       JSON.stringify({ type: "message", chat_id: "chat-x", content: "hello", webui: true }),
     );
+  });
+
+  it("includes an explicit turn id on outbound WebUI messages", () => {
+    const client = new NanobotClient({
+      url: "ws://test",
+      reconnect: false,
+      socketFactory: (url) => new FakeSocket(url) as unknown as WebSocket,
+    });
+    client.connect();
+    lastSocket().fakeOpen();
+    client.sendMessage("chat-x", "hello", undefined, { turnId: "turn-1" });
+    expect(JSON.parse(lastSocket().sent.at(-1) as string)).toEqual({
+      type: "message",
+      chat_id: "chat-x",
+      content: "hello",
+      turn_id: "turn-1",
+      webui: true,
+    });
   });
 
   it("includes image generation options in outbound messages", () => {

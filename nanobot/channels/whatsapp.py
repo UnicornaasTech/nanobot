@@ -30,6 +30,11 @@ class WhatsAppConfig(Base):
     bridge_token: str = ""
     allow_from: list[str] = Field(default_factory=list)
     group_policy: Literal["open", "mention"] = "open"  # "open" responds to all, "mention" only when @mentioned
+    # Optional static LID->phone mappings, e.g. {"123456789012345": "15551234567"}.
+    # Useful to resolve a sender's phone number from the very first message instead of
+    # only after a message that carries both phone and LID. Merged with mappings the
+    # bridge persists on disk (lid-mapping-*_reverse.json) under the auth directory.
+    lid_mappings: dict[str, str] = Field(default_factory=dict)
 
 
 def _bridge_token_path() -> Path:
@@ -75,8 +80,38 @@ class WhatsAppChannel(BaseChannel):
         self._ws = None
         self._connected = False
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()
-        self._lid_to_phone: dict[str, str] = {}
+        self._lid_to_phone: dict[str, str] = self._load_lid_mappings()
         self._bridge_token: str | None = None
+
+    def _load_lid_mappings(self) -> dict[str, str]:
+        """Seed LID->phone mappings on startup.
+
+        Combines two sources so the sender's phone number can be resolved from the
+        very first message (instead of only after one that carries both phone and LID):
+
+        1. Reverse mapping files the bridge persists in the auth directory, named
+           ``lid-mapping-<lid>_reverse.json`` and containing the phone number string.
+        2. Static ``lid_mappings`` from the channel config (takes precedence).
+        """
+        from nanobot.config.paths import get_runtime_subdir
+
+        mapping: dict[str, str] = {}
+        auth_dir = get_runtime_subdir("whatsapp-auth")
+        if auth_dir.is_dir():
+            for path in auth_dir.glob("lid-mapping-*_reverse.json"):
+                lid = path.name[len("lid-mapping-"):-len("_reverse.json")]
+                try:
+                    phone = json.loads(path.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                if isinstance(phone, str) and phone.strip():
+                    mapping[lid] = phone.strip()
+
+        for lid, phone in getattr(self.config, "lid_mappings", {}).items():
+            if isinstance(phone, str) and phone.strip():
+                mapping[str(lid)] = phone.strip()
+
+        return mapping
 
     def _effective_bridge_token(self) -> str:
         """Resolve the bridge token, generating a local secret when needed."""
@@ -216,7 +251,7 @@ class WhatsAppChannel(BaseChannel):
 
             # Extract just the phone number or lid as chat_id
             is_group = data.get("isGroup", False)
-            was_mentioned = data.get("wasMentioned", False)
+            was_mentioned = bool(data.get("wasMentioned", False) or data.get("isReplyToBot", False))
 
             if is_group and getattr(self.config, "group_policy", "open") == "mention":
                 if not was_mentioned:
@@ -225,7 +260,8 @@ class WhatsAppChannel(BaseChannel):
             # Classify by JID suffix: @s.whatsapp.net = phone, @lid.whatsapp.net = LID
             # The bridge's pn/sender fields don't consistently map to phone/LID across versions.
             raw_a = pn or ""
-            raw_b = sender or ""
+            participant = data.get("participant", "")
+            raw_b = participant or sender or ""
             id_a = raw_a.split("@")[0] if "@" in raw_a else raw_a
             id_b = raw_b.split("@")[0] if "@" in raw_b else raw_b
 
@@ -289,6 +325,9 @@ class WhatsAppChannel(BaseChannel):
                     "message_id": message_id,
                     "timestamp": data.get("timestamp"),
                     "is_group": data.get("isGroup", False),
+                    "is_forwarded": bool(data.get("isForwarded", False)),
+                    "participant": participant or None,
+                    "is_reply_to_bot": data.get("isReplyToBot", False),
                 },
             )
 

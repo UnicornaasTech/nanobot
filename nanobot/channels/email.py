@@ -1,12 +1,11 @@
-"""Email channel implementation using IMAP polling (outbound SMTP disabled)."""
+"""Email channel implementation using IMAP polling (outbound send disabled)."""
 
 import asyncio
 import html
 import imaplib
 import re
-import select
-import time
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import date
 from email import policy
 from email.header import decode_header, make_header
@@ -14,7 +13,7 @@ from email.parser import BytesParser
 from email.utils import parseaddr
 from fnmatch import fnmatch
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from loguru import logger
 from pydantic import Field
@@ -28,7 +27,7 @@ from nanobot.utils.helpers import safe_filename
 
 
 class EmailConfig(Base):
-    """Email channel configuration (IMAP inbound; outbound via Gmail draft tool only)."""
+    """Email channel configuration (IMAP inbound + SMTP outbound)."""
 
     enabled: bool = False
     consent_granted: bool = False
@@ -49,16 +48,17 @@ class EmailConfig(Base):
     from_address: str = ""
 
     auto_reply_enabled: bool = True
-    # Final agent replies for email sessions are posted here (Slack channel/DM target)
-    # instead of attempting email outbound. Requires channels.slack enabled.
     outbound_slack_channel: str = ""
-    imap_idle_enabled: bool = True  # Gmail/IMAP IDLE for near-real-time inbound (falls back to poll)
-    poll_interval_seconds: int = 60  # Max 60s between checks when IDLE is off or as IDLE cycle cap
+    imap_idle_enabled: bool = True
+    poll_interval_seconds: int = 60
     mark_seen: bool = True
+    post_action: Literal["delete", "move"] | None = None
+    post_action_move_mailbox: str | None = None
+    post_action_expunge: bool = False
+    post_action_ignore_skipped: bool = True
     max_body_chars: int = 12000
     subject_prefix: str = "Re: "
     allow_from: list[str] = Field(default_factory=list)
-    # Glob patterns (fnmatch); matching subjects are dropped before agent processing (not marked \\Seen).
     drop_subject_patterns: list[str] = Field(default_factory=list)
 
     # Email authentication verification (anti-spoofing)
@@ -71,23 +71,27 @@ class EmailConfig(Base):
     max_attachments_per_email: int = 5
 
 
+@dataclass
+class _ServerFeatures:
+    move: bool
+    uidplus: bool
+    uid_store: bool | None = None
+
+
 class EmailChannel(BaseChannel):
     """
     Email channel.
 
     Inbound:
-    - IMAP to the mailbox (Gmail-friendly). Prefer IMAP IDLE for near-real-time
-      notifications when ``imap_idle_enabled`` is true; otherwise poll at
-      ``poll_interval_seconds`` (clamped to at most 60s).
+    - Poll IMAP mailbox for unread messages.
+    - Convert each message into an inbound event.
 
     Outbound:
-    - SMTP sending is disabled by policy. Use the ``create_gmail_draft`` tool
-      for human-reviewed Gmail drafts instead.
+    - Disabled by policy; use ``create_gmail_draft`` for draft replies.
     """
 
     name = "email"
     display_name = "Email"
-    _MAX_PROCESSED_UIDS = 100_000
     _POLL_INTERVAL_MIN = 5
     _POLL_INTERVAL_MAX = 60  # inbound policy: poll at most once per minute
     _IMAP_MONTHS = (
@@ -133,32 +137,14 @@ class EmailChannel(BaseChannel):
         self._last_subject_by_chat: dict[str, str] = {}
         self._last_message_id_by_chat: dict[str, str] = {}
         self._processed_uids: set[str] = set()  # Capped to prevent unbounded growth
+        self._MAX_PROCESSED_UIDS = 100000
 
     @classmethod
     def _clamp_poll_interval(cls, seconds: int) -> int:
         return max(cls._POLL_INTERVAL_MIN, min(cls._POLL_INTERVAL_MAX, int(seconds)))
 
-    async def _deliver_inbound_batch(self, inbound_items: list[dict[str, Any]]) -> None:
-        for item in inbound_items:
-            sender = item["sender"]
-            subject = item.get("subject", "")
-            message_id = item.get("message_id", "")
-
-            if subject:
-                self._last_subject_by_chat[sender] = subject
-            if message_id:
-                self._last_message_id_by_chat[sender] = message_id
-
-            await self._handle_message(
-                sender_id=sender,
-                chat_id=sender,
-                content=item["content"],
-                media=item.get("media") or None,
-                metadata=item.get("metadata", {}),
-            )
-
     async def start(self) -> None:
-        """Start IMAP IDLE (immediate) or polling (≤60s) for inbound emails."""
+        """Start polling IMAP for inbound emails."""
         if not self.config.consent_granted:
             self.logger.warning(
                 "Email channel disabled: consent_granted is false. "
@@ -176,49 +162,53 @@ class EmailChannel(BaseChannel):
                 "Emails with spoofed From headers will be accepted. "
                 "Set verify_dkim=true and verify_spf=true for anti-spoofing protection."
             )
+        self.logger.info("Starting Email channel (IMAP polling mode)...")
 
         poll_seconds = self._clamp_poll_interval(self.config.poll_interval_seconds)
-        use_idle = self.config.imap_idle_enabled
-        idle_failed = False
-        if use_idle:
-            self.logger.info(
-                "Starting Email channel (IMAP IDLE, {}s max wait between checks)...",
-                poll_seconds,
-            )
-        else:
-            self.logger.info("Starting Email channel (IMAP poll every {}s)...", poll_seconds)
-
         while self._running:
             try:
-                if use_idle and not idle_failed:
+                inbound_items, skipped_uids = await asyncio.to_thread(self._fetch_new_messages)
+                should_apply_post_action = self._should_apply_post_action()
+                post_actions_uids: set[str] = set()
+                for item in inbound_items:
+                    sender = item["sender"]
+                    subject = item.get("subject", "")
+                    message_id = item.get("message_id", "")
+
+                    if subject:
+                        self._last_subject_by_chat[sender] = subject
+                    if message_id:
+                        self._last_message_id_by_chat[sender] = message_id
+
                     try:
-                        await asyncio.to_thread(self._imap_idle_wait, poll_seconds)
-                    except Exception as exc:
-                        self.logger.warning(
-                            "IMAP IDLE unavailable ({}), falling back to {}s polling",
-                            exc,
-                            poll_seconds,
+                        await self._handle_message(
+                            sender_id=sender,
+                            chat_id=sender,
+                            content=item["content"],
+                            media=item.get("media") or None,
+                            metadata=item.get("metadata", {}),
                         )
-                        idle_failed = True
+                    except Exception:
+                        self.logger.exception("Error delivering email from {}", sender)
+                        continue
 
-                inbound_items = await asyncio.to_thread(self._fetch_new_messages)
-                await self._deliver_inbound_batch(inbound_items)
+                    uid = str((item.get("metadata") or {}).get("uid") or "")
+                    if uid and should_apply_post_action:
+                        post_actions_uids.add(uid)
 
-                if not use_idle or idle_failed:
-                    await asyncio.sleep(poll_seconds)
+                if should_apply_post_action and not self.config.post_action_ignore_skipped:
+                    post_actions_uids.update(skipped_uids)
+
+                if post_actions_uids:
+                    await asyncio.to_thread(self._apply_post_actions_batch, sorted(post_actions_uids))
             except Exception:
                 self.logger.exception("Polling error")
-                await asyncio.sleep(poll_seconds)
+
+            await asyncio.sleep(poll_seconds)
 
     async def stop(self) -> None:
         """Stop polling loop."""
         self._running = False
-
-    def send_message(self, *args: Any, **kwargs: Any) -> None:
-        """Legacy hook; email delivery is disabled (see :meth:`send`)."""
-        raise NotImplementedError(
-            "Email sending is disabled by policy. Use the create_gmail_draft tool instead.",
-        )
 
     async def send(self, msg: OutboundMessage) -> None:
         """Email outbound delivery is disabled — use ``create_gmail_draft`` for drafts."""
@@ -235,68 +225,39 @@ class EmailChannel(BaseChannel):
         if not self.config.imap_password:
             missing.append("imap_password")
 
+        if self.config.post_action == "move" and not (self.config.post_action_move_mailbox or "").strip():
+            missing.append("post_action_move_mailbox")
+
         if missing:
             self.logger.error("Channel not configured, missing: {}", ', '.join(missing))
             return False
         return True
 
-    def _imap_idle_wait(self, timeout_seconds: float) -> None:
-        """Block on IMAP IDLE until mail may have arrived or *timeout_seconds* elapses."""
-        mailbox = self.config.imap_mailbox or "INBOX"
-        if self.config.imap_use_ssl:
-            client = imaplib.IMAP4_SSL(self.config.imap_host, self.config.imap_port)
-        else:
-            client = imaplib.IMAP4(self.config.imap_host, self.config.imap_port)
+    def _matching_drop_subject_pattern(self, subject: str) -> str | None:
+        """Return the first matching dropSubjectPatterns entry, or None."""
+        if not self.config.drop_subject_patterns:
+            return None
+        subj = (subject or "").casefold()
+        for pat in self.config.drop_subject_patterns:
+            p = (pat or "").strip()
+            if not p:
+                continue
+            folded = p.casefold()
+            try:
+                matched = fnmatch(subj, folded)
+            except Exception as exc:
+                self.logger.warning(
+                    "Invalid dropSubjectPatterns entry {!r} ignored: {}",
+                    p,
+                    exc,
+                )
+                continue
+            if matched:
+                return p
+        return None
 
-        try:
-            client.login(self.config.imap_username, self.config.imap_password)
-            status, _ = client.select(mailbox)
-            if status != "OK":
-                raise RuntimeError(f"IMAP select failed: {status}")
-
-            tag = client._new_tag()
-            client.send(tag + b" IDLE\r\n")
-
-            while True:
-                line = client.readline()
-                if not line:
-                    raise ConnectionError("IMAP IDLE: connection closed during handshake")
-                if line.startswith(b"+"):
-                    break
-                if line.startswith(tag):
-                    raise RuntimeError(f"IMAP IDLE rejected: {line!r}")
-
-            sock = client.socket()
-            if sock is None:
-                raise RuntimeError("IMAP IDLE: socket unavailable")
-
-            deadline = time.monotonic() + float(timeout_seconds)
-            while time.monotonic() < deadline:
-                wait = min(30.0, deadline - time.monotonic())
-                if wait <= 0:
-                    break
-                readable, _, _ = select.select([sock], [], [], wait)
-                if not readable:
-                    continue
-                line = client.readline()
-                if line.startswith(b"*") and (
-                    b"EXISTS" in line or b"RECENT" in line or b"EXPUNGE" in line
-                ):
-                    break
-
-            client.send(b"DONE\r\n")
-            while True:
-                line = client.readline()
-                if not line:
-                    break
-                if line.startswith(tag):
-                    break
-        finally:
-            with suppress(Exception):
-                client.logout()
-
-    def _fetch_new_messages(self) -> list[dict[str, Any]]:
-        """Poll IMAP and return parsed unread messages."""
+    def _fetch_new_messages(self) -> tuple[list[dict[str, Any]], set[str]]:
+        """Poll IMAP and return parsed unread messages plus skipped message UIDs."""
         return self._fetch_messages(
             search_criteria=("UNSEEN",),
             mark_seen=self.config.mark_seen,
@@ -318,7 +279,7 @@ class EmailChannel(BaseChannel):
         if end_date <= start_date:
             return []
 
-        return self._fetch_messages(
+        messages, _ = self._fetch_messages(
             search_criteria=(
                 "SINCE",
                 self._format_imap_date(start_date),
@@ -329,6 +290,7 @@ class EmailChannel(BaseChannel):
             dedupe=False,
             limit=max(1, int(limit)),
         )
+        return messages
 
     def _fetch_messages(
         self,
@@ -336,8 +298,9 @@ class EmailChannel(BaseChannel):
         mark_seen: bool,
         dedupe: bool,
         limit: int,
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], set[str]]:
         messages: list[dict[str, Any]] = []
+        skipped_uids: set[str] = set()
         cycle_uids: set[str] = set()
 
         for attempt in range(2):
@@ -348,15 +311,16 @@ class EmailChannel(BaseChannel):
                     dedupe,
                     limit,
                     messages,
+                    skipped_uids,
                     cycle_uids,
                 )
-                return messages
+                return messages, skipped_uids
             except Exception as exc:
                 if attempt == 1 or not self._is_stale_imap_error(exc):
                     raise
                 self.logger.warning("IMAP connection went stale, retrying once: {}", exc)
 
-        return messages
+        return messages, skipped_uids
 
     def _fetch_messages_once(
         self,
@@ -365,29 +329,17 @@ class EmailChannel(BaseChannel):
         dedupe: bool,
         limit: int,
         messages: list[dict[str, Any]],
+        skipped_uids: set[str],
         cycle_uids: set[str],
     ) -> None:
         """Fetch messages by arbitrary IMAP search criteria."""
         mailbox = self.config.imap_mailbox or "INBOX"
 
-        if self.config.imap_use_ssl:
-            client = imaplib.IMAP4_SSL(self.config.imap_host, self.config.imap_port)
-        else:
-            client = imaplib.IMAP4(self.config.imap_host, self.config.imap_port)
+        client = self._open_imap_client(mailbox=mailbox, missing_mailbox_ok=True)
+        if client is None:
+            return messages
 
         try:
-            client.login(self.config.imap_username, self.config.imap_password)
-            try:
-                status, _ = client.select(mailbox)
-            except Exception as exc:
-                if self._is_missing_mailbox_error(exc):
-                    self.logger.warning("Mailbox unavailable, skipping poll for {}: {}", mailbox, exc)
-                    return messages
-                raise
-            if status != "OK":
-                self.logger.warning("Mailbox select returned {}, skipping poll for {}", status, mailbox)
-                return messages
-
             status, data = client.search(None, *search_criteria)
             if status != "OK" or not data:
                 return messages
@@ -419,17 +371,8 @@ class EmailChannel(BaseChannel):
                     self._remember_processed_uid(uid, dedupe, cycle_uids)
                     if mark_seen:
                         client.store(imap_id, "+FLAGS", "\\Seen")
-                    continue
-
-                subject = self._decode_header_value(parsed.get("Subject", ""))
-                drop_pattern = self._matching_drop_subject_pattern(subject)
-                if drop_pattern is not None:
-                    self.logger.info(
-                        "Subject {!r} dropped: matches dropSubjectPatterns {!r}",
-                        subject,
-                        drop_pattern,
-                    )
-                    self._remember_processed_uid(uid, dedupe, cycle_uids)
+                    if uid:
+                        skipped_uids.add(uid)
                     continue
 
                 # --- Anti-spoofing: verify Authentication-Results ---
@@ -441,6 +384,8 @@ class EmailChannel(BaseChannel):
                         sender,
                     )
                     self._remember_processed_uid(uid, dedupe, cycle_uids)
+                    if uid:
+                        skipped_uids.add(uid)
                     continue
                 if self.config.verify_dkim and not dkim_pass:
                     self.logger.warning(
@@ -449,14 +394,32 @@ class EmailChannel(BaseChannel):
                         sender,
                     )
                     self._remember_processed_uid(uid, dedupe, cycle_uids)
+                    if uid:
+                        skipped_uids.add(uid)
                     continue
 
                 if not self.is_allowed(sender):
                     self._remember_processed_uid(uid, dedupe, cycle_uids)
                     if mark_seen:
                         client.store(imap_id, "+FLAGS", "\\Seen")
+                    if uid:
+                        skipped_uids.add(uid)
                     continue
 
+                subject = self._decode_header_value(parsed.get("Subject", ""))
+                drop_pattern = self._matching_drop_subject_pattern(subject)
+                if drop_pattern is not None:
+                    self.logger.info(
+                        "Subject {!r} dropped: matches dropSubjectPatterns {!r}",
+                        subject,
+                        drop_pattern,
+                    )
+                    self._remember_processed_uid(uid, dedupe, cycle_uids)
+                    if mark_seen:
+                        client.store(imap_id, "+FLAGS", "\\Seen")
+                    if uid:
+                        skipped_uids.add(uid)
+                    continue
                 date_value = parsed.get("Date", "")
                 message_id = parsed.get("Message-ID", "").strip()
                 body = self._extract_text_body(parsed)
@@ -492,7 +455,6 @@ class EmailChannel(BaseChannel):
                     "subject": subject,
                     "date": date_value,
                     "sender_email": sender,
-                    "email_body": body,
                     "uid": uid,
                 }
                 messages.append(
@@ -511,8 +473,39 @@ class EmailChannel(BaseChannel):
                 if mark_seen:
                     client.store(imap_id, "+FLAGS", "\\Seen")
         finally:
-            with suppress(Exception):
-                client.logout()
+            self._close_imap_client(client)
+
+    def _open_imap_client(self, mailbox: str, *, missing_mailbox_ok: bool = False) -> Any | None:
+        if self.config.imap_use_ssl:
+            client: Any = imaplib.IMAP4_SSL(self.config.imap_host, self.config.imap_port)
+        else:
+            client = imaplib.IMAP4(self.config.imap_host, self.config.imap_port)
+
+        try:
+            client.login(self.config.imap_username, self.config.imap_password)
+            try:
+                status, _ = client.select(mailbox)
+            except Exception as exc:
+                if missing_mailbox_ok and self._is_missing_mailbox_error(exc):
+                    self.logger.warning("Mailbox unavailable, skipping poll for {}: {}", mailbox, exc)
+                    self._close_imap_client(client)
+                    return None
+                raise
+
+            if status != "OK":
+                self.logger.warning("Mailbox select returned {}, skipping poll for {}", status, mailbox)
+                self._close_imap_client(client)
+                return None
+        except Exception:
+            self._close_imap_client(client)
+            raise
+
+        return client
+
+    @staticmethod
+    def _close_imap_client(client: Any) -> None:
+        with suppress(Exception):
+            client.logout()
 
     def _collect_self_addresses(self) -> set[str]:
         """Return normalized email addresses owned by this channel instance."""
@@ -546,29 +539,6 @@ class EmailChannel(BaseChannel):
         normalized_sender = self._normalize_address(sender)
         return bool(normalized_sender) and normalized_sender in self._self_addresses
 
-    def _matching_drop_subject_pattern(self, subject: str) -> str | None:
-        """Return the first matching dropSubjectPatterns entry, or None."""
-        if not self.config.drop_subject_patterns:
-            return None
-        subj = (subject or "").casefold()
-        for pat in self.config.drop_subject_patterns:
-            p = (pat or "").strip()
-            if not p:
-                continue
-            folded = p.casefold()
-            try:
-                matched = fnmatch(subj, folded)
-            except Exception as exc:
-                self.logger.warning(
-                    "Invalid dropSubjectPatterns entry {!r} ignored: {}",
-                    p,
-                    exc,
-                )
-                continue
-            if matched:
-                return p
-        return None
-
     def _remember_processed_uid(self, uid: str, dedupe: bool, cycle_uids: set[str]) -> None:
         """Track a fetched UID so skipped messages are not reprocessed forever."""
         if not uid:
@@ -580,6 +550,118 @@ class EmailChannel(BaseChannel):
             if len(self._processed_uids) > self._MAX_PROCESSED_UIDS:
                 # Evict a random half to cap memory; mark_seen is the primary dedup
                 self._processed_uids = set(list(self._processed_uids)[len(self._processed_uids) // 2:])
+
+    def _should_apply_post_action(self) -> bool:
+        return self.config.post_action in {"delete", "move"}
+
+    def _apply_post_actions_batch(self, post_actions_uids: list[str]) -> None:
+        if not self._should_apply_post_action() or not post_actions_uids:
+            return
+
+        mailbox = self.config.imap_mailbox or "INBOX"
+        client = self._open_imap_client(mailbox=mailbox)
+        if client is None:
+            return
+
+        try:
+            features = self._server_features(client)
+            # Apply all post-actions in one IMAP session. `features` also carries
+            # session-learned behavior (e.g. UID STORE support) so later UIDs can
+            # skip known-broken paths.
+            for uid in post_actions_uids:
+                if uid:
+                    self._apply_post_action(client, uid, features)
+        finally:
+            self._close_imap_client(client)
+
+    def _apply_post_action(
+        self,
+        client: Any,
+        uid: str,
+        features: _ServerFeatures,
+    ) -> None:
+        action = self.config.post_action
+
+        if action == "delete":
+            if not self._uid_store_deleted(client, uid, features):
+                return
+            self._uid_expunge_or_fallback(client, uid, features)
+            return
+
+        if action == "move":
+            target = (self.config.post_action_move_mailbox or "").strip()
+            if features.move:
+                status, _ = client.uid("MOVE", uid, target)
+                if status != "OK":
+                    self.logger.warning("Post-action move failed (UID MOVE) for UID {} to mailbox {}", uid, target)
+                return
+
+            status, _ = client.uid("COPY", uid, target)
+            if status != "OK":
+                self.logger.warning("Post-action move failed (UID COPY) for UID {} to mailbox {}", uid, target)
+                return
+            if not self._uid_store_deleted(client, uid, features):
+                return
+            self._uid_expunge_or_fallback(client, uid, features)
+
+    @staticmethod
+    def _server_features(client: Any) -> _ServerFeatures:
+        caps: set[str] = set()
+        with suppress(Exception):
+            status, data = client.capability()
+            if status == "OK" and data:
+                for raw in data:
+                    if isinstance(raw, (bytes, bytearray)):
+                        caps.update(token.upper() for token in raw.decode("utf-8", errors="ignore").split())
+                    elif isinstance(raw, str):
+                        caps.update(token.upper() for token in raw.split())
+        return _ServerFeatures(move="MOVE" in caps, uidplus="UIDPLUS" in caps)
+
+    @staticmethod
+    def _lookup_imap_id_by_uid(client: Any, uid: str) -> bytes | None:
+        # IMAP exposes two message identifiers: UID (stable) and sequence number
+        # (session-local). We target by UID first, but some servers may reject
+        # UID STORE. In that case we resolve the current sequence number for the
+        # UID and retry with STORE using that sequence id.
+        status, data = client.search(None, "UID", uid)
+        if status != "OK" or not data or not data[0]:
+            return None
+        return data[0].split()[0]
+
+    def _uid_store_deleted(self, client: Any, uid: str, features: _ServerFeatures) -> bool:
+        # Optimistic path: try UID STORE first because UID is stable and avoids
+        # sequence-number lookup. If this fails once for the session, remember it
+        # and use the sequence STORE fallback directly for remaining UIDs.
+        if features.uid_store is not False:
+            status, _ = client.uid("STORE", uid, "+FLAGS", "(\\Deleted)")
+            if status == "OK":
+                features.uid_store = True
+                return True
+            features.uid_store = False
+
+        # Compatibility fallback for servers where UID STORE is unavailable or
+        # unreliable: resolve the current sequence number from UID and use STORE.
+        imap_id = self._lookup_imap_id_by_uid(client, uid)
+        if not imap_id:
+            self.logger.warning("Post-action skipped: UID {} not found", uid)
+            return False
+
+        status, _ = client.store(imap_id, "+FLAGS", "\\Deleted")
+        if status != "OK":
+            self.logger.warning("Post-action failed: could not mark UID {} as deleted", uid)
+            return False
+        return True
+
+    def _uid_expunge_or_fallback(self, client: Any, uid: str, features: _ServerFeatures) -> None:
+        # Prefer UID-scoped expunge when supported to avoid expunging unrelated
+        # messages already marked \Deleted in the selected mailbox.
+        if features.uidplus:
+            status, _ = client.uid("EXPUNGE", uid)
+            if status == "OK":
+                return
+            self.logger.warning("UID EXPUNGE failed for UID {}, falling back to EXPUNGE", uid)
+        if self.config.post_action_expunge:
+            client.expunge()
 
     @classmethod
     def _is_stale_imap_error(cls, exc: Exception) -> bool:

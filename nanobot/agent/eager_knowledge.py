@@ -21,7 +21,10 @@ _EAGER_LAST_FLUSH_KEY = "_prospr_eager_last_flush_at"
 
 def read_eager_cursor(session: Session) -> int:
     """Return the eager archive cursor, clamped to the current message list."""
-    raw = session.metadata.get(_EAGER_CURSOR_KEY, 0)
+    meta = getattr(session, "metadata", None)
+    if not isinstance(meta, dict):
+        return 0
+    raw = meta.get(_EAGER_CURSOR_KEY, 0)
     try:
         cursor = int(raw)
     except (TypeError, ValueError):

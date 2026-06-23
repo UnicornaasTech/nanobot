@@ -3,20 +3,24 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from nanobot.agent.runner import AgentRunner, AgentRunSpec
 from nanobot.agent.tools.base import Tool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.config.schema import AgentDefaults
 from nanobot.providers.base import LLMResponse, ToolCallRequest
+from nanobot.providers.openai_compat_provider import OpenAICompatProvider
+from nanobot.providers.openai_responses.parsing import parse_response_output
 
 _MAX_TOOL_RESULT_CHARS = AgentDefaults().max_tool_result_chars
 
 
-def _empty_tool_tracking() -> tuple[dict, dict, dict, dict, set, set, dict]:
+def _empty_tool_guard_state() -> tuple[dict, dict, dict, dict, set, set, dict]:
     return {}, {}, {}, {}, set(), set(), {}
+
 
 class _DelayTool(Tool):
     def __init__(
@@ -61,10 +65,45 @@ class _DelayTool(Tool):
         return self._name
 
 
+async def _run_optional_tool_response(response: LLMResponse):
+    provider = MagicMock()
+    calls = {"n": 0}
+
+    async def chat_with_retry(*, messages, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return response
+        return LLMResponse(content="done", tool_calls=[], usage={})
+
+    provider.chat_with_retry = chat_with_retry
+    tools = ToolRegistry()
+    shared_events: list[str] = []
+    tools.register(_DelayTool(
+        "optional_tool",
+        delay=0,
+        read_only=True,
+        shared_events=shared_events,
+    ))
+
+    result = await AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "try optional"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=2,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    ))
+    return result, shared_events
+
+
+def _tool_message(result, tool_call_id: str) -> dict:
+    return [
+        msg for msg in result.messages
+        if msg.get("role") == "tool" and msg.get("tool_call_id") == tool_call_id
+    ][0]
+
+
 @pytest.mark.asyncio
 async def test_runner_batches_read_only_tools_before_exclusive_work():
-    from nanobot.agent.runner import AgentRunSpec, AgentRunner
-
     tools = ToolRegistry()
     shared_events: list[str] = []
     read_a = _DelayTool("read_a", delay=0.05, read_only=True, shared_events=shared_events)
@@ -89,7 +128,7 @@ async def test_runner_batches_read_only_tools_before_exclusive_work():
             ToolCallRequest(id="ro2", name="read_b", arguments={}),
             ToolCallRequest(id="rw1", name="write_a", arguments={}),
         ],
-        *_empty_tool_tracking(),
+        *_empty_tool_guard_state(),
     )
 
     assert shared_events[0:2] == ["start:read_a", "start:read_b"]
@@ -101,8 +140,6 @@ async def test_runner_batches_read_only_tools_before_exclusive_work():
 
 @pytest.mark.asyncio
 async def test_runner_does_not_batch_exclusive_read_only_tools():
-    from nanobot.agent.runner import AgentRunSpec, AgentRunner
-
     tools = ToolRegistry()
     shared_events: list[str] = []
     read_a = _DelayTool("read_a", delay=0.03, read_only=True, shared_events=shared_events)
@@ -133,7 +170,7 @@ async def test_runner_does_not_batch_exclusive_read_only_tools():
             ToolCallRequest(id="ddg1", name="ddg_like", arguments={}),
             ToolCallRequest(id="ro2", name="read_b", arguments={}),
         ],
-        *_empty_tool_tracking(),
+        *_empty_tool_guard_state(),
     )
 
     assert shared_events[0] == "start:read_a"
@@ -142,9 +179,151 @@ async def test_runner_does_not_batch_exclusive_read_only_tools():
 
 
 @pytest.mark.asyncio
-async def test_runner_blocks_repeated_external_fetches():
-    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+async def test_runner_rejects_near_miss_tool_name_without_executing():
+    provider = MagicMock()
+    call_count = {"n": 0}
+    captured_second_call: list[dict] = []
 
+    async def chat_with_retry(*, messages, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCallRequest(
+                        id="call_1",
+                        name="readFile",
+                        arguments={"path": "notes.txt"},
+                    )
+                ],
+                finish_reason="tool_calls",
+                usage={},
+            )
+        captured_second_call[:] = messages
+        return LLMResponse(content="done", tool_calls=[], usage={})
+
+    provider.chat_with_retry = chat_with_retry
+    tools = ToolRegistry()
+    shared_events: list[str] = []
+    tools.register(_DelayTool(
+        "read_file",
+        delay=0,
+        read_only=True,
+        shared_events=shared_events,
+    ))
+
+    runner = AgentRunner(provider)
+    result = await runner.run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "read notes"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=2,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    ))
+
+    assert result.final_content == "done"
+    assert result.tools_used == []
+    assert shared_events == []
+    assistant_message = [
+        msg for msg in result.messages
+        if msg.get("role") == "assistant" and msg.get("tool_calls")
+    ][0]
+    assert assistant_message["tool_calls"][0]["function"]["name"] == "readFile"
+    tool_message = [
+        msg for msg in result.messages
+        if msg.get("role") == "tool" and msg.get("tool_call_id") == "call_1"
+    ][0]
+    assert tool_message["name"] == "readFile"
+    assert "Tool 'readFile' not found" in tool_message["content"]
+    assert "Did you mean 'read_file'?" in tool_message["content"]
+    replayed_assistant = [
+        msg for msg in captured_second_call
+        if msg.get("role") == "assistant" and msg.get("tool_calls")
+    ][0]
+    assert replayed_assistant["tool_calls"][0]["function"]["name"] == "readFile"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("arguments", ['{path:"notes.txt"}', "null"])
+async def test_runner_rejects_openai_compat_invalid_arguments_without_executing(arguments):
+    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI"):
+        parsed = OpenAICompatProvider()._parse({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "optional_tool",
+                            "arguments": arguments,
+                        },
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }],
+            "usage": {},
+        })
+
+    result, shared_events = await _run_optional_tool_response(parsed)
+
+    assert result.final_content == "done"
+    assert parsed.tool_calls[0].arguments == arguments
+    assert result.tools_used == []
+    assert shared_events == []
+    tool_message = _tool_message(result, "call_1")
+    assert "parameters must be a JSON object" in tool_message["content"]
+
+
+@pytest.mark.asyncio
+async def test_runner_rejects_openai_responses_malformed_arguments_without_executing():
+    parsed = parse_response_output({
+        "output": [{
+            "type": "function_call",
+            "call_id": "call_1",
+            "id": "fc_1",
+            "name": "optional_tool",
+            "arguments": "{bad",
+        }],
+        "status": "completed",
+        "usage": {},
+    })
+
+    result, shared_events = await _run_optional_tool_response(parsed)
+
+    assert result.final_content == "done"
+    assert parsed.tool_calls[0].arguments == "{bad"
+    assert result.tools_used == []
+    assert shared_events == []
+    tool_message = _tool_message(result, "call_1|fc_1")
+    assert "parameters must be a JSON object" in tool_message["content"]
+
+
+@pytest.mark.asyncio
+async def test_runner_rejects_openai_responses_array_arguments_without_executing():
+    parsed = parse_response_output({
+        "output": [{
+            "type": "function_call",
+            "call_id": "call_1",
+            "id": "fc_1",
+            "name": "optional_tool",
+            "arguments": [],
+        }],
+        "status": "completed",
+        "usage": {},
+    })
+
+    result, shared_events = await _run_optional_tool_response(parsed)
+
+    assert result.final_content == "done"
+    assert parsed.tool_calls[0].arguments == []
+    assert result.tools_used == []
+    assert shared_events == []
+    tool_message = _tool_message(result, "call_1|fc_1")
+    assert "parameters must be a JSON object" in tool_message["content"]
+
+
+@pytest.mark.asyncio
+async def test_runner_blocks_repeated_external_fetches():
     provider = MagicMock()
     captured_final_call: list[dict] = []
     call_count = {"n": 0}
@@ -152,9 +331,17 @@ async def test_runner_blocks_repeated_external_fetches():
     async def chat_with_retry(*, messages, **kwargs):
         call_count["n"] += 1
         if call_count["n"] <= 3:
+            # Same URL but different optional args so batch-repeat guard stays idle.
             return LLMResponse(
                 content="working",
-                tool_calls=[ToolCallRequest(id=f"call_{call_count['n']}", name="web_fetch", arguments={"url": "https://example.com"})],
+                tool_calls=[ToolCallRequest(
+                    id=f"call_{call_count['n']}",
+                    name="web_fetch",
+                    arguments={
+                        "url": "https://example.com",
+                        "max_length": 1000 + call_count["n"],
+                    },
+                )],
                 usage={},
             )
         captured_final_call[:] = messages
@@ -174,64 +361,10 @@ async def test_runner_blocks_repeated_external_fetches():
         max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
     ))
 
-    # The batch guard fires on the 3rd identical single-tool batch, injecting a
-    # forcing message before the per-tool external-lookup guard can turn it into
-    # a fatal error.  The model then produces a final answer ("done").
-    assert result.final_content is not None
+    assert result.final_content == "done"
     assert tools.execute.await_count == 2
-    assert result.had_injections
-
-
-@pytest.mark.asyncio
-async def test_runner_injects_on_repeated_tool_batch():
-    from nanobot.agent.runner import AgentRunSpec, AgentRunner
-    from nanobot.utils.runtime import REPEATED_TOOL_BATCH_PROMPT
-
-    same_batch = [
-        ToolCallRequest(id="s1", name="web_search", arguments={"query": "tallinn events"}),
-        ToolCallRequest(id="s2", name="web_search", arguments={"query": "tartu events"}),
-    ]
-    provider = MagicMock()
-    call_count = {"n": 0}
-    captured_messages: list[list[dict]] = []
-
-    async def chat_with_retry(*, messages, **kwargs):
-        call_count["n"] += 1
-        if call_count["n"] <= 3:
-            return LLMResponse(content="", tool_calls=list(same_batch), usage={})
-        captured_messages.append(messages)
-        return LLMResponse(content="here is the answer", tool_calls=[], usage={})
-
-    provider.chat_with_retry = chat_with_retry
-    tools = MagicMock()
-    tools.get_definitions.return_value = []
-    tools.execute = AsyncMock(return_value="search results")
-
-    runner = AgentRunner(provider)
-    result = await runner.run(AgentRunSpec(
-        initial_messages=[{"role": "user", "content": "find events"}],
-        tools=tools,
-        model="test-model",
-        max_iterations=6,
-        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
-    ))
-
-    assert result.final_content == "here is the answer"
-    assert tools.execute.await_count == 4  # two real batches × two tools; third blocked
-    final_msgs = captured_messages[-1]
-    roles = [m["role"] for m in final_msgs]
-    # Forcing message must appear in history.
-    assert any(
-        m.get("role") == "user" and REPEATED_TOOL_BATCH_PROMPT in m.get("content", "")
-        for m in final_msgs
-    )
-    # The blocked assistant turn (tool_calls) must precede the forcing message so it
-    # is contextually coherent for the model.
-    forcing_idx = next(
-        i for i, m in enumerate(final_msgs)
-        if m.get("role") == "user" and REPEATED_TOOL_BATCH_PROMPT in m.get("content", "")
-    )
-    assert any(
-        final_msgs[i].get("role") == "assistant" and final_msgs[i].get("tool_calls")
-        for i in range(forcing_idx)
-    )
+    blocked_tool_message = [
+        msg for msg in captured_final_call
+        if msg.get("role") == "tool" and msg.get("tool_call_id") == "call_3"
+    ][0]
+    assert "repeated external lookup blocked" in blocked_tool_message["content"]

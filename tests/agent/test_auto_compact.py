@@ -45,6 +45,33 @@ def _add_turns(session, turns: int, *, prefix: str = "msg") -> None:
         session.add_message("assistant", f"{prefix} assistant {i}")
 
 
+def _add_tool_turn(session, prefix: str, idx: int) -> None:
+    call_id = f"{prefix}_{idx}"
+    session.messages.append(
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": "exec", "arguments": "{}"},
+                }
+            ],
+            "timestamp": datetime.now().isoformat(),
+        }
+    )
+    session.messages.append(
+        {
+            "role": "tool",
+            "tool_call_id": call_id,
+            "name": "exec",
+            "content": "ok",
+            "timestamp": datetime.now().isoformat(),
+        }
+    )
+
+
 def _make_fake_compact(
     loop: AgentLoop,
     *,
@@ -76,10 +103,12 @@ def _make_fake_compact(
             metadata={},
             last_consolidated=0,
         )
-        probe.retain_recent_legal_suffix(max_suffix)
+        dropped, already_consolidated = probe.retain_recent_legal_suffix(
+            max_suffix,
+            extend_to_user=True,
+        )
         kept = probe.messages
-        cut = len(tail) - len(kept)
-        archive_msgs = tail[:cut]
+        archive_msgs = dropped[already_consolidated:]
 
         if not archive_msgs and not kept:
             session.updated_at = datetime.now()
@@ -112,12 +141,24 @@ def _make_fake_compact(
     return _fake_compact
 
 
+async def _drain_background_tasks(loop: AgentLoop) -> None:
+    tasks = list(loop._background_tasks)
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    await asyncio.sleep(0)
+
+
 class TestSessionTTLConfig:
     """Test session TTL configuration."""
 
-    def test_default_ttl_is_zero(self):
-        """Default TTL should be 0 (disabled)."""
+    def test_default_ttl_is_fifteen_minutes(self):
+        """Default TTL should proactively compact stale sessions."""
         defaults = AgentDefaults()
+        assert defaults.session_ttl_minutes == 15
+
+    def test_explicit_zero_disables_ttl(self):
+        """Explicit 0 should still disable idle auto-compact."""
+        defaults = AgentDefaults(session_ttl_minutes=0)
         assert defaults.session_ttl_minutes == 0
 
     def test_custom_ttl(self):
@@ -270,7 +311,7 @@ class TestAutoCompact:
 
         loop.consolidator.compact_idle_session = _make_fake_compact(loop)
         loop.auto_compact.check_expired(loop._schedule_background)
-        await asyncio.sleep(0.1)
+        await _drain_background_tasks(loop)
 
         active_after = loop.sessions.get_or_create("cli:active")
         assert len(active_after.messages) == 1
@@ -297,6 +338,35 @@ class TestAutoCompact:
         assert len(session_after.messages) == loop.auto_compact._RECENT_SUFFIX_MESSAGES
         assert session_after.messages[0]["content"] == "msg user 2"
         assert session_after.messages[-1]["content"] == "msg assistant 5"
+        await loop.close_mcp()
+
+    @pytest.mark.asyncio
+    async def test_auto_compact_extends_recent_suffix_to_user_turn(self, tmp_path):
+        loop = _make_loop(tmp_path, session_ttl_minutes=15)
+        session = loop.sessions.get_or_create("cli:test")
+        _add_turns(session, 2, prefix="old")
+        session.add_message("user", "record this")
+        for i in range(8):
+            _add_tool_turn(session, "recent", i)
+        session.add_message("assistant", "done")
+        loop.sessions.save(session)
+
+        await loop.auto_compact._archive("cli:test")
+
+        session_after = loop.sessions.get_or_create("cli:test")
+        assert len(session_after.messages) > loop.auto_compact._RECENT_SUFFIX_MESSAGES
+        assert session_after.messages[0]["content"] == "record this"
+        assert session_after.messages[-1]["content"] == "done"
+        tool_results = {
+            m.get("tool_call_id")
+            for m in session_after.messages
+            if m.get("role") == "tool"
+        }
+        assert all(
+            tc["id"] in tool_results
+            for m in session_after.messages
+            for tc in (m.get("tool_calls") or [])
+        )
         await loop.close_mcp()
 
     @pytest.mark.asyncio
@@ -711,7 +781,7 @@ class TestProactiveAutoCompact:
             loop._schedule_background,
             active_session_keys=active_session_keys,
         )
-        await asyncio.sleep(0.1)
+        await _drain_background_tasks(loop)
 
     @pytest.mark.asyncio
     async def test_no_check_when_ttl_disabled(self, tmp_path):
@@ -750,6 +820,27 @@ class TestProactiveAutoCompact:
         entry = loop.auto_compact._summaries.get("cli:test")
         assert entry is not None
         assert entry[0] == "User chatted about old things."
+        await loop.close_mcp()
+
+    @pytest.mark.asyncio
+    async def test_proactive_archive_skips_dream_sessions(self, tmp_path):
+        """Internal Dream sessions should be left to Dream retention, not idle compact."""
+        loop = _make_loop(tmp_path, session_ttl_minutes=15)
+        session = loop.sessions.get_or_create("dream:20260602-155256")
+        _add_turns(session, 6, prefix="dream")
+        session.updated_at = datetime.now() - timedelta(minutes=20)
+        loop.sessions.save(session)
+
+        _fake_compact = _make_fake_compact(loop)
+        loop.consolidator.compact_idle_session = _fake_compact
+
+        await self._run_check_expired(loop)
+
+        session_after = loop.sessions.get_or_create("dream:20260602-155256")
+        assert len(session_after.messages) == 12
+        assert _fake_compact.state["count"] == 0
+        assert "dream:20260602-155256" not in loop.auto_compact._archiving
+        assert "dream:20260602-155256" not in loop.auto_compact._summaries
         await loop.close_mcp()
 
     @pytest.mark.asyncio
@@ -795,12 +886,11 @@ class TestProactiveAutoCompact:
 
         # Second call should skip (key is in _archiving)
         loop.auto_compact.check_expired(loop._schedule_background)
-        await asyncio.sleep(0.05)
         assert archive_count == 1
 
         # Clean up
         block_forever.set()
-        await asyncio.sleep(0.1)
+        await _drain_background_tasks(loop)
         await loop.close_mcp()
 
     @pytest.mark.asyncio

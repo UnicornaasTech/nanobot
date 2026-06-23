@@ -43,11 +43,12 @@ FINALIZATION_RETRY_PROMPT = (
     "Please provide your response to the user based on the conversation above."
 )
 
-MAX_ITERATIONS_FINALIZATION_PROMPT = (
-    "Maximum tool call iterations ({max_iterations}) has been reached. "
-    "Do not call any more tools. Provide your final response to the user "
-    "summarizing what you've learned and accomplished so far, and what "
-    "remains unfinished if applicable."
+BUDGET_EXHAUSTED_FINALIZATION_PROMPT = (
+    "The tool-call budget for this turn is exhausted. Based only on the "
+    "conversation and tool results above, provide a concise final response to "
+    "the user. Do not call or request tools. Do not claim the task is complete "
+    "unless the evidence above clearly shows it is complete. State what was "
+    "done, what remains, and the best next step if anything is incomplete."
 )
 
 LENGTH_RECOVERY_PROMPT = (
@@ -97,12 +98,9 @@ def build_finalization_retry_message() -> dict[str, str]:
     return {"role": "user", "content": FINALIZATION_RETRY_PROMPT}
 
 
-def build_max_iterations_finalization_message(max_iterations: int) -> dict[str, str]:
-    """Prompt the model to summarize progress after the iteration budget is exhausted."""
-    return {
-        "role": "user",
-        "content": MAX_ITERATIONS_FINALIZATION_PROMPT.format(max_iterations=max_iterations),
-    }
+def build_budget_exhausted_finalization_message() -> dict[str, str]:
+    """Prompt the model for a no-tools final response after budget exhaustion."""
+    return {"role": "user", "content": BUDGET_EXHAUSTED_FINALIZATION_PROMPT}
 
 
 def build_length_recovery_message() -> dict[str, str]:
@@ -120,8 +118,10 @@ def build_repeated_tool_batch_message() -> dict[str, str]:
     return {"role": "user", "content": REPEATED_TOOL_BATCH_PROMPT}
 
 
-def external_lookup_signature(tool_name: str, arguments: dict[str, Any]) -> str | None:
+def external_lookup_signature(tool_name: str, arguments: Any) -> str | None:
     """Stable signature for repeated external lookups we want to throttle."""
+    if not isinstance(arguments, dict):
+        return None
     if tool_name == "web_fetch":
         url = str(arguments.get("url") or "").strip()
         if url:
@@ -143,25 +143,19 @@ def external_lookup_signature(tool_name: str, arguments: dict[str, Any]) -> str 
 
 def repeated_external_lookup_error(
     tool_name: str,
-    arguments: dict[str, Any],
-    state: dict[str, Any],
+    arguments: Any,
+    seen_counts: dict[str, int],
 ) -> str | None:
-    """Block repeated consecutive external lookups after a small retry budget."""
+    """Block repeated external lookups after a small retry budget."""
     signature = external_lookup_signature(tool_name, arguments)
     if signature is None:
-        state[_REPEAT_STATE_LAST_KEY] = None
-        state[_REPEAT_STATE_STREAK_KEY] = 0
         return None
-    if state.get(_REPEAT_STATE_LAST_KEY) == signature:
-        count = int(state.get(_REPEAT_STATE_STREAK_KEY, 0)) + 1
-    else:
-        count = 1
-    state[_REPEAT_STATE_LAST_KEY] = signature
-    state[_REPEAT_STATE_STREAK_KEY] = count
+    count = seen_counts.get(signature, 0) + 1
+    seen_counts[signature] = count
     if count <= _MAX_REPEAT_EXTERNAL_LOOKUPS:
         return None
     logger.warning(
-        "Blocking repeated consecutive external lookup {} on attempt {}",
+        "Blocking repeated external lookup {} on attempt {}",
         signature[:160],
         count,
     )

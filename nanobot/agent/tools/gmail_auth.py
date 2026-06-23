@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from nanobot.config.schema import Base
+from nanobot.config_base import Base
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.compose",

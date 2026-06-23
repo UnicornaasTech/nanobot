@@ -16,7 +16,7 @@ from nanobot.agent.tools.schema import (
     tool_parameters_schema,
 )
 from nanobot.apps.cli import CliAppError, CliAppManager, CliAppsRuntimeConfig
-from nanobot.config.schema import Base
+from nanobot.config_base import Base
 from nanobot.security.workspace_access import current_tool_workspace
 
 

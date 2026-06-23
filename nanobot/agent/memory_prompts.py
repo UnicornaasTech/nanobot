@@ -7,4 +7,6 @@ def resolve_memory_template(base: str, *, generic_memory_only: bool) -> str:
     """Return template path under ``templates/`` for Consolidator or Dream prompts."""
     if generic_memory_only:
         return f"agent/{base}_generic.md"
+    if base in {"dream_phase1", "dream_phase2"}:
+        return "agent/dream.md"
     return f"agent/{base}.md"

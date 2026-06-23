@@ -23,8 +23,7 @@ def _make_loop(tmp_path: Path, unified_session: bool = True) -> AgentLoop:
     provider = MagicMock()
     provider.get_default_model.return_value = "test-model"
     with patch("nanobot.agent.loop.SessionManager"), \
-         patch("nanobot.agent.loop.SubagentManager") as mock_sub_mgr, \
-         patch("nanobot.agent.loop.Dream"):
+         patch("nanobot.agent.loop.SubagentManager") as mock_sub_mgr:
         mock_sub_mgr.return_value.cancel_by_session = AsyncMock(return_value=0)
         loop = AgentLoop(
             bus=bus,

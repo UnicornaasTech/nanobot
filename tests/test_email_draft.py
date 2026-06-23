@@ -12,9 +12,9 @@ from nanobot.channels.email import EmailChannel, EmailConfig
 
 
 def test_send_message_is_disabled() -> None:
+    """Legacy send_message API removed; outbound send() is disabled."""
     ch = EmailChannel.__new__(EmailChannel)
-    with pytest.raises(NotImplementedError, match="create_gmail_draft"):
-        ch.send_message("a@b.com", "Test", "Body")
+    assert not hasattr(ch, "send_message") or not callable(getattr(ch, "send_message", None))
 
 
 @pytest.mark.asyncio

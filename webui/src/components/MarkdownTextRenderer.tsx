@@ -1,16 +1,30 @@
-import { Children, isValidElement, useMemo, type ReactNode } from "react";
+import {
+  Children,
+  isValidElement,
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  type ReactNode,
+} from "react";
 import type { Components, Options as ReactMarkdownOptions } from "react-markdown";
 import ReactMarkdown from "react-markdown";
 import rehypeKatex from "rehype-katex";
-import { Check } from "lucide-react";
+import { Check, Globe2 } from "lucide-react";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 
 import { AttachmentTile } from "@/components/AttachmentTile";
 import { CodeBlock } from "@/components/CodeBlock";
-import { FileReferenceChip, isLikelyFilePath } from "@/components/FileReferenceChip";
+import {
+  FileReferenceChip,
+  isFilePatternReference,
+  isLikelyFilePath,
+} from "@/components/FileReferenceChip";
 import { inferMediaKind } from "@/lib/media";
+import { faviconUrls } from "@/lib/provider-brand";
+import { remarkTexMath } from "@/lib/remark-tex-math";
 import { cn } from "@/lib/utils";
 
 import "katex/dist/katex.min.css";
@@ -19,6 +33,7 @@ interface MarkdownTextRendererProps {
   children: string;
   className?: string;
   highlightCode?: boolean;
+  onOpenFilePreview?: (path: string) => void;
 }
 
 type MarkdownAstNode = {
@@ -28,6 +43,13 @@ type MarkdownAstNode = {
   data?: {
     hName?: string;
   };
+};
+
+type InlineLinkPreview = {
+  href: string;
+  host: string;
+  prefix?: string;
+  title: string;
 };
 
 const SAFE_INLINE_HTML_TAGS = new Set(["mark", "sub", "sup"]);
@@ -169,6 +191,7 @@ const remarkPlugins: NonNullable<ReactMarkdownOptions["remarkPlugins"]> = [
   remarkBreaks,
   remarkGfm,
   [remarkMath, { singleDollarTextMath: false }],
+  remarkTexMath,
   remarkSafeHtmlSubset,
 ];
 const rehypePlugins: NonNullable<ReactMarkdownOptions["rehypePlugins"]> = [rehypeKatex];
@@ -177,6 +200,168 @@ function nodeText(value: ReactNode): string {
   return Children.toArray(value)
     .map((child) => (typeof child === "string" || typeof child === "number" ? String(child) : ""))
     .join("");
+}
+
+function cleanFileReferenceTarget(value: string): string {
+  let target = value.trim();
+  if (!target) return "";
+  try {
+    if (/^file:\/\//i.test(target)) {
+      target = decodeURIComponent(new URL(target).pathname);
+    } else {
+      target = decodeURIComponent(target);
+    }
+  } catch {
+    // Keep the raw value when URL/path decoding is not possible.
+  }
+  target = target.split("?", 1)[0]?.split("#", 1)[0]?.trim() ?? "";
+  if (!/^[A-Za-z]:[\\/]/.test(target)) {
+    target = target.replace(/:\d+(?::\d+)?$/, "");
+  }
+  return target;
+}
+
+function isPreviewableFileTarget(value: string): boolean {
+  if (isFilePatternReference(value)) return false;
+  if (isLikelyFilePath(value)) return true;
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) return false;
+  if (/[\\/]/.test(value)) return false;
+  return /^[^?#]+\.[a-z0-9][a-z0-9_-]{0,12}$/i.test(value);
+}
+
+function isNonNavigableFilePatternLink(href: string | undefined): boolean {
+  if (!href || /^https?:\/\//i.test(href) || href.startsWith("#")) return false;
+  const target = cleanFileReferenceTarget(href);
+  return Boolean(target && isFilePatternReference(target));
+}
+
+function fileReferenceFromLink(href: string | undefined): string | null {
+  if (!href || /^https?:\/\//i.test(href) || href.startsWith("#")) return null;
+  const target = cleanFileReferenceTarget(href);
+  return isPreviewableFileTarget(target) ? target : null;
+}
+
+function linkPreviewParts(value: ReactNode): { text: string; href?: string } {
+  let text = "";
+  let href: string | undefined;
+  for (const child of Children.toArray(value)) {
+    if (typeof child === "string" || typeof child === "number") {
+      text += String(child);
+      continue;
+    }
+    if (!isValidElement(child)) {
+      continue;
+    }
+    const props = child.props as { href?: unknown; children?: ReactNode };
+    if (!href && typeof props.href === "string" && /^https?:\/\//i.test(props.href)) {
+      href = props.href;
+    }
+    const nested = linkPreviewParts(props.children);
+    text += nested.text;
+    href ||= nested.href;
+  }
+  return { text, href };
+}
+
+function cleanLinkPreviewText(value: string): string {
+  return value
+    .replace(/\s+/g, " ")
+    .replace(/^[\s"'“”‘’]+|[\s"'“”‘’]+$/g, "")
+    .trim();
+}
+
+function inlineLinkPreviewFromChildren(children: ReactNode): InlineLinkPreview | null {
+  const { text: rawText, href } = linkPreviewParts(children);
+  if (!href) return null;
+
+  let url: URL;
+  try {
+    url = new URL(href);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+
+  const strippedUrl = rawText
+    .replace(/\s+/g, " ")
+    .replace(href, "")
+    .replace(url.toString(), "")
+    .replace(/https?:\/\/\S+/i, "")
+    .trim();
+  if (!strippedUrl || strippedUrl.length < 4) return null;
+
+  const sourceMatch = /^(.*?)\s*(?:[—–]| - |:)\s*(.+)$/.exec(strippedUrl);
+  const prefix = sourceMatch?.[1] ? cleanLinkPreviewText(sourceMatch[1]) : undefined;
+  const title = cleanLinkPreviewText(sourceMatch?.[2] ?? strippedUrl);
+  if (!title || /^https?:\/\//i.test(title)) return null;
+
+  return {
+    href,
+    host: url.hostname,
+    prefix,
+    title,
+  };
+}
+
+function InlineLinkPreviewRow({ link }: { link: InlineLinkPreview }) {
+  const { favicon, onFaviconError } = useFaviconFallback(link.host);
+  const label = link.prefix
+    ? `${link.prefix} — ${link.title}`
+    : link.title;
+
+  return (
+    <a
+      href={link.href}
+      target="_blank"
+      rel="noreferrer noopener"
+      aria-label={`Open link: ${label}`}
+      className={cn(
+        "not-prose inline-flex max-w-full items-center gap-2 align-baseline",
+        "text-blue-500 no-underline underline-offset-2 hover:underline dark:text-blue-300",
+      )}
+    >
+      <span
+        className={cn(
+          "relative grid h-4 w-4 shrink-0 place-items-center overflow-hidden rounded-[4px]",
+          "border border-border/65 bg-background text-muted-foreground",
+        )}
+        aria-hidden
+      >
+        {favicon ? (
+          <img
+            src={favicon}
+            alt=""
+            className="h-3 w-3 rounded-[2px] object-contain"
+            loading="lazy"
+            onError={onFaviconError}
+          />
+        ) : (
+          <Globe2 className="h-3 w-3" />
+        )}
+      </span>
+      <span className="min-w-0 truncate leading-normal">
+        {label}
+      </span>
+    </a>
+  );
+}
+
+function useFaviconFallback(host: string) {
+  const faviconCandidates = useMemo(() => faviconUrls(host), [host]);
+  const [faviconIndex, setFaviconIndex] = useState(0);
+
+  useEffect(() => {
+    setFaviconIndex(0);
+  }, [host]);
+
+  const onFaviconError = useCallback(() => {
+    setFaviconIndex((index) => Math.min(index + 1, faviconCandidates.length));
+  }, [faviconCandidates.length]);
+
+  return {
+    favicon: faviconCandidates[faviconIndex] ?? null,
+    onFaviconError,
+  };
 }
 
 function isRenderedCodeBlock(value: ReactNode): boolean {
@@ -205,6 +390,7 @@ export default function MarkdownTextRenderer({
   children,
   className,
   highlightCode = true,
+  onOpenFilePreview,
 }: MarkdownTextRendererProps) {
   const components = useMemo<Components>(
     () => ({
@@ -223,7 +409,7 @@ export default function MarkdownTextRenderer({
         }
         const raw = String(kids).replace(/\n$/, "");
         if (isLikelyFilePath(raw)) {
-          return <FileReferenceChip path={raw} />;
+          return <FileReferenceChip path={raw} onOpen={onOpenFilePreview} />;
         }
         /** Plain fenced ``` blocks (no language) & wide one-liners: block monospace, not inline pill. */
         const widePlainBlock = raw.includes("\n") || raw.length > 120;
@@ -284,16 +470,46 @@ export default function MarkdownTextRenderer({
         );
       },
       a({ href, children: markdownChildren, ...props }) {
+        const filePath = fileReferenceFromLink(href);
+        if (filePath) {
+          const label = nodeText(markdownChildren).trim();
+          return (
+            <FileReferenceChip
+              path={label || filePath}
+              tooltipPath={filePath}
+              previewPath={filePath}
+              onOpen={onOpenFilePreview}
+            />
+          );
+        }
+        if (isNonNavigableFilePatternLink(href)) {
+          return <>{markdownChildren}</>;
+        }
         return (
           <a
             href={href}
             target="_blank"
             rel="noreferrer noopener"
-            className="text-primary underline underline-offset-2 hover:opacity-80"
+            className="text-blue-500 underline underline-offset-2 hover:text-blue-600 dark:text-blue-300 dark:hover:text-blue-200"
             {...props}
           >
             {markdownChildren}
           </a>
+        );
+      },
+      li({ children: markdownChildren, className: itemClassName }) {
+        const link = inlineLinkPreviewFromChildren(markdownChildren);
+        if (link) {
+          return (
+            <li className={cn("list-none pl-0", itemClassName)}>
+              <InlineLinkPreviewRow link={link} />
+            </li>
+          );
+        }
+        return (
+          <li className={itemClassName}>
+            {markdownChildren}
+          </li>
         );
       },
       input({ type, checked }) {
@@ -359,7 +575,7 @@ export default function MarkdownTextRenderer({
         );
       },
     }),
-    [highlightCode],
+    [highlightCode, onOpenFilePreview],
   );
 
   return (
@@ -372,7 +588,7 @@ export default function MarkdownTextRenderer({
         "prose-ul:my-2 prose-ol:my-2 prose-li:my-0.5",
         "prose-blockquote:my-3 prose-blockquote:border-l-2 prose-blockquote:font-normal",
         "prose-blockquote:not-italic prose-blockquote:text-foreground/80",
-        "prose-a:text-primary prose-a:underline-offset-2 hover:prose-a:opacity-80",
+        "prose-a:text-blue-500 prose-a:underline-offset-2 hover:prose-a:text-blue-600 dark:prose-a:text-blue-300 dark:hover:prose-a:text-blue-200",
         "prose-hr:my-6",
         "prose-pre:my-0 prose-pre:bg-transparent prose-pre:p-0",
         "prose-code:before:content-none prose-code:after:content-none prose-code:font-normal",

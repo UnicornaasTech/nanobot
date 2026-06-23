@@ -118,6 +118,7 @@ class SubagentManager:
         return ToolsConfig(
             exec=self.tools_config.exec,
             web=self.tools_config.web,
+            file=self.tools_config.file,
             restrict_to_workspace=self.restrict_to_workspace,
         )
 
@@ -248,6 +249,7 @@ class SubagentManager:
                     max_tool_result_chars=self.max_tool_result_chars,
                     hook=_SubagentHook(task_id, status),
                     max_iterations_message="Task completed but no final response was generated.",
+                    finalize_on_max_iterations=False,
                     error_message=None,
                     fail_on_tool_error=True,
                     checkpoint_callback=_on_checkpoint,
