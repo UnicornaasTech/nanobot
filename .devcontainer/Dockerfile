@@ -108,6 +108,9 @@ USER node
 RUN curl -fsSL https://cursor.com/install | bash
 ENV PATH="/home/node/.local/bin:/usr/local/share/npm-global/bin:$PATH"
 
+# Qwen Code CLI (coding harness)
+RUN curl -fsSL https://qwen-code-assets.oss-cn-hangzhou.aliyuncs.com/installation/install-qwen-standalone.sh | bash
+
 # Install global packages
 ENV NPM_CONFIG_PREFIX=/usr/local/share/npm-global
 RUN npm install -g agent-browser
