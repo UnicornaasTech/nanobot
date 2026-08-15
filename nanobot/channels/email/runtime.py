@@ -5,6 +5,7 @@ import html
 import imaplib
 import re
 import select
+import socket
 import time
 from contextlib import suppress
 from dataclasses import dataclass
@@ -21,12 +22,41 @@ from loguru import logger
 from pydantic import Field
 
 from nanobot.bus.events import OutboundMessage
-from nanobot.bus.outbound_events import ProgressEvent
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.paths import get_media_dir
 from nanobot.config.schema import Base
 from nanobot.utils.helpers import safe_filename
+
+
+def _connect_ipv4(host: str, port: int, timeout: float | None) -> socket.socket:
+    """Open a TCP connection using IPv4 only (avoids Gmail auth failures on some cloud IPv6 paths)."""
+    infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+    if not infos:
+        raise OSError(f"No IPv4 address for {host!r}")
+    return socket.create_connection(infos[0][4], timeout)
+
+
+class _IMAP4_IPv4(imaplib.IMAP4):
+    """IMAP4 client that resolves and connects over IPv4 only."""
+
+    def _create_socket(self, timeout):  # noqa: ANN001 - matches imaplib signature
+        return _connect_ipv4(self.host, self.port, timeout)
+
+
+class _IMAP4_SSL_IPv4(imaplib.IMAP4_SSL):
+    """IMAP4_SSL client that resolves and connects over IPv4 only."""
+
+    def _create_socket(self, timeout):  # noqa: ANN001 - matches imaplib signature
+        sock = _connect_ipv4(self.host, self.port, timeout)
+        return self.ssl_context.wrap_socket(sock, server_hostname=self.host)
+
+
+def _create_imap_client(host: str, port: int, *, use_ssl: bool) -> imaplib.IMAP4:
+    """Create an IMAP client forced to IPv4 (SNI/cert hostname unchanged)."""
+    if use_ssl:
+        return _IMAP4_SSL_IPv4(host, port)
+    return _IMAP4_IPv4(host, port)
 
 
 class EmailConfig(Base):
@@ -264,10 +294,11 @@ class EmailChannel(BaseChannel):
     def _imap_idle_wait(self, timeout_seconds: float) -> None:
         """Block on IMAP IDLE until mail may have arrived or *timeout_seconds* elapses."""
         mailbox = self.config.imap_mailbox or "INBOX"
-        if self.config.imap_use_ssl:
-            client = imaplib.IMAP4_SSL(self.config.imap_host, self.config.imap_port)
-        else:
-            client = imaplib.IMAP4(self.config.imap_host, self.config.imap_port)
+        client = _create_imap_client(
+            self.config.imap_host,
+            self.config.imap_port,
+            use_ssl=self.config.imap_use_ssl,
+        )
 
         try:
             client.login(self.config.imap_username, self.config.imap_password)
@@ -559,10 +590,11 @@ class EmailChannel(BaseChannel):
             self._close_imap_client(client)
 
     def _open_imap_client(self, mailbox: str, *, missing_mailbox_ok: bool = False) -> Any | None:
-        if self.config.imap_use_ssl:
-            client: Any = imaplib.IMAP4_SSL(self.config.imap_host, self.config.imap_port)
-        else:
-            client = imaplib.IMAP4(self.config.imap_host, self.config.imap_port)
+        client: Any = _create_imap_client(
+            self.config.imap_host,
+            self.config.imap_port,
+            use_ssl=self.config.imap_use_ssl,
+        )
 
         try:
             client.login(self.config.imap_username, self.config.imap_password)

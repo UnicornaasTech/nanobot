@@ -6,7 +6,7 @@ Upstream: https://github.com/HKUDS/nanobot · Fork: https://github.com/prospr-ap
 
 ## Prospr-only
 
-See [prospr-custom-implementations.md](prospr-custom-implementations.md) for the full list (Slack `no_reply`, eager knowledge, Instagram/Gmail, unified-session delivery guard, MCP/tool-repeat guards, email send disabled, etc.).
+See [prospr-custom-implementations.md](prospr-custom-implementations.md) for the full list (Slack `no_reply`, eager knowledge, Instagram/Gmail, unified-session delivery guard, MCP/tool-repeat guards, email send disabled, email IMAP IPv4-only connect, etc.).
 
 ## No longer fork-only
 

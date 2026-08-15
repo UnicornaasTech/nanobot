@@ -30,13 +30,9 @@ def _manager(
     sessions = SessionManager(tmp_path)
     store = MemoryStore(tmp_path)
     if consolidator is None:
-        provider = MagicMock()
         consolidator = Consolidator(
             store=store,
-            provider=provider,
-            model="test-model",
             sessions=sessions,
-            context_window_tokens=8192,
             build_messages=MagicMock(return_value=[]),
             get_tool_definitions=MagicMock(return_value=[]),
             workspace=tmp_path,
@@ -215,14 +211,9 @@ async def test_token_consolidation_skips_eager_archived_prefix(tmp_path: Path) -
     """Overflow consolidation must not re-archive messages eager already promoted."""
     sessions = SessionManager(tmp_path)
     store = MemoryStore(tmp_path)
-    provider = MagicMock()
-    provider.generation = MagicMock(max_tokens=1024)
     consolidator = Consolidator(
         store=store,
-        provider=provider,
-        model="test-model",
         sessions=sessions,
-        context_window_tokens=8192,
         build_messages=MagicMock(return_value=[]),
         get_tool_definitions=MagicMock(return_value=[]),
     )

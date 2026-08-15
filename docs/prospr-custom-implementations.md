@@ -160,7 +160,9 @@ Install from repo root: `pip install -e '.[gmail,instagram]'`
 3. **Enable IMAP** in Gmail → Settings → **Forwarding and POP/IMAP** → [Enable IMAP](https://support.google.com/mail/answer/7126229). Workspace admins can restrict IMAP org-wide.
 4. Set `imapPassword` to that value, or `"${GMAIL_PASSWORD}"` with `GMAIL_PASSWORD` set in the **same environment as the gateway process** (e.g. systemd `Environment=` / `EnvironmentFile=` — a shell export alone is not enough if the service does not inherit it). Config `${VAR}` refs are resolved at startup (`nanobot/config/loader.py`); missing vars fail fast with a clear error.
 
-Startup log `IMAP IDLE unavailable ([AUTHENTICATIONFAILED] Invalid credentials)` means Gmail rejected `client.login(imapUsername, imapPassword)` — fix credentials/IMAP policy, not nanobot channel code. Confirm the running gateway uses the config file you edited (`nanobot gateway -c /path` or default `~/.nanobot/config.json` for the service user).
+The email channel forces **IPv4** for IMAP connect/LOGIN (IDLE and poll). Some cloud providers (e.g. UpCloud Finland IPv6) cause Gmail to return `AUTHENTICATIONFAILED` on dual-stack even when App Passwords are correct; IPv4-only avoids that.
+
+Startup log `IMAP IDLE unavailable ([AUTHENTICATIONFAILED] Invalid credentials)` means Gmail rejected `client.login(imapUsername, imapPassword)` — after confirming IPv4 is in use, fix credentials/IMAP policy or Google blocking the server egress IP. Confirm the running gateway uses the config file you edited (`nanobot gateway -c /path` or default `~/.nanobot/config.json` for the service user).
 
 Full mailbox + OAuth draft setup: [`docs/prospr-customersupport-additions.md`](prospr-customersupport-additions.md#setup-gmail-mailbot-path).
 
