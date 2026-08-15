@@ -8,7 +8,7 @@ Operational setup (Google Cloud, Meta dashboards, ngrok, etc.) stays in vendor d
 
 **Upstream baseline:** merged `public/main` @ `d2da6df1` (2026-06-23); prior merge-base `15c6abc9` (2026-05-31).
 
-**Merge integration (2026-06-23):** full upstream merge on `integ/upstream-public-main` — upstream wins for max-iter finalization (`finalize_on_max_iterations` / `build_budget_exhausted_finalization_message`), empty-response inline retries, Dream single-phase cron helpers, WebUI/gateway refactor, and session compaction. Fork hooks re-grafted: `no_reply`, eager knowledge, unified-session delivery guard, Instagram/Gmail, MCP repeat guard, tool-batch repeat blocking, `genericMemoryOnly`, email send disabled.
+**Merge integration (2026-08-15):** upstream channel-package layout; fork hooks re-grafted: `no_reply`, eager knowledge, unified-session delivery guard, Instagram/Gmail (Instagram as `nanobot/channels/instagram/` package), MCP repeat guard, tool-batch repeat blocking, email send disabled. Upstream wins for max-iter finalization, empty-response inline retries, single-phase Dream, and path-ref attachments (`reference_non_image_attachments`). Former fork `genericMemoryOnly` removed.
 
 | Commit     | Summary                                                                                          |
 | ---------- | ------------------------------------------------------------------------------------------------ |
@@ -102,52 +102,16 @@ When `agents.defaults.eagerKnowledge.enabled` is **true**, session traffic is pr
 
 **Tests:** `tests/agent/test_eager_knowledge.py`, `tests/agent/test_loop_no_reply.py`
 
-### Generic memory prompts (`genericMemoryOnly`)
-
-Customer-support deployments can store **generalized phenomena only** (playbooks, recurring issues, product patterns) without contradicting default memory behavior in `SOUL.md` / `USER.md`.
-
-When `agents.defaults.genericMemoryOnly` is **true**, Consolidator and Dream use alternate bundled templates (`*_generic.md`) instead of the upstream `consolidator_archive.md` / `dream_phase1.md` / `dream_phase2.md`. Template selection: [`nanobot/agent/memory_prompts.py`](nanobot/agent/memory_prompts.py).
-
-| Piece                        | Behavior                                                                                                                                              |
-| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **`Consolidator.archive()`** | Summarizes only cross-case patterns; forbids customer PII in `history.jsonl` bullets.                                                                 |
-| **Archive LLM failure**      | Appends a short withheld marker — **no** `[RAW]` transcript dump.                                                                                     |
-| **`Dream`**                  | Phase 1/2 use generic prompts: `USER.md` = operator/team only; `MEMORY.md` = generalized playbooks.                                                   |
-| **Mutual exclusion**         | Config load **fails** if `genericMemoryOnly` and `eagerKnowledge.enabled` are both true (eager singleton raw flushes would bypass de-identification). |
-
-**Config** (`agents.defaults.genericMemoryOnly`):
-
-| Key                 | Type | Default | Meaning                                                              |
-| ------------------- | ---- | ------- | -------------------------------------------------------------------- |
-| `genericMemoryOnly` | bool | `false` | Use de-identified memory-gathering prompts for Consolidator + Dream. |
-
-**Config example** (customer support; eager knowledge off):
-
-```json
-{
-  "agents": {
-    "defaults": {
-      "genericMemoryOnly": true,
-      "eagerKnowledge": { "enabled": false }
-    }
-  }
-}
-```
-
-See also upstream memory overview: [`docs/memory.md`](memory.md).
-
-**Tests:** `tests/config/test_generic_memory_config.py`, `tests/agent/test_consolidator.py`, `tests/agent/test_dream.py`
-
 ### Agent loop tweaks (local)
 
-- **Dream** (`memory.py`, `dream_phase*.md`, optional `*_generic.md`): Defer batches stuck on repeated stale `edit_file`; prompts nudge read-after-edit and fewer auto-skills.
+- **Dream** (`memory.py`, upstream `agent/dream.md`): Single-phase Dream; durable-file edit flow with read-after-edit nudges.
 - **`edit_file`** (`filesystem.py`): Stale-read warning included in `old_text` not-found errors when applicable.
 - **Provider retry** (`base.py`): Also retry on truncated/non-JSON bodies (`expecting value`, `jsondecodeerror`).
-- **Empty-response fallback** (`fallback_provider.py`, `runner.py`): When the primary model returns a blank successful reply (after the usual two silent retries on the same model), configured `agents.defaults.fallbackModels` are tried once each before the no-tools finalization prompt — same presets as error failover, skipped when answer text was already streamed. If finalization is still blank, fallbacks are tried once more.
+- **Empty responses** — keep upstream `runner.py` same-model empty retries (`_MAX_EMPTY_RETRIES`) plus no-tools finalization; `fallbackModels` remains **error** failover only (`FallbackProvider`), not blank-success switching.
 - **MCP endpoint loop protection** (`nanobot/utils/runtime.py`, `nanobot/agent/runner.py`): Per-turn throttle for repeated identical failing `mcp_*` tool calls (same tool name, normalized arguments, and error signature; third attempt blocked). Non-retryable MCP `400`/`404` responses with `validation_error` or `object_not_found` return an explicit “stop retrying this endpoint” payload instead of the generic “try a different approach” hint — reduces runaway Notion-style retry loops and downstream LLM 300s timeouts.
 - **Repeated tool-call loop cutoff** (`nanobot/utils/runtime.py`, `nanobot/agent/runner.py`): Consecutive identical tool calls (same tool + normalized arguments) are blocked after a small retry budget, and the turn hard-stops to prevent no-progress loops. The guard is streak-based, so `A -> B -> A` remains allowed (streak resets when a different call runs).
 
-**Tests:** `tests/utils/test_mcp_endpoint_throttle.py`, `tests/agent/test_runner_tool_execution.py`, `tests/agent/test_runner_safety.py`
+**Tests:** `tests/utils/test_mcp_endpoint_throttle.py`, `tests/utils/test_tool_batch_repeat.py`, `tests/agent/test_runner_tool_execution.py`, `tests/agent/test_runner_safety.py`
 
 ### Unified session: delivery-target guard (`unified_delivery.py`)
 
@@ -175,7 +139,7 @@ Extends upstream **`agents.defaults.unifiedSession`** (`unified:default` session
 
 Install from repo root: `pip install -e '.[gmail,instagram]'`
 
-### Email channel (`nanobot/channels/email.py`)
+### Email channel (`nanobot/channels/email/`)
 
 - **Inbound:** IMAP (`imapHost`, etc.). Optional **IMAP IDLE** when `imapIdleEnabled` is true (default); otherwise timer polling at `pollIntervalSeconds` (clamped **5–60** seconds).
 - **Outbound disabled:** `send()` and `send_message()` always raise `NotImplementedError` directing the agent to `create_gmail_draft`. No SMTP `sendmail()` path runs even if SMTP fields are set.
@@ -257,17 +221,17 @@ Full mailbox + OAuth draft setup: [`docs/prospr-customersupport-additions.md`](p
 
 Obtain the refresh token once via `python3 scripts/gmail_draft_oauth_setup.py` (prompts for client ID/secret; no credential files on disk). See [`docs/prospr-customersupport-additions.md`](prospr-customersupport-additions.md) for full setup.
 
-### Instagram channel (`nanobot/channels/instagram.py`)
+### Instagram channel (`nanobot/channels/instagram/`)
 
 New channel: Instagram DMs → agent → Slack review → human Send / Edit & Send / Discard → Meta send API.
 
-> **REMARK / TODO (remove when sorted):** Poll mode (`_poll_conversations_for_account` in `nanobot/channels/instagram.py`) uses one heavy `GET /{pageId}/conversations?fields=messages.limit(10){…}` call. Meta often returns *“Please reduce the amount of data…”* or times out (30s). The light list (`?platform=INSTAGRAM` only) can return far fewer threads than the Instagram/Meta inbox UI — usually **Advanced Access** on `instagram_manage_messages`, not a pagination bug. **Fix:** refactor to Meta’s documented 3-step flow (list `id`/`updated_time` → `GET /{conversation-id}?fields=messages` → `GET /{message-id}`); persist seen message IDs / `updated_time` watermarks; prefer webhooks for inbound. There is **no** Graph `unread` filter — “new only” = webhooks or local dedupe, not `messages.limit` on the page list.
+> **REMARK / TODO (remove when sorted):** Poll mode (`_poll_conversations_for_account` in `nanobot/channels/instagram/runtime.py`) uses one heavy `GET /{pageId}/conversations?fields=messages.limit(10){…}` call. Meta often returns *“Please reduce the amount of data…”* or times out (30s). The light list (`?platform=INSTAGRAM` only) can return far fewer threads than the Instagram/Meta inbox UI — usually **Advanced Access** on `instagram_manage_messages`, not a pagination bug. **Fix:** refactor to Meta’s documented 3-step flow (list `id`/`updated_time` → `GET /{conversation-id}?fields=messages` → `GET /{message-id}`); persist seen message IDs / `updated_time` watermarks; prefer webhooks for inbound. There is **no** Graph `unread` filter — “new only” = webhooks or local dedupe, not `messages.limit` on the page list.
 
 | Area                       | Behavior                                                                                                                                                                                                                                  |
 | -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Agent send**             | `send()` / `send_message()` raise `NotImplementedError`. Agent must use `create_instagram_draft`.                                                                                                                                         |
 | **Turn completion**        | On agent turn end, `send()` posts a Slack review card (never calls Instagram).                                                                                                                                                            |
-| **Draft tool**             | `create_instagram_draft` stores text in `instagram_review_state`; channel `consume_draft()` on turn end.                                                                                                                                  |
+| **Draft tool**             | `create_instagram_draft` stores text in `instagram.review_state`; channel `consume_draft()` on turn end.                                                                                                                                   |
 | **No reply suggested**     | If the agent does **not** call `create_instagram_draft`, a Slack card is still posted (“no reply suggested”); **Send** is hidden; **Edit & Send** remains so humans can reply manually.                                                   |
 | **Slack approvals**        | Socket Mode (`slackAppToken` + `slackBotToken`). Interactive payloads ACK’d on the socket; send/discard run in background threads.                                                                                                        |
 | **Shared Slack app**       | If the same `xoxb` / `xapp` is used for `channels.slack`, the Slack channel ignores `ig_*` block actions (see [Slack: ignore Instagram draft-review button clicks](#slack-ignore-instagram-draft-review-button-clicks)).                                                                                  |
@@ -275,10 +239,10 @@ New channel: Instagram DMs → agent → Slack review → human Send / Edit & Se
 | **Meta inbound — poll**    | When `useWebhook` is false **or** `pollFallbackEnabled` is true: Graph `GET /v19.0/{pageId}/conversations?platform=INSTAGRAM` on each account on `pollIntervalSeconds` (clamped 5–60). Requires `pageId` + `pageAccessToken` per account. |
 | **Meta outbound**          | `_send_instagram_message()` → `POST /v19.0/me/messages` with that account’s `pageAccessToken`. Only from Slack button/modal handlers.                                                                                                     |
 | **Multi-account**          | `accounts[]` with distinct Meta apps recommended. `chatId` = `{accountKey}:{customerSenderId}` via `compose_chat_id()`. Slack cards show account label; send uses matching token.                                                         |
-| **Inbound attachments**    | Webhook and poll paths parse `message.attachments`. Files with a CDN URL download to `~/.nanobot/data/media/instagram/`. Images/stickers go on `InboundMessage.media` for vision; PDF/DOCX/XLSX/PPTX and other `extract_documents`-supported types also go on `media` so the agent loop can inline extracted text. Video, audio, and other types are saved locally and described via markers (e.g. `[video: … — saved to …]`). Failed downloads get `[type: download failed]`. Image-only DMs (no `text`) are ingested. |
+| **Inbound attachments**    | Webhook and poll paths parse `message.attachments`. Files with a CDN URL download to `~/.nanobot/data/media/instagram/`. Images/stickers go on `InboundMessage.media` for vision; PDF/DOCX/XLSX/PPTX and other extractable types also go on `media`. The agent loop keeps images for vision and references non-image files as `[Attachment: path]` (on-demand `read_file`); consolidator archive still inlines extractable text. Video, audio, and other types are saved locally and described via markers (e.g. `[video: … — saved to …]`). Failed downloads get `[type: download failed]`. Image-only DMs (no `text`) are ingested. |
 | **Slack review thread**    | Review cards show up to **3 prior customer messages** from the Meta thread (plus the current message under *Current message*), when `pageId` + `pageAccessToken` can fetch Graph history. `metadata.instagram_original_dm` remains the current message only. |
 | **Thread backfill**        | On the **first** inbound for a `chatId` when the nanobot session has **no prior user history**, the channel fetches up to **20** prior customer messages from Graph (`/{pageId}/conversations?user_id=…`, with conversation-scan fallback). They are prefixed as `Instagram thread context before this message:` in model input; up to **5** most recent images from that history are attached. `metadata.instagram_original_dm` and Slack review cards still show only the **current** customer message. Backfill is skipped once the session has user messages or after one attempt per `chatId` (in-memory). Requires `SessionManager` (wired from channel manager when the gateway runs). |
-| **Slack threading**        | One Slack thread per `chatId`; map persisted in `~/.nanobot/data/instagram_slack_threads.json` (`instagram_review_state`).                                                                                                                |
+| **Slack threading**        | One Slack thread per `chatId`; map persisted in `~/.nanobot/data/instagram_slack_threads.json` (`instagram.review_state`).                                                                                                                 |
 | **Startup**                | Requires `consentGranted`, Slack tokens, and at least one `accounts[]` entry. Webhook mode additionally requires per-account `appSecret` + `verifyToken`. Poll mode requires per-account `pageId` + `pageAccessToken`. Thread backfill uses the same per-account `pageId` + `pageAccessToken`.                    |
 
 **Config example — single account (poll-first with webhooks off):**
@@ -329,7 +293,7 @@ When `"useWebhook": true`, register Meta callbacks at `https://YOUR_PUBLIC_HOST/
 
 **Config:** no tool-specific keys — enable `channels.instagram` (above) and install `pip install -e '.[instagram]'`.
 
-### Review state module (`nanobot/channels/instagram_review_state.py`)
+### Review state module (`nanobot/channels/instagram/review_state.py`)
 
 In-memory draft queue (10-minute TTL) plus persisted Slack `thread_ts` per Instagram `chatId`. Keeps agent loop free of Instagram/Slack coupling.
 
@@ -344,7 +308,7 @@ In-memory draft queue (10-minute TTL) plus persisted Slack `thread_ts` per Insta
 
 - `tests/agent/test_loop_no_reply.py` — Slack read-only persist
 - `tests/agent/test_unified_delivery.py` — unified session injection guard
-- `tests/test_email_draft.py`, `tests/channels/test_email_channel.py` — SMTP/send disabled, IMAP IDLE
+- `tests/test_email_draft.py`, `nanobot/channels/email/tests/test_email_channel.py` — SMTP/send disabled, IMAP IDLE
 - `tests/test_instagram_channel.py`, `tests/test_instagram_draft_tool.py` — Instagram channel + draft tool
 
 ---
@@ -360,7 +324,6 @@ Fragments below merge into `~/.nanobot/config.json`. Longer setup runbooks: [`do
 | Key                             | Type   | Default    | Fork behavior                                                                                                                                                                            |
 | ------------------------------- | ------ | ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `unifiedSession`                | bool   | `false`    | When `true`, mid-turn follow-ups only inject if delivery target matches active turn; see [Unified session](#unified-session-delivery-target-guard-unified_deliverypy).                   |
-| `genericMemoryOnly`             | bool   | `false`    | Alternate Consolidator/Dream prompts for pattern-only memory; **cannot** combine with `eagerKnowledge.enabled`. See [Generic memory prompts](#generic-memory-prompts-genericmemoryonly). |
 | `eagerKnowledge`                | object | —          | Fork-only; see [Eager knowledge](#eager-knowledge-non-unified-cross-channel-recall).                                                                                                     |
 | `eagerKnowledge.enabled`        | bool   | `false`    | Promote session traffic into `memory/history.jsonl` soon after persist.                                                                                                                  |
 | `eagerKnowledge.minBatch`       | int    | `3`        | LLM archive when pending chunk reaches this size.                                                                                                                                        |
@@ -401,19 +364,6 @@ Fragments below merge into `~/.nanobot/config.json`. Longer setup runbooks: [`do
 }
 ```
 
-#### Example — `genericMemoryOnly`
-
-```json
-{
-  "agents": {
-    "defaults": {
-      "genericMemoryOnly": true,
-      "eagerKnowledge": { "enabled": false }
-    }
-  }
-}
-```
-
 #### Example — Slack ambient context + eager promotion
 
 Typical Prospr stack: persist non-mention channel traffic (`groupPolicy: "mention"`) and promote it into global history without a shared session:
@@ -448,7 +398,7 @@ Typical Prospr stack: persist non-mention channel traffic (`groupPolicy: "mentio
 | ------------- | ------ | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `groupPolicy` | string | `"mention"` | `"mention"` → non-mention channel messages use `no_reply` persist (see [Slack no_reply](#slack-persist-channel-traffic-without-replying-no_reply)). `"open"` → all channel messages get full agent turns. |
 
-Other `channels.slack` keys (`botToken`, `appToken`, `replyInThread`, `groupAllowFrom`, `dm`, etc.) are unchanged upstream; see `SlackConfig` in `nanobot/channels/slack.py`.
+Other `channels.slack` keys (`botToken`, `appToken`, `replyInThread`, `groupAllowFrom`, `dm`, etc.) are unchanged upstream; see `SlackConfig` in `nanobot/channels/slack/runtime.py`.
 
 #### Example — `groupPolicy` (fork `no_reply` persist)
 

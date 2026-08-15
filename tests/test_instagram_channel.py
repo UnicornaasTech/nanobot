@@ -15,7 +15,8 @@ from slack_sdk.socket_mode.response import SocketModeResponse
 pytest.importorskip("flask")
 
 from nanobot.bus.queue import MessageBus
-from nanobot.channels.instagram import (
+from nanobot.channels.instagram.review_state import compose_chat_id
+from nanobot.channels.instagram.runtime import (
     _MAX_BACKFILL_IMAGES,
     _THREAD_CONTEXT_LIMIT,
     ACTION_DISCARD,
@@ -26,8 +27,15 @@ from nanobot.channels.instagram import (
     InstagramConfig,
     _ParsedIgMessage,
 )
-from nanobot.channels.instagram_review_state import compose_chat_id
+from nanobot.channels.registry import discover_plugins
 from nanobot.session.manager import SessionManager
+
+
+def test_instagram_channel_package_is_discoverable() -> None:
+    plugins = discover_plugins()
+    assert "instagram" in plugins
+    assert plugins["instagram"].name == "instagram"
+    assert plugins["instagram"].load_channel_class() is InstagramChannel
 
 
 def test_legacy_top_level_config_rejected() -> None:
@@ -340,7 +348,7 @@ def test_post_review_reuses_slack_thread(monkeypatch: pytest.MonkeyPatch) -> Non
 
     monkeypatch.setattr(ch, "_slack_api", fake_slack_api)
     monkeypatch.setattr(
-        "nanobot.channels.instagram.get_slack_thread_ts",
+        "nanobot.channels.instagram.runtime.get_slack_thread_ts",
         lambda _sender: "300.000",
     )
 
@@ -382,11 +390,11 @@ def test_post_review_creates_thread_anchor_when_missing(monkeypatch: pytest.Monk
 
     monkeypatch.setattr(ch, "_slack_api", fake_slack_api)
     monkeypatch.setattr(
-        "nanobot.channels.instagram.get_slack_thread_ts",
+        "nanobot.channels.instagram.runtime.get_slack_thread_ts",
         lambda sender: stored.get(sender),
     )
     monkeypatch.setattr(
-        "nanobot.channels.instagram.set_slack_thread_ts",
+        "nanobot.channels.instagram.runtime.set_slack_thread_ts",
         lambda sender, ts: stored.__setitem__(sender, ts),
     )
 
@@ -415,7 +423,7 @@ async def test_send_posts_no_reply_card_when_tool_not_used(monkeypatch: pytest.M
         posted.append({"args": args, "kwargs": kwargs})
 
     monkeypatch.setattr(ch, "post_review_to_slack", capture_post)
-    monkeypatch.setattr("nanobot.channels.instagram.consume_draft", lambda _chat: None)
+    monkeypatch.setattr("nanobot.channels.instagram.runtime.consume_draft", lambda _chat: None)
 
     from nanobot.bus.events import OutboundMessage
 
@@ -444,10 +452,10 @@ async def test_send_posts_tool_draft_card_when_tool_used(monkeypatch: pytest.Mon
 
     monkeypatch.setattr(ch, "post_review_to_slack", capture_post)
 
-    from nanobot.channels.instagram_review_state import InstagramDraftPayload
+    from nanobot.channels.instagram.review_state import InstagramDraftPayload
 
     monkeypatch.setattr(
-        "nanobot.channels.instagram.consume_draft",
+        "nanobot.channels.instagram.runtime.consume_draft",
         lambda _chat: InstagramDraftPayload(draft_text="Proposed reply", review_notes="note"),
     )
 
@@ -585,7 +593,7 @@ def test_poll_conversations_ingests_customer_messages(monkeypatch: pytest.Monkey
             assert "PAGE1" in url
             return FakeResponse()
 
-    monkeypatch.setattr("nanobot.channels.instagram.httpx.Client", FakeClient)
+    monkeypatch.setattr("nanobot.channels.instagram.runtime.httpx.Client", FakeClient)
     ch._poll_conversations_for_account(_sole_account(ch))
     assert ingested == [("default", "USER1", "hi there")]
 
@@ -738,7 +746,7 @@ def test_send_uses_matching_account_token(monkeypatch: pytest.MonkeyPatch) -> No
             tokens.append((params or {}).get("access_token", ""))
             return FakeResponse()
 
-    monkeypatch.setattr("nanobot.channels.instagram.httpx.Client", FakeClient)
+    monkeypatch.setattr("nanobot.channels.instagram.runtime.httpx.Client", FakeClient)
     ch._send_instagram_message("CUST", "hello", "acct_a")
     assert tokens == ["token_a"]
 

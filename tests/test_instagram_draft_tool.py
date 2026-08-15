@@ -9,8 +9,8 @@ import pytest
 
 from nanobot.agent.tools.context import RequestContext
 from nanobot.agent.tools.instagram_draft import CreateInstagramDraftTool
-from nanobot.channels import instagram_review_state as state
-from nanobot.channels.instagram_review_state import compose_chat_id
+from nanobot.channels.instagram import review_state as state
+from nanobot.channels.instagram.review_state import compose_chat_id
 
 
 @pytest.fixture(autouse=True)

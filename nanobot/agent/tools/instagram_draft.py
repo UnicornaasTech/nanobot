@@ -1,7 +1,7 @@
 """
 Tool: create_instagram_draft — queues a Slack review draft (never sends to Instagram).
 
-Core logic stores draft intent in ``instagram_review_state``; the Instagram channel
+Core logic stores draft intent in ``instagram.review_state``; the Instagram channel
 posts the review card when the agent turn completes.
 """
 
@@ -12,7 +12,7 @@ import json
 from nanobot.agent.tools.base import Tool, tool_parameters
 from nanobot.agent.tools.context import ContextAware, RequestContext, ToolContext
 from nanobot.agent.tools.schema import StringSchema, tool_parameters_schema
-from nanobot.channels.instagram_review_state import set_draft
+from nanobot.channels.instagram.review_state import set_draft
 
 
 @tool_parameters(
