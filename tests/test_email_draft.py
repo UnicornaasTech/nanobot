@@ -8,7 +8,7 @@ import pytest
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.channels.email import EmailChannel, EmailConfig
+from nanobot.channels.email.runtime import EmailChannel, EmailConfig
 
 
 def test_send_message_is_disabled() -> None:
