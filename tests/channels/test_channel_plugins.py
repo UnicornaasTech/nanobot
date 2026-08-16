@@ -2678,6 +2678,7 @@ def test_optional_dependency_metadata_for_enable():
             "aiohttp>=3.9.0,<4.0.0",
             "mistune>=3.0.0,<4.0.0",
             "nh3>=0.2.17,<1.0.0",
+            "cryptography>=42.0.0",
         ),
         "mochat": (
             "python-socketio>=5.16.0,<6.0.0",

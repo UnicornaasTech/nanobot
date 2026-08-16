@@ -27,6 +27,7 @@ try:
         Api,
         AsyncClient,
         AsyncClientConfig,
+        ErrorResponse,
         InviteEvent,
         JoinError,
         JoinResponse,
@@ -47,10 +48,12 @@ try:
         SyncError,
         SyncResponse,
         ToDeviceError,
+        ToDeviceMessage,
+        UnknownToDeviceEvent,
         UploadError,
     )
     from nio.crypto.attachments import decrypt_attachment
-    from nio.exceptions import EncryptionError
+    from nio.exceptions import EncryptionError, LocalProtocolError
 except ImportError as e:
     raise ImportError(
         "Matrix dependencies not installed. Run: nanobot plugins enable matrix"
@@ -410,11 +413,20 @@ class MatrixChannel(BaseChannel):
             (self.config.recovery_key or "").strip()
             or (self.config.recovery_passphrase or "").strip()
         ):
-            from nanobot.channels.matrix.cross_signing_recovery import (
-                bootstrap_cross_signing_from_recovery,
-            )
+            try:
+                from nanobot.channels.matrix.cross_signing_recovery import (
+                    bootstrap_cross_signing_from_recovery,
+                )
 
-            await bootstrap_cross_signing_from_recovery(self.client, self.config)
+                await bootstrap_cross_signing_from_recovery(self.client, self.config)
+            except Exception:
+                self.logger.exception(
+                    "Matrix cross-signing bootstrap failed (channel continues)"
+                )
+
+        # Warm Olm device_store so SAS Start is not dropped for unknown devices.
+        if self.client and self.config.e2ee_enabled and self.config.sas_verification:
+            await self._warm_device_keys_for_sas()
 
         self._sync_task = asyncio.create_task(self._sync_loop())
 
@@ -797,10 +809,13 @@ class MatrixChannel(BaseChannel):
 
     def _register_to_device_callbacks(self) -> None:
         if self.config.e2ee_enabled and self.config.sas_verification:
+            from nanobot.channels.matrix.sas_nio_compat import apply_nio_sas_commitment_patch
+
+            apply_nio_sas_commitment_patch()
             client = self._callback_registrar()
             client.add_to_device_callback(
                 self._on_key_verification_event,
-                (KeyVerificationEvent,),
+                (KeyVerificationEvent, UnknownToDeviceEvent),
             )
 
     def _register_response_callbacks(self) -> None:
@@ -811,9 +826,62 @@ class MatrixChannel(BaseChannel):
         client.add_response_callback(self._on_sync_invite_fallback, SyncResponse)
 
     def _is_sas_sender_allowed(self, sender: str) -> bool:
-        return bool(sender and self.is_allowed(sender))
+        """Allow SAS from allowFrom / pairing, or from this bot's own MXID (Sessions UI)."""
+        if not sender:
+            return False
+        if self.is_allowed(sender):
+            return True
+        own = getattr(self.client, "user_id", None) if self.client else None
+        return bool(own and sender == own)
 
-    async def _on_key_verification_event(self, event: KeyVerificationEvent) -> None:
+    async def _warm_device_keys_for_sas(self, *extra_users: str) -> None:
+        """Queue keys/query for allowFrom + own MXID so SAS Start can resolve devices."""
+        client = self.client
+        if not client or not getattr(client, "olm", None):
+            return
+        users: set[str] = set()
+        own = getattr(client, "user_id", None)
+        if own:
+            users.add(str(own))
+        for entry in self.config.allow_from or []:
+            if entry and entry != "*":
+                users.add(str(entry))
+        for user in extra_users:
+            if user:
+                users.add(str(user))
+        if not users:
+            return
+        try:
+            client.olm.users_for_key_query.update(users)
+        except Exception:
+            self.logger.debug("Matrix SAS: could not queue users for keys/query", exc_info=True)
+            return
+        try:
+            response = await client.keys_query()
+        except LocalProtocolError:
+            return
+        except Exception:
+            self.logger.warning("Matrix SAS: keys/query failed while warming device store", exc_info=True)
+            return
+        if isinstance(response, ErrorResponse):
+            self.logger.warning("Matrix SAS: keys/query returned error: {}", response)
+
+    async def _flush_sas_to_device(self, label: str, sender: str) -> bool:
+        """Send any pending Olm to-device messages (e.g. SAS cancel of a prior attempt)."""
+        client = self.client
+        if not client:
+            return False
+        try:
+            responses = await client.send_to_device_messages()
+        except Exception:
+            self.logger.warning("Matrix SAS {} flush failed for {}", label, sender, exc_info=True)
+            return False
+        if any(isinstance(response, ToDeviceError) for response in (responses or [])):
+            self.logger.warning("Matrix SAS {} to-device failed for {}", label, sender)
+            return False
+        return True
+
+    async def _on_key_verification_event(self, event: Any) -> None:
         try:
             await self._handle_key_verification_event(event)
         except asyncio.CancelledError:
@@ -821,16 +889,94 @@ class MatrixChannel(BaseChannel):
         except Exception:
             self.logger.exception("Matrix SAS verification handling failed")
 
-    async def _handle_key_verification_event(self, event: KeyVerificationEvent) -> None:
+    def _sas_event_type_and_content(self, event: Any) -> tuple[str, dict[str, Any]]:
+        source = getattr(event, "source", None) or {}
+        event_type = str(
+            getattr(event, "type", None) or source.get("type") or ""
+        )
+        content = source.get("content") if isinstance(source.get("content"), dict) else {}
+        return event_type, content
+
+    async def _send_sas_ready(self, sender: str, content: dict[str, Any]) -> None:
+        client = self.client
+        if not client or not client.device_id:
+            return
+        from_device = str(content.get("from_device") or "")
+        transaction_id = str(content.get("transaction_id") or "")
+        methods = content.get("methods") or []
+        if not from_device or not transaction_id:
+            return
+        if "m.sas.v1" not in methods:
+            self.logger.info(
+                "Ignoring Matrix verification request from {} without m.sas.v1 ({})",
+                sender,
+                methods,
+            )
+            return
+        message = ToDeviceMessage(
+            type="m.key.verification.ready",
+            recipient=sender,
+            recipient_device=from_device,
+            content={
+                "from_device": client.device_id,
+                "methods": ["m.sas.v1"],
+                "transaction_id": transaction_id,
+            },
+        )
+        response = await client.to_device(message, transaction_id)
+        if isinstance(response, ToDeviceError):
+            self.logger.warning("Matrix SAS ready failed for {}: {}", sender, response)
+            return
+        self.logger.info(
+            "Matrix SAS ready sent to {} (transaction {})",
+            sender,
+            transaction_id,
+        )
+
+    async def _send_sas_done(self, sender: str, transaction_id: str, sas: Any) -> None:
+        client = self.client
+        if not client:
+            return
+        other = getattr(sas, "other_olm_device", None)
+        other_device = getattr(other, "device_id", None) or getattr(other, "id", None)
+        if not other_device:
+            return
+        message = ToDeviceMessage(
+            type="m.key.verification.done",
+            recipient=sender,
+            recipient_device=str(other_device),
+            content={"transaction_id": transaction_id},
+        )
+        response = await client.to_device(message, transaction_id)
+        if isinstance(response, ToDeviceError):
+            self.logger.warning("Matrix SAS done failed for {}: {}", sender, response)
+
+    async def _handle_key_verification_event(self, event: Any) -> None:
         if not (self.config.e2ee_enabled and self.config.sas_verification):
             return
         if not self.client:
             return
 
         sender = str(getattr(event, "sender", "") or "")
-        transaction_id = str(getattr(event, "transaction_id", "") or "")
-        if not transaction_id or not self._is_sas_sender_allowed(sender):
+        event_type, content = self._sas_event_type_and_content(event)
+        transaction_id = str(
+            getattr(event, "transaction_id", None) or content.get("transaction_id") or ""
+        )
+        if not self._is_sas_sender_allowed(sender):
             return
+
+        # Element uses the request/ready wrapper; nio parses those as UnknownToDeviceEvent.
+        if event_type == "m.key.verification.request":
+            await self._send_sas_ready(sender, content)
+            return
+        if event_type == "m.key.verification.done":
+            self.logger.info("Matrix SAS verification acknowledged by {}", sender)
+            return
+
+        if not transaction_id:
+            return
+
+        verifications = getattr(self.client, "key_verifications", {}) or {}
 
         if isinstance(event, KeyVerificationStart):
             if "emoji" not in (getattr(event, "short_authentication_string", None) or []):
@@ -840,26 +986,75 @@ class MatrixChannel(BaseChannel):
                 )
                 return
 
-            response = await self.client.accept_key_verification(transaction_id)
+            if transaction_id not in verifications:
+                # nio drops Start when from_device is missing from device_store; Start cannot be replayed.
+                from_device = getattr(event, "from_device", "") or ""
+                self.logger.warning(
+                    "Matrix SAS Start from {} device {} has no local transaction {} — "
+                    "warming keys/query; retry Verify after this device is known",
+                    sender,
+                    from_device,
+                    transaction_id,
+                )
+                await self._warm_device_keys_for_sas(sender)
+                await self._flush_sas_to_device("start-missing", sender)
+                return
+
+            try:
+                response = await self.client.accept_key_verification(transaction_id)
+            except LocalProtocolError as e:
+                self.logger.warning(
+                    "Matrix SAS accept skipped for {} tx {}: {}",
+                    sender,
+                    transaction_id,
+                    e,
+                )
+                await self._warm_device_keys_for_sas(sender)
+                return
             if isinstance(response, ToDeviceError):
                 self.logger.warning("Matrix SAS accept failed for {}: {}", sender, response)
+                return
+            await self._flush_sas_to_device("accept", sender)
+            self.logger.info(
+                "Matrix SAS verification accepted for {} (transaction {})",
+                sender,
+                transaction_id,
+            )
             return
 
         if isinstance(event, KeyVerificationKey):
-            responses = await self.client.send_to_device_messages()
-            if any(isinstance(response, ToDeviceError) for response in responses):
-                self.logger.warning("Matrix SAS key share failed for {}", sender)
+            if not await self._flush_sas_to_device("key-share", sender):
                 return
-
-            response = await self.client.confirm_short_auth_string(transaction_id)
+            if transaction_id not in verifications:
+                self.logger.warning(
+                    "Matrix SAS Key event for unknown transaction {} from {}",
+                    transaction_id,
+                    sender,
+                )
+                return
+            try:
+                response = await self.client.confirm_short_auth_string(transaction_id)
+            except LocalProtocolError as e:
+                self.logger.warning(
+                    "Matrix SAS confirm skipped for {} tx {}: {}",
+                    sender,
+                    transaction_id,
+                    e,
+                )
+                return
             if isinstance(response, ToDeviceError):
                 self.logger.warning("Matrix SAS confirm failed for {}: {}", sender, response)
+                return
+            sas = verifications.get(transaction_id)
+            if sas is not None and getattr(sas, "verified", False):
+                await self._send_sas_done(sender, transaction_id, sas)
             return
 
         if isinstance(event, KeyVerificationMac):
-            sas = getattr(self.client, "key_verifications", {}).get(transaction_id)
+            sas = verifications.get(transaction_id)
             if sas is not None and getattr(sas, "verified", False):
                 self.logger.info("Matrix SAS verification completed for {}", sender)
+                await self._send_sas_done(sender, transaction_id, sas)
             return
 
         if isinstance(event, KeyVerificationCancel):

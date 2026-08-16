@@ -18,9 +18,8 @@ from typing import TYPE_CHECKING, Any, Protocol
 from urllib.parse import quote, urljoin
 
 import aiohttp
-import olm
 from loguru import logger
-from unpaddedbase64 import decode_base64
+from unpaddedbase64 import decode_base64, encode_base64
 
 _MATRIX_HTTP_TIMEOUT = aiohttp.ClientTimeout(total=60)
 
@@ -250,6 +249,35 @@ def _device_has_self_signing_sig(device: dict[str, Any], user_id: str, self_sign
     return f"ed25519:{self_signing_pub}" in user_sigs
 
 
+class _PkSigning:
+    """Ed25519 from a 32-byte seed (libolm PkSigning / Matrix cross-signing seed)."""
+
+    def __init__(self, seed: bytes) -> None:
+        if len(seed) != 32:
+            raise ValueError("decoded self-signing seed is not 32 bytes")
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+        self._sk = Ed25519PrivateKey.from_private_bytes(seed)
+        self.public_key = encode_base64(
+            self._sk.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+        )
+
+    def sign(self, message: str) -> str:
+        return encode_base64(self._sk.sign(message.encode("utf-8")))
+
+
+def _ed25519_verify(public_key: str, message: str, signature: str) -> None:
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+    pk = Ed25519PublicKey.from_public_bytes(decode_base64(public_key))
+    try:
+        pk.verify(decode_base64(signature), message.encode("utf-8"))
+    except InvalidSignature as e:
+        raise ValueError("ed25519 signature verification failed") from e
+
+
 async def bootstrap_cross_signing_from_recovery(
     client: AsyncClient, matrix_config: _MatrixRecoveryConfig
 ) -> None:
@@ -270,6 +298,11 @@ async def bootstrap_cross_signing_from_recovery(
         logger.error("Matrix cross-signing bootstrap skipped: client not fully logged in")
         return
 
+    logger.info(
+        "Matrix cross-signing: ensuring device {} ({}) is self-signed via Secret Storage",
+        device_id,
+        user_id,
+    )
     try:
         await _bootstrap_cross_signing_from_recovery_impl(
             homeserver=homeserver,
@@ -280,7 +313,11 @@ async def bootstrap_cross_signing_from_recovery(
             recovery_passphrase=recovery_passphrase.strip(),
         )
     except Exception as e:
-        logger.error("Matrix cross-signing recovery failed (channel continues): {}", e)
+        logger.error(
+            "Matrix cross-signing recovery failed for device {} (channel continues): {}",
+            device_id,
+            e,
+        )
 
 
 async def _bootstrap_cross_signing_from_recovery_impl(
@@ -376,7 +413,7 @@ async def _bootstrap_cross_signing_from_recovery_impl(
         if len(seed) != 32:
             raise ValueError("decoded self-signing seed is not 32 bytes")
 
-        pk = olm.PkSigning(seed)
+        pk = _PkSigning(seed)
         self_pub = pk.public_key
 
         # --- keys/query for device + published self-signing public key ---
@@ -407,12 +444,15 @@ async def _bootstrap_cross_signing_from_recovery_impl(
             raise RuntimeError(f"keys/query did not return keys for device {device_id!r}")
 
         if _device_has_self_signing_sig(device, user_id, self_pub):
-            logger.info("Matrix device {} already has self-signing signature; skipping upload", device_id)
+            logger.info(
+                "Matrix cross-signing: device {} already self-signed; Element should treat it as verified",
+                device_id,
+            )
             return
 
         canonical = _canonical_json_for_signing(device)
         sig = pk.sign(canonical)
-        olm.ed25519_verify(self_pub, canonical, sig)
+        _ed25519_verify(self_pub, canonical, sig)
 
         new_sigs_user = dict((device.get("signatures") or {}).get(user_id, {}))
         new_sigs_user[f"ed25519:{self_pub}"] = sig
@@ -433,14 +473,38 @@ async def _bootstrap_cross_signing_from_recovery_impl(
         if st != 200:
             raise RuntimeError(f"keys/signatures/upload failed: HTTP {st}: {resp!r}")
 
-        failures = (resp or {}).get("failures") or {}
+        failures = (resp or {}).get("failures") if isinstance(resp, dict) else {}
+        failures = failures or {}
         user_fail = failures.get(user_id) or {}
         if device_id in user_fail:
             raise RuntimeError(f"keys/signatures/upload rejected signature: {user_fail[device_id]!r}")
         if failures:
             logger.warning("Matrix keys/signatures/upload reported unrelated failures: {}", failures)
 
+        # Confirm the signature is visible via keys/query (Element / MSC4153 trust).
+        st, kq_after = await _post_json(
+            session,
+            homeserver,
+            access_token,
+            "_matrix/client/v3/keys/query",
+            {"device_keys": {user_id: []}},
+        )
+        if st != 200 or not isinstance(kq_after, dict):
+            raise RuntimeError(f"post-upload keys/query failed: HTTP {st}")
+        device_after = ((kq_after.get("device_keys") or {}).get(user_id) or {}).get(device_id)
+        if not isinstance(device_after, dict) or not _device_has_self_signing_sig(
+            device_after, user_id, self_pub
+        ):
+            logger.warning(
+                "Matrix cross-signing: keys/signatures/upload returned OK but device {} "
+                "does not yet show a self-signing signature on keys/query — Element may "
+                "need a moment to refresh",
+                device_id,
+            )
+            return
+
         logger.info(
-            "Matrix cross-signing: uploaded self-signing signature for device {} (you may remove recoveryKey from config)",
+            "Matrix cross-signing: uploaded and confirmed self-signing signature for "
+            "device {} (you may remove recoveryKey from config)",
             device_id,
         )

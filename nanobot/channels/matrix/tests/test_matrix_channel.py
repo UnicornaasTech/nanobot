@@ -66,11 +66,14 @@ class _FakeAsyncClient:
         self.accept_key_verification_calls: list[str] = []
         self.confirm_short_auth_string_calls: list[str] = []
         self.send_to_device_messages_calls = 0
+        self.keys_query_calls = 0
         self.to_device_calls: list[object] = []
         self.accept_key_verification_response: object | None = None
         self.confirm_short_auth_string_response: object | None = None
         self.send_to_device_messages_response: list[object] = []
+        self.keys_query_response: object = SimpleNamespace()
         self.to_device_response: object | None = None
+        self.olm = SimpleNamespace(users_for_key_query=set())
         self.rooms: dict[str, object] = {}
         self.room_send_calls: list[dict[str, object]] = []
         self.typing_calls: list[tuple[str, bool, int]] = []
@@ -86,6 +89,8 @@ class _FakeAsyncClient:
         self.raise_on_typing = False
         self.raise_on_upload = False
         self.room_send_response: RoomSendResponse | None = RoomSendResponse(event_id="", room_id="")
+        self.raise_on_accept: Exception | None = None
+        self.raise_on_confirm: Exception | None = None
 
     def add_event_callback(self, callback, event_type) -> None:
         self.callbacks.append((callback, event_type))
@@ -115,11 +120,15 @@ class _FakeAsyncClient:
         return response_class()
 
     async def accept_key_verification(self, transaction_id: str):
+        if self.raise_on_accept is not None:
+            raise self.raise_on_accept
         self.operation_calls.append(f"accept:{transaction_id}")
         self.accept_key_verification_calls.append(transaction_id)
         return self.accept_key_verification_response
 
     async def confirm_short_auth_string(self, transaction_id: str):
+        if self.raise_on_confirm is not None:
+            raise self.raise_on_confirm
         self.operation_calls.append(f"confirm:{transaction_id}")
         self.confirm_short_auth_string_calls.append(transaction_id)
         return self.confirm_short_auth_string_response
@@ -129,7 +138,12 @@ class _FakeAsyncClient:
         self.send_to_device_messages_calls += 1
         return self.send_to_device_messages_response
 
-    async def to_device(self, message):
+    async def keys_query(self):
+        self.operation_calls.append("keys_query")
+        self.keys_query_calls += 1
+        return self.keys_query_response
+
+    async def to_device(self, message, tx_id=None):
         self.operation_calls.append("to_device")
         self.to_device_calls.append(message)
         return self.to_device_response
@@ -239,10 +253,12 @@ class _FakeKeyVerificationStart:
         *,
         sender: str = "@alice:matrix.org",
         transaction_id: str = "tx1",
+        from_device: str = "ALICEDEVICE",
         short_authentication_string: list[str] | None = None,
     ) -> None:
         self.sender = sender
         self.transaction_id = transaction_id
+        self.from_device = from_device
         self.short_authentication_string = short_authentication_string or ["emoji"]
 
 
@@ -266,6 +282,28 @@ class _FakeKeyVerificationMac:
     ) -> None:
         self.sender = sender
         self.transaction_id = transaction_id
+
+
+class _FakeUnknownToDevice:
+    def __init__(
+        self,
+        *,
+        sender: str = "@alice:matrix.org",
+        event_type: str = "m.key.verification.request",
+        content: dict | None = None,
+    ) -> None:
+        self.sender = sender
+        self.type = event_type
+        self.source = {
+            "type": event_type,
+            "sender": sender,
+            "content": content
+            or {
+                "from_device": "ALICEDEVICE",
+                "transaction_id": "tx1",
+                "methods": ["m.sas.v1"],
+            },
+        }
 
 
 def _patch_key_verification_events(monkeypatch) -> None:
@@ -324,6 +362,49 @@ async def test_start_skips_load_store_when_device_id_missing(
 
 
 @pytest.mark.asyncio
+async def test_start_continues_when_cross_signing_bootstrap_fails(
+    monkeypatch, tmp_path
+) -> None:
+    clients: list[_FakeAsyncClient] = []
+
+    def _fake_client(*args, **kwargs) -> _FakeAsyncClient:
+        client = _FakeAsyncClient(*args, **kwargs)
+        clients.append(client)
+        return client
+
+    def _fake_create_task(coro):
+        coro.close()
+        return _DummyTask()
+
+    async def _boom(*_args, **_kwargs):
+        raise ModuleNotFoundError("No module named 'olm'")
+
+    monkeypatch.setattr("nanobot.channels.matrix.runtime.get_data_dir", lambda: tmp_path)
+    monkeypatch.setattr(
+        "nanobot.channels.matrix.runtime.AsyncClientConfig",
+        lambda **kwargs: SimpleNamespace(**kwargs),
+    )
+    monkeypatch.setattr("nanobot.channels.matrix.runtime.AsyncClient", _fake_client)
+    monkeypatch.setattr(
+        "nanobot.channels.matrix.runtime.asyncio.create_task", _fake_create_task
+    )
+    monkeypatch.setattr(
+        "nanobot.channels.matrix.cross_signing_recovery.bootstrap_cross_signing_from_recovery",
+        _boom,
+    )
+
+    channel = MatrixChannel(
+        _make_config(device_id="BOTDEVICE", e2ee_enabled=True, recovery_key="EsTdummy"),
+        MessageBus(),
+    )
+    await channel.start()
+
+    assert len(clients) == 1
+    assert channel._sync_task is not None
+    await channel.stop()
+
+
+@pytest.mark.asyncio
 async def test_register_event_callbacks_uses_media_base_filter() -> None:
     channel = MatrixChannel(_make_config(), MessageBus())
     client = _FakeAsyncClient("", "", "", None)
@@ -344,7 +425,7 @@ def test_register_to_device_callbacks_when_sas_verification_enabled() -> None:
     channel._register_to_device_callbacks()
 
     assert client.to_device_callbacks == [
-        (channel._on_key_verification_event, (matrix_module.KeyVerificationEvent,))
+        (channel._on_key_verification_event, (matrix_module.KeyVerificationEvent, matrix_module.UnknownToDeviceEvent))
     ]
 
 
@@ -380,8 +461,124 @@ async def test_sas_verification_start_accepts_allowed_sender(monkeypatch) -> Non
     await channel._handle_key_verification_event(_FakeKeyVerificationStart())
 
     assert client.accept_key_verification_calls == ["tx1"]
+    assert client.send_to_device_messages_calls == 1
     assert sas.share_key_called is False
     assert client.to_device_calls == []
+
+
+@pytest.mark.asyncio
+async def test_sas_verification_allows_own_mxid(monkeypatch) -> None:
+    _patch_key_verification_events(monkeypatch)
+    channel = MatrixChannel(
+        _make_config(
+            allow_from=["@alice:matrix.org"],
+            e2ee_enabled=True,
+            sas_verification=True,
+        ),
+        MessageBus(),
+    )
+    client = _FakeAsyncClient("", "", "", None)
+    client.user_id = "@bot:matrix.org"
+    client.key_verifications["tx1"] = _FakeSas()
+    channel.client = client
+
+    await channel._handle_key_verification_event(
+        _FakeKeyVerificationStart(sender="@bot:matrix.org")
+    )
+
+    assert client.accept_key_verification_calls == ["tx1"]
+    assert client.send_to_device_messages_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_sas_verification_start_missing_tx_warms_keys(monkeypatch) -> None:
+    _patch_key_verification_events(monkeypatch)
+    channel = MatrixChannel(
+        _make_config(
+            allow_from=["@alice:matrix.org"],
+            e2ee_enabled=True,
+            sas_verification=True,
+        ),
+        MessageBus(),
+    )
+    client = _FakeAsyncClient("", "", "", None)
+    client.user_id = "@bot:matrix.org"
+    channel.client = client
+
+    await channel._handle_key_verification_event(_FakeKeyVerificationStart())
+
+    assert client.accept_key_verification_calls == []
+    assert client.keys_query_calls == 1
+    assert "@alice:matrix.org" in client.olm.users_for_key_query
+    assert client.send_to_device_messages_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_sas_verification_request_sends_ready(monkeypatch) -> None:
+    _patch_key_verification_events(monkeypatch)
+    channel = MatrixChannel(
+        _make_config(
+            allow_from=["@alice:matrix.org"],
+            e2ee_enabled=True,
+            sas_verification=True,
+        ),
+        MessageBus(),
+    )
+    client = _FakeAsyncClient("", "", "", None)
+    client.device_id = "BOTDEVICE"
+    channel.client = client
+
+    await channel._handle_key_verification_event(_FakeUnknownToDevice())
+
+    assert client.accept_key_verification_calls == []
+    assert len(client.to_device_calls) == 1
+    message = client.to_device_calls[0]
+    assert message.type == "m.key.verification.ready"
+    assert message.recipient == "@alice:matrix.org"
+    assert message.recipient_device == "ALICEDEVICE"
+    assert message.content["methods"] == ["m.sas.v1"]
+    assert message.content["from_device"] == "BOTDEVICE"
+
+
+@pytest.mark.asyncio
+async def test_sas_verification_request_ignores_denied_sender(monkeypatch) -> None:
+    channel = MatrixChannel(
+        _make_config(
+            allow_from=["@alice:matrix.org"],
+            e2ee_enabled=True,
+            sas_verification=True,
+        ),
+        MessageBus(),
+    )
+    client = _FakeAsyncClient("", "", "", None)
+    client.user_id = "@bot:matrix.org"
+    client.device_id = "BOTDEVICE"
+    channel.client = client
+
+    await channel._handle_key_verification_event(
+        _FakeUnknownToDevice(sender="@mallory:matrix.org")
+    )
+
+    assert client.to_device_calls == []
+    _patch_key_verification_events(monkeypatch)
+    channel = MatrixChannel(
+        _make_config(
+            allow_from=["@alice:matrix.org"],
+            e2ee_enabled=True,
+            sas_verification=True,
+        ),
+        MessageBus(),
+    )
+    client = _FakeAsyncClient("", "", "", None)
+    client.user_id = "@bot:matrix.org"
+    channel.client = client
+
+    await channel._handle_key_verification_event(_FakeKeyVerificationStart())
+
+    assert client.accept_key_verification_calls == []
+    assert client.keys_query_calls == 1
+    assert "@alice:matrix.org" in client.olm.users_for_key_query
+    assert client.send_to_device_messages_calls == 1
 
 
 @pytest.mark.asyncio
@@ -396,6 +593,7 @@ async def test_sas_verification_ignores_denied_sender(monkeypatch) -> None:
         MessageBus(),
     )
     client = _FakeAsyncClient("", "", "", None)
+    client.user_id = "@bot:matrix.org"
     client.key_verifications["tx1"] = _FakeSas()
     channel.client = client
 
@@ -436,6 +634,7 @@ async def test_sas_verification_key_confirms_allowed_sender(monkeypatch) -> None
         MessageBus(),
     )
     client = _FakeAsyncClient("", "", "", None)
+    client.key_verifications["tx1"] = _FakeSas()
     channel.client = client
 
     await channel._handle_key_verification_event(_FakeKeyVerificationKey())

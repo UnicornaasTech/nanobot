@@ -34,6 +34,7 @@ PLUGIN = ChannelPlugin(
         "aiohttp>=3.9.0,<4.0.0",
         "mistune>=3.0.0,<4.0.0",
         "nh3>=0.2.17,<1.0.0",
+        "cryptography>=42.0.0",
     ),
     webui="webui/index.ts",
 )

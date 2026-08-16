@@ -9,7 +9,6 @@ import os
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
-import olm
 import pytest
 from unpaddedbase64 import encode_base64
 
@@ -63,8 +62,8 @@ def test_decode_recovery_key_rejects_invalid_chars() -> None:
 def test_bootstrap_uploads_self_signing_signature(monkeypatch: pytest.MonkeyPatch) -> None:
     secret_key = os.urandom(32)
     recovery_key = mcr.encode_matrix_recovery_key(secret_key)
-    self_seed = olm.PkSigning.generate_seed()
-    pk = olm.PkSigning(self_seed)
+    self_seed = os.urandom(32)
+    pk = mcr._PkSigning(self_seed)
     self_pub = pk.public_key
     user_id = "@bot:example.org"
     device_id = "NANOBOT1"
@@ -96,6 +95,7 @@ def test_bootstrap_uploads_self_signing_signature(monkeypatch: pytest.MonkeyPatc
     }
 
     uploads: list[dict[str, Any]] = []
+    signed_device: dict[str, Any] | None = None
 
     async def fake_get(
         session: Any, homeserver: str, access_token: str, path: str
@@ -112,10 +112,17 @@ def test_bootstrap_uploads_self_signing_signature(monkeypatch: pytest.MonkeyPatc
     async def fake_post(
         session: Any, homeserver: str, access_token: str, path: str, body: dict[str, Any]
     ) -> tuple[int, Any]:
+        nonlocal signed_device
         if path.endswith("/keys/query"):
+            if signed_device is not None:
+                return 200, {
+                    "device_keys": {user_id: {device_id: signed_device}},
+                    "self_signing_keys": kq["self_signing_keys"],
+                }
             return 200, kq
         if path.endswith("/keys/signatures/upload"):
             uploads.append(body)
+            signed_device = body[user_id][device_id]
             return 200, {"failures": {}}
         return 500, {"err": path}
 
@@ -141,14 +148,14 @@ def test_bootstrap_uploads_self_signing_signature(monkeypatch: pytest.MonkeyPatc
     assert f"ed25519:{self_pub}" in sigs
 
     canonical = mcr._canonical_json_for_signing(device_obj)
-    olm.ed25519_verify(self_pub, canonical, sigs[f"ed25519:{self_pub}"])
+    mcr._ed25519_verify(self_pub, canonical, sigs[f"ed25519:{self_pub}"])
 
 
 def test_bootstrap_skips_when_already_signed(monkeypatch: pytest.MonkeyPatch) -> None:
     secret_key = os.urandom(32)
     recovery_key = mcr.encode_matrix_recovery_key(secret_key)
-    self_seed = olm.PkSigning.generate_seed()
-    pk = olm.PkSigning(self_seed)
+    self_seed = os.urandom(32)
+    pk = mcr._PkSigning(self_seed)
     self_pub = pk.public_key
     user_id = "@bot:example.org"
     device_id = "NANOBOT1"
@@ -257,3 +264,27 @@ def test_bootstrap_noop_without_secrets() -> None:
         await mcr.bootstrap_cross_signing_from_recovery(client, cfg)  # type: ignore[arg-type]
 
     asyncio.run(_run())
+
+
+def test_pk_signing_roundtrip() -> None:
+    seed = os.urandom(32)
+    pk = mcr._PkSigning(seed)
+    msg = '{"a":1}'
+    sig = pk.sign(msg)
+    mcr._ed25519_verify(pk.public_key, msg, sig)
+    with pytest.raises(ValueError, match="ed25519"):
+        mcr._ed25519_verify(pk.public_key, msg, encode_base64(os.urandom(64)))
+
+
+def test_pk_signing_matches_libolm_when_installed() -> None:
+    olm = pytest.importorskip("olm")
+    seed = os.urandom(32)
+    ours = mcr._PkSigning(seed)
+    theirs = olm.PkSigning(seed)
+    assert ours.public_key == theirs.public_key
+    msg = '{"device_id":"X"}'
+    assert ours.sign(msg) == theirs.sign(msg)
+
+
+def test_cross_signing_module_does_not_import_olm() -> None:
+    assert "olm" not in mcr.__dict__

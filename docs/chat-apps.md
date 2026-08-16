@@ -363,6 +363,7 @@ nanobot plugins enable matrix
       "password": "mypasswordhere",
       "e2eeEnabled": true,
       "sasVerification": true,
+      "recoveryKey": "EsT …",
       "allowFrom": ["@your_user:matrix.org"],
       "groupPolicy": "open",
       "groupAllowFrom": [],
@@ -373,7 +374,7 @@ nanobot plugins enable matrix
 }
 ```
 
-> Keep a persistent `matrix-store` — encrypted session state is lost if these change across restarts.
+> Keep a persistent `matrix-store` (under the nanobot data dir, e.g. `~/.nanobot/matrix-store`). Encrypted session state and device identity are lost if you wipe it or change homeserver/user across restarts. Do not casually delete it if the bot device must stay cross-signed.
 
 | Option | Description |
 |--------|-------------|
@@ -382,11 +383,15 @@ nanobot plugins enable matrix
 | `groupAllowFrom` | Room allowlist (used when policy is `allowlist`). |
 | `allowRoomMentions` | Accept `@room` mentions in mention mode. |
 | `e2eeEnabled` | E2EE support (default `true`). Set `false` for plaintext-only. |
-| `sasVerification` | Auto-complete SAS device verification requests from allowed users (default `false`). Useful for Element X, which does not expose manual trust for third-party devices. |
+| `sasVerification` | Auto-complete SAS device verification from `allowFrom` users **or** the bot's own MXID (default `false`). Useful for Element X, which does not expose manual trust for third-party devices. |
+| `recoveryKey` / `recoveryPassphrase` | Fork: Element Secret Storage security key or passphrase. At startup, signs this gateway device with the account's self-signing key so Element treats it as verified (needed for “exclude insecure devices” / MSC4153). Prefer this over interactive Sessions→Verify from the bot account. |
 | `maxMediaBytes` | Max attachment size (default `20MB`). Set `0` to block all media. |
 
+**Device trust (Element / MSC4153)**
 
-
+1. Prefer **`recoveryKey`** (or passphrase) once so the nanobot device is **cross-signed**. Element's "exclude insecure devices" mode only shares room keys with cross-signed devices.
+2. Interactive SAS (`sasVerification`) auto-accepts `m.key.verification.request` with `m.sas.v1` from `allowFrom` or the bot's own MXID. Prefer starting Verify from a human account in the bot DM/profile. Same-account Sessions verify is best-effort (matrix-nio still has gaps vs Element).
+3. After a successful cross-sign upload you can remove `recoveryKey` from config; keep `matrix-store` intact.
 
 **4. Run**
 
