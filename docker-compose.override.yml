@@ -12,6 +12,7 @@
 # TTS output: host ttswrapper data dir → workspace media/tts (override via TTS_OUTPUT_HOST in .env).
 # Spotify MCP: host repo → /home/nanobot/tools/spotify-mcp (override via SPOTIFY_MCP_HOST in .env).
 x-runtime-volumes: &runtime-volumes
+  - ~/.nanobot:/home/nanobot/.nanobot
   - ${HF_HOME:-~/.cache/huggingface}:/home/nanobot/.cache/huggingface
   - ${TTS_OUTPUT_HOST:-/Users/panuhallfors/tools/ttswrapper/data/output}:/home/nanobot/.nanobot/workspace/media/tts
   - ${SPOTIFY_MCP_HOST:-/Users/panuhallfors/tools/spotify-mcp}:/home/nanobot/tools/spotify-mcp

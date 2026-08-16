@@ -12,7 +12,6 @@ because ``nanobot/agent/__init__.py`` eagerly imports ``AgentLoop``, which binds
 
 from __future__ import annotations
 
-import json
 import time
 from typing import Any
 
@@ -39,7 +38,6 @@ def apply() -> None:
         return
 
     import nanobot.agent.tools.web as web_mod
-    from nanobot.agent.tools.web import _validate_url_safe
     from nanobot.contrib.web_guard.postprocess import postprocess_fetch_result
 
     cls = web_mod.WebFetchTool
@@ -52,20 +50,15 @@ def apply() -> None:
     async def guarded_execute(  # type: ignore[override]
         self,
         url: str,
-        extractMode: str = "markdown",  # noqa: N803
-        maxChars: int | None = None,  # noqa: N803
+        extract_mode: str = "markdown",
+        max_chars: int | None = None,
         **kwargs: Any,
     ) -> Any:
-        is_valid, error_msg = _validate_url_safe(url)
-        if not is_valid:
-            return json.dumps(
-                {"error": f"URL validation failed: {error_msg}", "url": url},
-                ensure_ascii=False,
-            )
-
         settings = load_guard_config()
         page_t0 = time.perf_counter()
-        result = await original_execute(self, url, extractMode, maxChars, **kwargs)
+        result = await original_execute(
+            self, url, extract_mode, max_chars, **kwargs
+        )
         fetch_seconds = time.perf_counter() - page_t0
         result = await postprocess_fetch_result(url, result, settings)
         logger.debug(

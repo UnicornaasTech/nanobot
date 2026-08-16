@@ -12,7 +12,7 @@ from nanobot.agent.tools.web import _UNTRUSTED_BANNER
 from nanobot.config.loader import get_config_path, set_config_path
 from nanobot.contrib.web_guard.config import invalidate_guard_config_cache
 from nanobot.contrib.web_guard.guard import GuardScanResult, chunk_text
-from nanobot.contrib.web_guard.postprocess import postprocess_fetch_result, _split_untrusted_banner
+from nanobot.contrib.web_guard.postprocess import _split_untrusted_banner, postprocess_fetch_result
 
 _saved_config_path: Path | None = None
 
@@ -179,8 +179,8 @@ async def test_bootstrap_applies_postprocess(monkeypatch: pytest.MonkeyPatch) ->
     async def fake_fetch(
         self,
         url: str,
-        extractMode: str = "markdown",  # noqa: N803
-        maxChars: int | None = None,  # noqa: N803
+        extract_mode: str = "markdown",
+        max_chars: int | None = None,
         **kwargs: object,
     ) -> str:
         return sample
@@ -200,6 +200,43 @@ async def test_bootstrap_applies_postprocess(monkeypatch: pytest.MonkeyPatch) ->
         out = await cls().execute("https://example.com")
     data = json.loads(out)
     assert data.get("reason") == "content_blocked"
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_forwards_snake_and_camel_extract_args(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import nanobot.agent.tools.web as web_mod
+    from nanobot.contrib.web_guard import bootstrap
+
+    cls = web_mod.WebFetchTool
+    seen: list[tuple[str, int | None, dict[str, object]]] = []
+
+    async def fake_fetch(
+        self,
+        url: str,
+        extract_mode: str = "markdown",
+        max_chars: int | None = None,
+        **kwargs: object,
+    ) -> str:
+        seen.append((extract_mode, max_chars, dict(kwargs)))
+        return json.dumps({"url": url, "text": "ok"})
+
+    bootstrap._applied = False
+    if hasattr(cls, "__nanobot_guarded_web_fetch__"):
+        delattr(cls, "__nanobot_guarded_web_fetch__")
+    monkeypatch.setattr(cls, "execute", fake_fetch)
+    bootstrap.apply()
+
+    tool = cls()
+    await tool.execute("https://example.com", extract_mode="text", max_chars=100)
+    await tool.execute("https://example.com", extractMode="text", maxChars=200)
+
+    assert seen[0][0] == "text"
+    assert seen[0][1] == 100
+    assert seen[1][0] == "markdown"
+    assert seen[1][2]["extractMode"] == "text"
+    assert seen[1][2]["maxChars"] == 200
 
 
 def test_cliguard_blocks_unsafe() -> None:

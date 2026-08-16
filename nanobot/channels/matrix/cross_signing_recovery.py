@@ -277,7 +277,7 @@ async def bootstrap_cross_signing_from_recovery(
             user_id=user_id,
             device_id=device_id,
             recovery_key=recovery_key.strip(),
-            recovery_passphrase=recovery_passphrase,
+            recovery_passphrase=recovery_passphrase.strip(),
         )
     except Exception as e:
         logger.error("Matrix cross-signing recovery failed (channel continues): {}", e)
