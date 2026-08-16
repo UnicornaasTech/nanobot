@@ -29,6 +29,14 @@ fi
 # re-exec as nanobot. Fail closed: if the privilege drop cannot be performed,
 # exit rather than run the agent as root.
 if [ "$(id -u)" = "0" ]; then
+    # FORK: optional egress firewall before privilege drop (local compose overlay).
+    if [ "${NANOBOT_INIT_FIREWALL:-0}" = "1" ] && [ -x /usr/local/bin/init-firewall.sh ]; then
+        echo "[entrypoint] applying container egress firewall"
+        /usr/local/bin/init-firewall.sh || {
+            echo "[entrypoint] error: init-firewall.sh failed" >&2
+            exit 1
+        }
+    fi
     chown -R nanobot:nanobot "$dir" 2>/dev/null || echo "[entrypoint] warning: chown $dir failed"
     if setpriv --reuid=nanobot --regid=nanobot --init-groups true 2>/dev/null; then
         echo "[entrypoint] dropping privileges to nanobot via setpriv"
@@ -50,6 +58,15 @@ Fix (pick one):
   Podman: podman run --userns=keep-id ...
 EOF
     exit 1
+fi
+
+# FORK: non-root path can still apply firewall via sudoers when requested.
+if [ "${NANOBOT_INIT_FIREWALL:-0}" = "1" ] && [ -x /usr/local/bin/init-firewall.sh ]; then
+    echo "[entrypoint] applying container egress firewall (sudo)"
+    sudo /usr/local/bin/init-firewall.sh || {
+        echo "[entrypoint] error: init-firewall.sh failed" >&2
+        exit 1
+    }
 fi
 
 exec nanobot "$@"

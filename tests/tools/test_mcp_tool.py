@@ -19,6 +19,7 @@ from nanobot.agent.tools.mcp import (
     _normalize_windows_stdio_command,
     _sanitize_mcp_tool_name,
     _sanitize_name,
+    _sse_httpx_timeout,
     connect_mcp_servers,
 )
 from nanobot.agent.tools.registry import ToolRegistry, is_tool_error_result
@@ -674,6 +675,32 @@ async def test_execute_handles_generic_exception() -> None:
     result = await wrapper.execute()
 
     assert result == "(MCP tool call failed: RuntimeError)"
+    assert is_tool_error_result(result)
+
+
+def test_sse_httpx_timeout_clears_read_timeout() -> None:
+    base = httpx.Timeout(5.0, read=300.0)
+    merged = _sse_httpx_timeout(base)
+    assert merged is not None
+    assert merged.read is None
+    assert merged.connect == base.connect
+
+
+@pytest.mark.asyncio
+async def test_execute_read_timeout_triggers_transport_hook() -> None:
+    events: list[int] = []
+
+    async def call_tool(_name: str, arguments: dict) -> object:
+        raise httpx.ReadTimeout("timed out")
+
+    async def on_fail() -> None:
+        events.append(1)
+
+    wrapper = _make_wrapper(SimpleNamespace(call_tool=call_tool))
+    wrapper.set_transport_failure_handler(on_fail)
+    result = await wrapper.execute()
+    assert events == [1]
+    assert "ReadTimeout" in str(result)
     assert is_tool_error_result(result)
 
 

@@ -57,13 +57,15 @@ echo "Host network detected as: $HOST_NETWORK"
 iptables -A INPUT -s "$HOST_NETWORK" -j ACCEPT
 iptables -A OUTPUT -d "$HOST_NETWORK" -j ACCEPT
 
-# Allow host services via Docker host alias (local LLM for Qwen Code, etc.).
+# Allow host services via Docker host alias (local LLM, Whisper STT, TTS, etc.).
 HOST_DOCKER_INTERNAL_IP=$(dig +noall +answer A host.docker.internal | awk '$4 == "A" {print $5}' | head -n 1)
 if [ -n "$HOST_DOCKER_INTERNAL_IP" ]; then
-    for host_port in 18000; do
+    for host_port in 18000 2022 2023 5432; do
         echo "Allowing host.docker.internal ($HOST_DOCKER_INTERNAL_IP:$host_port)"
         iptables -A OUTPUT -p tcp -d "$HOST_DOCKER_INTERNAL_IP" --dport "$host_port" -j ACCEPT
     done
+    echo "Allowing host.docker.internal ($HOST_DOCKER_INTERNAL_IP:8801-8810)"
+    iptables -A OUTPUT -p tcp -d "$HOST_DOCKER_INTERNAL_IP" -m multiport --dports 8801:8810 -j ACCEPT
 else
     echo "host.docker.internal did not resolve; relying on host network allow rule"
 fi

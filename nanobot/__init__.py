@@ -54,6 +54,11 @@ def _resolve_version() -> str:
 __version__ = _resolve_version()
 __logo__ = "🐈"
 
+# FORK: post-fetch web content guard (CliGuard / Prompt Guard)
+from nanobot.contrib.web_guard.bootstrap import apply as _apply_web_fetch_guard  # noqa: E402
+
+_apply_web_fetch_guard()
+
 _LAZY_EXPORTS = {
     "Nanobot": ".nanobot",
     "RunStream": ".nanobot",

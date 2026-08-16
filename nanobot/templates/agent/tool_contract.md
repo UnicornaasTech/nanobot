@@ -75,6 +75,7 @@
 - Use `message` only for proactive sends, cross-channel delivery, or delivering existing local files and generated images through its `media` parameter.
 - `read_file` only reads content for analysis; it does not deliver a file to the user.
 - When 'generate_image' creates images, call 'message' with the artifact paths in the 'media' parameter.
+- **Matrix + TTS/spoken `.ogg`:** call `message` with `media=["/path/to/file.ogg"]` **and** `voice=true` (boolean tool parameter). Example: `message(content="", media=["/path/to/speech.ogg"], voice=true)`. Without `voice=true`, Matrix shows a file attachment, not a voice bubble.
 
 ## Scheduling and Background Work
 

@@ -1,0 +1,62 @@
+# Merged automatically with docker-compose.yml by Docker Compose.
+# In-container firewall (init-firewall.sh): NET_ADMIN for iptables;
+# set NANOBOT_INIT_FIREWALL=1 so entrypoint applies it before privilege drop.
+# extra_hosts if need to have host.docker.internal resolves on Linux (see init-firewall.sh).
+#
+# Secrets: copy .env.example → .env (gitignored). Keys are injected via env_file.
+# In ~/.nanobot/config.json use placeholders, e.g. "apiKey": "${OPENROUTER_API_KEY}".
+#
+# Web fetch guard (fork): opt-in at build time (./build-nanobot.sh web-guard; WEB_GUARD default false).
+# Image always includes agent-browser + Chromium.
+# HF model cache: host HF_HOME (default ~/.cache/huggingface) is mounted into the container.
+# TTS output: host ttswrapper data dir → workspace media/tts (override via TTS_OUTPUT_HOST in .env).
+# Spotify MCP: host repo → /home/nanobot/tools/spotify-mcp (override via SPOTIFY_MCP_HOST in .env).
+x-runtime-volumes: &runtime-volumes
+  - ${HF_HOME:-~/.cache/huggingface}:/home/nanobot/.cache/huggingface
+  - ${TTS_OUTPUT_HOST:-/Users/panuhallfors/tools/ttswrapper/data/output}:/home/nanobot/.nanobot/workspace/media/tts
+  - ${SPOTIFY_MCP_HOST:-/Users/panuhallfors/tools/spotify-mcp}:/home/nanobot/tools/spotify-mcp
+
+x-fork-runtime: &fork-runtime
+  env_file:
+    - path: .env
+      required: false
+  environment:
+    HF_HOME: /home/nanobot/.cache/huggingface
+    NANOBOT_INIT_FIREWALL: "1"
+
+# web-guard loads torch + ~300M CliGuard model on first web_fetch; 1G base limit OOMs.
+# Slim images (no web-guard): set NANOBOT_MEMORY_LIMIT=1G in .env.
+x-web-guard-memory: &web-guard-memory
+  deploy:
+    resources:
+      limits:
+        memory: ${NANOBOT_MEMORY_LIMIT:-3G}
+
+services:
+  nanobot-gateway:
+    <<: [*fork-runtime, *web-guard-memory]
+#    extra_hosts:
+#      - "host.docker.internal:host-gateway"
+    volumes: *runtime-volumes
+    cap_add:
+        # init-firewall.sh runs as root in entrypoint before setpriv; NET_ADMIN needed.
+      - NET_ADMIN
+      - SETUID
+      - SETGID
+  nanobot-api:
+    <<: [*fork-runtime, *web-guard-memory]
+#    extra_hosts:
+#      - "host.docker.internal:host-gateway"
+    volumes: *runtime-volumes
+    # Use the same workspace in api as with cli:
+    command:
+      ["serve", "--host", "0.0.0.0", "-w", "/home/nanobot/.nanobot/workspace"]
+    cap_add:
+      - NET_ADMIN
+  nanobot-cli:
+    <<: *fork-runtime
+#    extra_hosts:
+#      - "host.docker.internal:host-gateway"
+    volumes: *runtime-volumes
+    cap_add:
+      - NET_ADMIN

@@ -15,6 +15,17 @@ Nanobot's agent workspace is at: {{ agent_workspace_path }}
 {% if channel == 'telegram' or channel == 'qq' or channel == 'discord' %}
 ## Format Hint
 This conversation is on a messaging app. Use short paragraphs. Avoid large headings (#, ##). Use **bold** sparingly. No tables — use plain lists.
+{% elif channel == 'matrix' %}
+## Format Hint
+This conversation is on Matrix (Element). Use short paragraphs. Avoid large headings (#, ##). Use **bold** sparingly. No tables — use plain lists.
+
+## Matrix voice messages (TTS / spoken audio)
+
+To deliver TTS or other spoken `.ogg` audio as a **native voice bubble**, call the `message` tool with **`voice` set to `true`** (a top-level boolean parameter on the tool, alongside `content` and `media`):
+
+```
+message(content="", media=["/path/to/speech.ogg"], voice=true)
+```
 {% elif channel == 'whatsapp' or channel == 'sms' %}
 ## Format Hint
 This conversation is on a text messaging platform that does not render markdown. Use plain text only.

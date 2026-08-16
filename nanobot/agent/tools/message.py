@@ -11,10 +11,18 @@ from loguru import logger
 from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
 from nanobot.agent.tools.context import ToolContext, current_request_context
 from nanobot.agent.tools.path_utils import resolve_workspace_path
-from nanobot.agent.tools.schema import ArraySchema, StringSchema, tool_parameters_schema
+from nanobot.agent.tools.schema import (
+    ArraySchema,
+    BooleanSchema,
+    StringSchema,
+    tool_parameters_schema,
+)
 from nanobot.bus.events import OutboundMessage
 from nanobot.config.paths import get_workspace_path
 from nanobot.security.workspace_access import current_tool_workspace
+
+_AUDIO_EXTENSIONS = frozenset({".ogg", ".oga", ".opus", ".mp3", ".m4a", ".wav", ".aac", ".flac"})
+_VOICE_EXTENSIONS = frozenset({".ogg", ".oga", ".opus"})
 
 
 @tool_parameters(
@@ -37,12 +45,21 @@ from nanobot.security.workspace_access import current_tool_workspace
             StringSchema(""),
             description=(
                 "Optional list of existing file paths to attach. "
-                "Use artifact paths returned by generate_image here when delivering generated images."
+                "Use artifact paths returned by generate_image here when delivering generated images. "
+                "For TTS or spoken replies on Matrix, pass the .ogg file path here together with voice=true."
             ),
         ),
         buttons=ArraySchema(
             ArraySchema(StringSchema("Button label")),
             description="Optional: inline keyboard buttons as list of rows, each row is list of button labels.",
+        ),
+        voice=BooleanSchema(
+            description=(
+                "Set to true when sending TTS or spoken .ogg audio on Matrix so it renders as a "
+                "native voice bubble. Example: message(content=\"\", media=[\"/path/to/speech.ogg\"], "
+                "voice=true). Required for Matrix voice delivery — omitting this sends a file attachment."
+            ),
+            default=False,
         ),
         required=["content"],
     )
@@ -122,6 +139,9 @@ class MessageTool(Tool):
             "When generate_image creates images in the current chat, use the message tool "
             "with the artifact paths in the media parameter to deliver the images to the user. "
             "For proactive attachment delivery, use the 'media' parameter with file paths. "
+            "Matrix TTS/spoken .ogg: call message(content=\"\", media=[ogg_path], voice=true) — "
+            "voice is a boolean parameter on this tool; without voice=true Matrix shows a file attachment. "
+            "Use voice=false (default) for images, documents, or music. "
             "Do NOT use read_file to send files — that only reads content for your own analysis."
         )
 
@@ -143,6 +163,14 @@ class MessageTool(Tool):
                 resolved.append(str(resolve_workspace_path(p, workspace, access.allowed_root)))
         return resolved
 
+    @staticmethod
+    def _looks_like_audio_path(path: str) -> bool:
+        return Path(path).suffix.lower() in _AUDIO_EXTENSIONS
+
+    @staticmethod
+    def _looks_like_voice_path(path: str) -> bool:
+        return Path(path).suffix.lower() in _VOICE_EXTENSIONS
+
     async def execute(
         self,
         content: str,
@@ -151,6 +179,7 @@ class MessageTool(Tool):
         message_id: str | None = None,
         media: list[str] | None = None,
         buttons: Any = None,
+        voice: bool = False,
         **kwargs: Any,
     ) -> str:  # pyright: ignore[reportIncompatibleMethodOverride]
         from nanobot.utils.helpers import strip_think
@@ -238,11 +267,51 @@ class MessageTool(Tool):
             except (OSError, PermissionError, ValueError) as e:
                 return ToolResult.error(f"Error: media path is not allowed: {str(e)}")
 
+        if (
+            media
+            and channel == "matrix"
+            and not voice
+            and any(self._looks_like_voice_path(p) for p in media)
+        ):
+            voice = True
+            logger.info(
+                "MessageTool: auto-enabled voice=true for Matrix .ogg attachment "
+                "(LLM omitted voice parameter). paths={}",
+                media,
+            )
+
         metadata = dict(default_metadata) if same_target else {}
         if message_id:
             metadata["message_id"] = message_id
         if media:
             metadata["_record_channel_delivery"] = True
+        if voice and media:
+            metadata["_matrix_voice"] = True
+
+        delivery_mode = "text_only"
+        if media:
+            if channel == "matrix" and metadata.get("_matrix_voice"):
+                delivery_mode = "matrix_voice"
+            elif channel == "matrix" and any(self._looks_like_audio_path(p) for p in media):
+                delivery_mode = "matrix_attachment"
+            else:
+                delivery_mode = "attachment"
+            logger.debug(
+                "MessageTool media delivery: channel={} chat_id={} voice_param={} "
+                "matrix_voice_metadata={} delivery_mode={} paths={}",
+                channel,
+                chat_id,
+                voice,
+                metadata.get("_matrix_voice"),
+                delivery_mode,
+                media,
+            )
+            if channel == "matrix" and delivery_mode == "matrix_attachment":
+                logger.warning(
+                    "MessageTool: Matrix audio sent without voice=true; clients will show a file "
+                    "attachment instead of a native voice bubble. paths={}",
+                    media,
+                )
 
         msg = OutboundMessage(
             channel=channel,
@@ -267,6 +336,13 @@ class MessageTool(Tool):
                 if button_rows
                 else ""
             )
-            return f"Message sent to {channel}:{chat_id}{media_info}{button_info}"
+            delivery_note = ""
+            if delivery_mode == "matrix_voice":
+                delivery_note = " (Matrix native voice message)"
+            elif delivery_mode == "matrix_attachment":
+                delivery_note = (
+                    " (Matrix file attachment — set voice=true for native voice bubble)"
+                )
+            return f"Message sent to {channel}:{chat_id}{media_info}{button_info}{delivery_note}"
         except Exception as e:
             return ToolResult.error(f"Error sending message: {str(e)}")

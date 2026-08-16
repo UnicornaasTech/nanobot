@@ -55,6 +55,7 @@ _WINDOWS_SHELL_LAUNCHERS: frozenset[str] = frozenset(("npx", "npm", "pnpm", "yar
 # Replace anything outside [a-zA-Z0-9_-] with underscore and collapse runs.
 _SANITIZE_RE = re.compile(r"_+")
 _ReconnectCallback = Callable[[str, str, Tool], Awaitable[Tool | None]]
+_TransportFailureCallback = Callable[[], Awaitable[None]]
 MCPServerLoader = Callable[[], Mapping[str, "MCPServerConfig"]]
 MCPRuntimeStatus = Literal["connecting", "connected", "failed"]
 
@@ -233,6 +234,57 @@ def _is_session_terminated(exc: BaseException) -> bool:
         marker in message.lower()
         for marker in ("session terminated", "connection closed")
         for message in messages
+    )
+
+
+def _is_mcp_transport_failure(exc: BaseException) -> bool:
+    """True when the MCP HTTP/SSE transport is likely dead (needs reset, not inline retry).
+
+    Covers httpx read/connect timeouts and protocol write failures that do not
+    always surface as the SDK's "session terminated" markers. Transient
+    anyio/connection errors remain on the existing reconnect/retry path.
+    """
+    if isinstance(exc, OSError):
+        import errno
+
+        err = getattr(exc, "errno", None)
+        if err in (errno.ECONNRESET, errno.EPIPE, errno.ETIMEDOUT, errno.ECONNABORTED):
+            return True
+    return isinstance(
+        exc,
+        (
+            httpx.ReadTimeout,
+            httpx.ConnectTimeout,
+            httpx.ConnectError,
+            httpx.RemoteProtocolError,
+            httpx.WriteError,
+        ),
+    )
+
+
+async def _notify_transport_failure(
+    hook: Callable[[], Awaitable[None]] | None,
+    label: str,
+) -> bool:
+    """Invoke transport-failure hook; return True if hook was called."""
+    if hook is None:
+        return False
+    try:
+        await hook()
+    except Exception:
+        logger.exception("MCP on_transport_failure hook failed for '{}'", label)
+    return True
+
+
+def _sse_httpx_timeout(timeout: httpx.Timeout | None) -> httpx.Timeout | None:
+    """SSE is a long-lived stream; never apply a finite read timeout to the shared client."""
+    if timeout is None:
+        return None
+    return httpx.Timeout(
+        connect=timeout.connect,
+        read=None,
+        write=timeout.write,
+        pool=timeout.pool,
     )
 
 
@@ -513,9 +565,27 @@ class _MCPWrapperBase(Tool):
         self._session = session
         self._server_name = server_name
         self._reconnect: _ReconnectCallback | None = None
+        self._on_transport_failure: _TransportFailureCallback | None = None
 
     def set_reconnect_handler(self, reconnect: _ReconnectCallback) -> None:
         self._reconnect = reconnect
+
+    def set_transport_failure_handler(self, hook: _TransportFailureCallback) -> None:
+        self._on_transport_failure = hook
+
+    async def _handle_transport_failure(self, exc: BaseException, capability_kind: str) -> bool:
+        """Reset the server on transport timeout/protocol failure; return True if handled."""
+        if self._on_transport_failure is None or not _is_mcp_transport_failure(exc):
+            return False
+        await _notify_transport_failure(self._on_transport_failure, self._name)
+        logger.warning(
+            "MCP {} '{}' transport error (session reset): {}: {}",
+            capability_kind,
+            self._name,
+            type(exc).__name__,
+            exc,
+        )
+        return True
 
     async def _refresh_session_after_termination(
         self,
@@ -648,6 +718,8 @@ class MCPToolWrapper(_MCPWrapperBase):
                 logger.warning("MCP tool '{}' was cancelled by server/SDK", self._name)
                 return ToolResult.error("(MCP tool call was cancelled)")
             except Exception as exc:
+                if await self._handle_transport_failure(exc, "tool"):
+                    return ToolResult.error(f"(MCP tool call failed: {type(exc).__name__})")
                 if await self._refresh_session_after_termination(
                     exc,
                     refreshed_session,
@@ -816,6 +888,8 @@ class MCPResourceWrapper(_MCPWrapperBase):
                 logger.warning("MCP resource '{}' was cancelled by server/SDK", self._name)
                 return "(MCP resource read was cancelled)"
             except Exception as exc:
+                if await self._handle_transport_failure(exc, "resource"):
+                    return f"(MCP resource read failed: {type(exc).__name__})"
                 if await self._refresh_session_after_termination(
                     exc,
                     refreshed_session,
@@ -950,6 +1024,8 @@ class MCPPromptWrapper(_MCPWrapperBase):
                 )
                 return f"(MCP prompt call failed: {exc.error.message} [code {exc.error.code}])"
             except Exception as exc:
+                if await self._handle_transport_failure(exc, "prompt"):
+                    return f"(MCP prompt call failed: {type(exc).__name__})"
                 if await self._refresh_session_after_termination(
                     exc,
                     refreshed_session,
@@ -1096,7 +1172,7 @@ async def connect_mcp_servers(
                         headers=merged_headers or None,
                         event_hooks={"request": [_validate_mcp_request_url]},
                         follow_redirects=True,
-                        timeout=timeout,
+                        timeout=_sse_httpx_timeout(timeout),
                         auth=auth,
                         **_pinned_transport_kwargs(),
                     )
@@ -1605,12 +1681,37 @@ class MCPProvider:
             )
 
         for server_name in server_names:
+            async def on_transport_failure(
+                reset_server: str = server_name,
+            ) -> None:
+                await self.reset_after_transport_failure(reset_server)
+
             for tool_name in list(self._registry.tool_names):
                 tool = self._registry.get(tool_name)
                 if not _tool_belongs_to_server(tool, tool_name, server_name):
                     continue
                 if isinstance(tool, _MCPWrapperBase):
                     tool.set_reconnect_handler(reconnect)
+                    tool.set_transport_failure_handler(on_transport_failure)
+
+    async def reset_after_transport_failure(self, server_name: str) -> None:
+        """Unregister and close a server after HTTP/SSE transport timeout failure.
+
+        Lazy reconnect happens on the next ``connect()`` readiness check.
+        """
+        async with self._lock:
+            if self._closing:
+                return
+            if server_name not in self._connections and server_name not in self._servers:
+                return
+            logger.warning(
+                "MCP server '{}' transport failure; closing connection for later reconnect",
+                server_name,
+            )
+            _unregister_server_tools(self._registry, server_name)
+            await self._close_server(server_name)
+            if server_name in self._servers:
+                self._runtime_statuses[server_name] = "failed"
 
     async def _refresh_terminated_server(
         self,

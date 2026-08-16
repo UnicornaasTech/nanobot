@@ -286,6 +286,9 @@ class MatrixConfig(Base):
     group_allow_from: list[str] = Field(default_factory=list)
     allow_room_mentions: bool = False
     streaming: bool = False
+    # FORK: Element Secret Storage recovery for cross-signing device verification
+    recovery_key: str = Field(default="", alias="recoveryKey")
+    recovery_passphrase: str = Field(default="", alias="recoveryPassphrase")
 
 
 class MatrixChannel(BaseChannel):
@@ -401,6 +404,17 @@ class MatrixChannel(BaseChannel):
         else:
             self.logger.warning("Unable to load a session due to missing password, access_token, or device_id; encryption may not work")
             return
+
+        # FORK: bootstrap cross-signing from recovery key/passphrase when configured
+        if self.client and self.config.e2ee_enabled and (
+            (self.config.recovery_key or "").strip()
+            or (self.config.recovery_passphrase or "").strip()
+        ):
+            from nanobot.channels.matrix.cross_signing_recovery import (
+                bootstrap_cross_signing_from_recovery,
+            )
+
+            await bootstrap_cross_signing_from_recovery(self.client, self.config)
 
         self._sync_task = asyncio.create_task(self._sync_loop())
 
@@ -534,8 +548,18 @@ class MatrixChannel(BaseChannel):
     async def _upload_and_send_attachment(
         self, room_id: str, path: Path, limit_bytes: int,
         relates_to: dict[str, Any] | None = None,
+        *,
+        as_voice: bool = False,
+        voice_hints: dict[str, Any] | None = None,
     ) -> str | None:
         """Upload one local file to Matrix and send it as a media message. Returns failure marker or None."""
+        from nanobot.channels.matrix.voice import (
+            build_voice_message_content,
+            resolve_voice_duration_ms,
+            resolve_voice_waveform,
+            voice_mime_for_path,
+        )
+
         if not self.client:
             return _ATTACH_UPLOAD_FAILED.format(path.name or _DEFAULT_ATTACH_NAME)
 
@@ -552,7 +576,24 @@ class MatrixChannel(BaseChannel):
         if limit_bytes <= 0 or size_bytes > limit_bytes:
             return _ATTACH_TOO_LARGE.format(filename)
 
-        mime = mimetypes.guess_type(filename, strict=False)[0] or "application/octet-stream"
+        guessed_mime = mimetypes.guess_type(filename, strict=False)[0] or "application/octet-stream"
+        mime = voice_mime_for_path(resolved, guessed_mime) if as_voice else guessed_mime
+        if as_voice and not mime.startswith("audio/"):
+            self.logger.warning(
+                "Matrix voice requested for non-audio file %s (mime=%s); sending as attachment",
+                filename,
+                mime,
+            )
+            as_voice = False
+        delivery_mode = "voice" if as_voice else "attachment"
+        self.logger.debug(
+            "Matrix media upload: room_id={} path={} delivery_mode={} mime={} size_bytes={}",
+            room_id,
+            resolved,
+            delivery_mode,
+            mime,
+            size_bytes,
+        )
         try:
             with resolved.open("rb") as f:
                 upload_result = await self.client.upload(
@@ -577,10 +618,45 @@ class MatrixChannel(BaseChannel):
         if not isinstance(mxc_url, str) or not mxc_url.startswith("mxc://"):
             return fail
 
-        content = self._build_outbound_attachment_content(
-            filename=filename, mime=mime, size_bytes=size_bytes,
-            mxc_url=mxc_url, encryption_info=encryption_info,
-        )
+        if as_voice:
+            hints = voice_hints or {}
+            duration_ms = resolve_voice_duration_ms(resolved, hints)
+            waveform = resolve_voice_waveform(hints)
+            content = build_voice_message_content(
+                mime=mime,
+                size_bytes=size_bytes,
+                duration_ms=duration_ms,
+                waveform=waveform,
+                mxc_url=mxc_url,
+                encryption_info=encryption_info,
+            )
+            self.logger.debug(
+                "Matrix media sent as voice message: room_id={} path={} duration_ms={} msgtype={}",
+                room_id,
+                resolved,
+                duration_ms,
+                content.get("msgtype"),
+            )
+        else:
+            content = self._build_outbound_attachment_content(
+                filename=filename, mime=mime, size_bytes=size_bytes,
+                mxc_url=mxc_url, encryption_info=encryption_info,
+            )
+            if mime.startswith("audio/"):
+                self.logger.warning(
+                    "Matrix audio sent as generic attachment (missing _matrix_voice metadata): "
+                    "room_id={} path={} msgtype={} — LLM should call message(..., voice=true)",
+                    room_id,
+                    resolved,
+                    content.get("msgtype"),
+                )
+            else:
+                self.logger.debug(
+                    "Matrix media sent as attachment: room_id={} path={} msgtype={}",
+                    room_id,
+                    resolved,
+                    content.get("msgtype"),
+                )
         if relates_to:
             content["m.relates_to"] = relates_to
         try:
@@ -592,10 +668,25 @@ class MatrixChannel(BaseChannel):
 
     async def send(self, msg: OutboundMessage) -> None:
         """Send outbound content; clear typing for non-progress messages."""
+        from nanobot.channels.matrix.voice import (
+            parse_matrix_voice_metadata,
+            resolve_path_key,
+        )
+
         if not self.client:
             raise RuntimeError("Matrix client not initialized")
         text = msg.content or ""
         candidates = self._collect_outbound_media_candidates(msg.media)
+        voice_paths, voice_hints = parse_matrix_voice_metadata(msg.metadata, candidates)
+        self.logger.debug(
+            "Matrix outbound media: room_id={} voice_metadata={!r} voice_path_count={} "
+            "media_count={} paths={}",
+            msg.chat_id,
+            (msg.metadata or {}).get("_matrix_voice"),
+            len(voice_paths),
+            len(candidates),
+            [str(path) for path in candidates],
+        )
         relates_to = self._build_thread_relates_to(msg.metadata)
         is_progress = isinstance(msg.event, ProgressEvent)
         try:
@@ -603,11 +694,24 @@ class MatrixChannel(BaseChannel):
             if candidates:
                 limit_bytes = await self._effective_media_limit_bytes()
                 for path in candidates:
+                    path_key = resolve_path_key(path)
+                    as_voice = path_key in voice_paths
+                    if not as_voice and path.suffix.lower() in {".ogg", ".oga", ".opus"}:
+                        self.logger.warning(
+                            "Matrix outbound .ogg without voice metadata: room_id={} path={} "
+                            "path_key={} voice_paths={} — will send as attachment",
+                            msg.chat_id,
+                            path,
+                            path_key,
+                            sorted(voice_paths),
+                        )
                     if fail := await self._upload_and_send_attachment(
                         room_id=msg.chat_id,
                         path=path,
                         limit_bytes=limit_bytes,
                         relates_to=relates_to,
+                        as_voice=as_voice,
+                        voice_hints=voice_hints,
                     ):
                         failures.append(fail)
             if failures:

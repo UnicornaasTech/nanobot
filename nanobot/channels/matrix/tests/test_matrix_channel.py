@@ -2354,3 +2354,121 @@ async def test_fetch_media_maps_streaming_cap_to_too_large(monkeypatch, tmp_path
     assert attachment is None
     assert marker == "[attachment: payload.bin - too large]"
     assert client.room_send_calls == []
+async def test_send_uploads_voice_message_with_msc3245_metadata(tmp_path) -> None:
+    channel = MatrixChannel(_make_config(), MessageBus())
+    client = _FakeAsyncClient("", "", "", None)
+    channel.client = client
+
+    file_path = tmp_path / "reply.ogg"
+    file_path.write_bytes(b"fake-ogg-bytes")
+
+    await channel.send(
+        OutboundMessage(
+            channel="matrix",
+            chat_id="!room:matrix.org",
+            content="",
+            media=[str(file_path)],
+            metadata={"_matrix_voice": {"duration_ms": 2500}},
+        )
+    )
+
+    assert len(client.upload_calls) == 1
+    assert client.upload_calls[0]["content_type"] == "audio/ogg"
+    assert len(client.room_send_calls) == 1
+    content = client.room_send_calls[0]["content"]
+    assert content["msgtype"] == "m.audio"
+    assert content["body"] == "Voice message"
+    assert content["url"] == "mxc://example.org/uploaded"
+    assert content["info"] == {
+        "mimetype": "audio/ogg",
+        "size": len(b"fake-ogg-bytes"),
+        "duration": 2500,
+    }
+    assert content["org.matrix.msc3245.voice"] == {}
+    assert content["org.matrix.msc1767.audio"]["duration"] == 2500
+    assert content["org.matrix.msc1767.audio"]["waveform"] == [0] * 100
+    assert content["org.matrix.msc1767.file"]["name"] == "Voice message.ogg"
+
+
+@pytest.mark.asyncio
+async def test_send_ogg_without_voice_metadata_uses_generic_audio_attachment(tmp_path) -> None:
+    channel = MatrixChannel(_make_config(), MessageBus())
+    client = _FakeAsyncClient("", "", "", None)
+    channel.client = client
+
+    file_path = tmp_path / "song.ogg"
+    file_path.write_bytes(b"fake-ogg-bytes")
+
+    await channel.send(
+        OutboundMessage(
+            channel="matrix",
+            chat_id="!room:matrix.org",
+            content="",
+            media=[str(file_path)],
+        )
+    )
+
+    content = client.room_send_calls[0]["content"]
+    assert content["msgtype"] == "m.audio"
+    assert content["body"] == "song.ogg"
+    assert "org.matrix.msc3245.voice" not in content
+
+
+@pytest.mark.asyncio
+async def test_send_voice_in_encrypted_room(tmp_path) -> None:
+    channel = MatrixChannel(_make_config(e2ee_enabled=True), MessageBus())
+    client = _FakeAsyncClient("", "", "", None)
+    client.rooms["!encrypted:matrix.org"] = SimpleNamespace(encrypted=True)
+    channel.client = client
+
+    file_path = tmp_path / "voice.ogg"
+    file_path.write_bytes(b"encrypted-voice")
+
+    await channel.send(
+        OutboundMessage(
+            channel="matrix",
+            chat_id="!encrypted:matrix.org",
+            content="",
+            media=[str(file_path)],
+            metadata={"_matrix_voice": {"duration_ms": 1200}},
+        )
+    )
+
+    content = client.room_send_calls[0]["content"]
+    assert content["msgtype"] == "m.audio"
+    assert "url" not in content
+    assert content["file"]["url"] == "mxc://example.org/uploaded"
+    assert content["org.matrix.msc3245.voice"] == {}
+    assert "url" not in content["org.matrix.msc1767.file"]
+    assert content["org.matrix.msc1767.file"]["file"]["url"] == "mxc://example.org/uploaded"
+
+
+@pytest.mark.asyncio
+async def test_send_voice_metadata_paths_only_marks_selected_files(tmp_path) -> None:
+    channel = MatrixChannel(_make_config(), MessageBus())
+    client = _FakeAsyncClient("", "", "", None)
+    channel.client = client
+
+    voice_path = tmp_path / "voice.ogg"
+    other_path = tmp_path / "other.ogg"
+    voice_path.write_bytes(b"voice")
+    other_path.write_bytes(b"other")
+
+    await channel.send(
+        OutboundMessage(
+            channel="matrix",
+            chat_id="!room:matrix.org",
+            content="",
+            media=[str(voice_path), str(other_path)],
+            metadata={"_matrix_voice": {"paths": [str(voice_path)], "duration_ms": 900}},
+        )
+    )
+
+    assert len(client.room_send_calls) == 2
+    voice_content = client.room_send_calls[0]["content"]
+    other_content = client.room_send_calls[1]["content"]
+    assert voice_content["body"] == "Voice message"
+    assert "org.matrix.msc3245.voice" in voice_content
+    assert other_content["body"] == "other.ogg"
+    assert "org.matrix.msc3245.voice" not in other_content
+

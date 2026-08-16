@@ -1,3 +1,13 @@
+This is our fork of the official nanobot repo, also pulling commits from another upstream repo and from the Prospr fork.
+
+IMPORTANT: Thus, when creating changes, **always attempt to minimize overlap with upstream code to avoid merge conflicts**.
+
+## Fork documentation
+
+When you add, change, or remove behavior that differs from upstream, update [docs/fork-changes.md](docs/fork-changes.md) in the same change (one brief bullet per feature).
+
+Prospr-specific features (Gmail, Instagram, Slack `no_reply`, eager knowledge, etc.) are documented in [docs/prospr-custom-implementations.md](docs/prospr-custom-implementations.md).
+
 This file provides guidance to AI coding agents working with this repository.
 
 ## Project Overview
